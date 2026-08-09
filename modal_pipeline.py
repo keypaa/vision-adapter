@@ -19,6 +19,7 @@ Phase-4 training lives in modal_train.py — run:
   modal run modal_train.py::train             # only after dryrun prints MEMORY GATE PASS
 """
 from __future__ import annotations
+import os
 import modal
 
 # ------------------------------------------------------------------ infra ---
@@ -43,17 +44,37 @@ GPU_MEM_BUDGET_GIB = 70.0                  # max_memory={0:...}
 SYS_RAM_BUDGET_GIB = 200.0
 MAX_SEQ_LEN = 4096
 BATCH_SIZE = 8
-GROK_STEPS_TARGET = 1035                   # ~1 epoch @64 batch on 66k (Baseten)
+
+class _Const:
+    BATCH = 16  # micro-batch of images per packed precompute forward
+
+import os as _os
+
+def _local_hf_token():
+    t = (_os.environ.get("HF_TOKEN")
+         or _os.environ.get("HUGGING_FACE_HUB_TOKEN"))
+    if not t:
+        p = _os.path.expanduser("~/.cache/huggingface/token")
+        if _os.path.exists(p):
+            t = open(p).read().strip()
+    if not t:
+        raise RuntimeError(
+            "No HF token found. Set HF_TOKEN env var or run `huggingface-cli login` "
+            "once on this machine so Modal can forward it into the container.")
+    return t
+
+
+_hf_env = {"HF_HOME": HF_CACHE, "HF_TOKEN": _local_hf_token()}
 
 _etl_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("duckdb", "pyarrow", "pillow", "requests", "huggingface_hub", "datasets")
-    .env({"HF_HOME": HF_CACHE})
+    .env(_hf_env)
 )
 _vit_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("torch", "safetensors", "pillow", "numpy", "huggingface_hub", "accelerate")
-    .env({"HF_HOME": HF_CACHE})
+    .env(_hf_env)
 )
 
 app = modal.App(APP_NAME)
@@ -63,7 +84,7 @@ app = modal.App(APP_NAME)
 # STAGE etl
 # =====================================================================
 @app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
-              timeout=60 * 60 * 6, ephemeral_disk_request=250 * 1024)
+              timeout=60 * 60 * 6, ephemeral_disk=524288)  # 512 GiB (Modal floor for this SKU)
 def etl():
     import os, sys, json
     sys.path.insert(0, "/root")  # we'll mount uploaded modules
@@ -119,7 +140,93 @@ def _build_manifest_local():
     return "/root/sero_manifest.parquet"
 
 
-def bai_build_one(subset, bai):
+# =====================================================================
+# STAGE push_datasets_to_hf
+# =====================================================================
+@app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              timeout=60 * 60 * 6, memory="8GB")
+def push_datasets_to_hf(repo_ns: str = "keypa",
+                        public: bool = True):
+    """Publish the datasets we built so others don't need to re-run the ETL.
+
+    Datasets pushed (created if missing; never deleted/reset):
+      {repo_ns}/vision-adapter-agentic-images  — every image file under
+        /data/images/{agentic,cauldron}/ plus per-image size/idx; as a plain
+        file-tree repo (no parquet conversion).
+      {repo_ns}/vision-adapter-mix-manifest    — /data/train_manifest.jsonl +
+        /data/train_manifest_val.jsonl (the 45/45/10 recipe actually trained on).
+      {repo_ns}/vision-adapter-cauldron-manifest  — /data/metadata/cauldron_manifest.jsonl,
+        the raw Cauldron pull before the mix sampling.
+
+    Idempotent: re-running uploads only files whose remote blob is missing or
+    whose size differs. Nothing else is touched.
+    """
+    import json, os, hashlib
+    from huggingface_hub import HfApi, upload_file, upload_folder
+
+    api = HfApi()
+    vol.reload()   # ensure we see whatever etl()/build_train_manifest wrote
+
+    # ------------------------ agentic_images as a HF dataset repo ------------------------
+    # Build a local snapshot (paths only) — we stream-upload whole files via upload_folder.
+    snapshot_root = os.path.join(VOLUME_DIR, "hf_snapshot")
+    if os.path.isdir(snapshot_root):
+        import shutil; shutil.rmtree(snapshot_root, ignore_errors=True)
+    os.makedirs(snapshot_root, exist_ok=True)
+
+    # flatten images into <snapshot_root>/images/{agentic,cauldron}/* once
+    def _materialize_images():
+        for group in ("agentic", "cauldron"):
+            src_dir = os.path.join(VOLUME_DIR, "images", group)
+            dst_dir = os.path.join(snapshot_root, "images", group)
+            os.makedirs(dst_dir, exist_ok=True)
+            n = 0
+            for name in sorted(os.listdir(src_dir)):
+                src = os.path.join(src_dir, name)
+                if not os.path.isfile(src):
+                    continue
+                dst = os.path.join(dst_dir, name)
+                if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
+                    try:
+                        import shutil; shutil.copy2(src, dst)
+                    except Exception as e:
+                        print(f"[push] copy-skip {group}/{name}: {e}")
+                        continue
+                n += 1
+                if n and n % 5000 == 0:
+                    print(f"[push] staged {group}: {n}")
+            print(f"[push] staged {group}: {n} files")
+    _materialize_images()
+
+    img_repo = f"{repo_ns}/vision-adapter-agentic-images"
+    api.create_repo(img_repo, repo_type="dataset", private=not public, exist_ok=True)
+    print(f"[push] uploading image corpus -> {img_repo}")
+    upload_folder(repo_id=img_repo, repo_type="dataset",
+                  folder_path=snapshot_root, path_in_repo="",
+                  commit_message="Add 79.6k agentic + cauldron images (flat snapshot)")
+
+    # ------------------------ mix + cauldron manifests ------------------------
+    for rel, repo in [
+        ("train_manifest.jsonl", "vision-adapter-mix-manifest"),
+        ("train_manifest_val.jsonl", "vision-adapter-mix-manifest"),
+        ("metadata/cauldron_manifest.jsonl", "vision-adapter-cauldron-manifest"),
+    ]:
+        src = os.path.join(VOLUME_DIR, rel)
+        if not os.path.exists(src):
+            print(f"[push] SKIP {rel} (not found)")
+            continue
+        rid = f"{repo_ns}/{repo}"
+        api.create_repo(rid, repo_type="dataset", private=not public, exist_ok=True)
+        upload_file(path_or_fileobj=src, path_in_repo=os.path.basename(rel),
+                    repo_id=rid, repo_type="dataset",
+                    commit_message=f"upload {os.path.basename(rel)}")
+        print(f"[push] {rel} -> {rid}")
+
+    vol.commit()
+    print("[push] DONE")
+
+
+def bai_build_one(subset, bai):  # module-scope helper called from inside etl(); needs `os` at module top
     """Invoke the verified per-subset positional join and write into the Volume."""
     needed = bai.load_needed_indices()          # reads bai.MANIFEST
     idx_map = needed.get(subset, {})
@@ -222,12 +329,18 @@ def build_train_manifest():
             rows.append({"emb": f"embeddings/{h}.pt", "user": m["user"],
                          "assistant": m["assistant"], "g": group_name})
     random.shuffle(rows)
+    # held-out val split (~2%, min 256) so the training loop has an honest
+    # "is it grokking" probe that never sees optimisation updates.
+    n_val = max(256, int(0.02 * len(rows)))
+    val, train = rows[:n_val], rows[n_val:]
     with open(f"{VOLUME_DIR}/train_manifest.jsonl", "w") as f:
-        for r in rows:
-            f.write(json.dumps(r) + "\n")
+        for r in train: f.write(json.dumps(r) + "\n")
+    with open(f"{VOLUME_DIR}/train_manifest_val.jsonl", "w") as f:
+        for r in val: f.write(json.dumps(r) + "\n")
     vol.commit()
     from collections import Counter
-    print("[mix]", Counter(r["g"] for r in rows), "total", len(rows))
+    print("[mix] train", Counter(r["g"] for r in train), "total", len(train))
+    print("[mix] val  ", Counter(r["g"] for r in val), "total", len(val))
 
 @app.function(image=_vit_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
               gpu=GPU, timeout=60 * 60 * 12, memory="64GB")
@@ -241,6 +354,7 @@ def precompute():
     sys.path.insert(0, "/root")
     from moonvit import load_moonvit_from_safetensors
     from preprocess import collate_images  # packs PIL list -> pixel_values, grid_thws
+    from preprocess import process_image
 
     cfg = json.load(open(hf_hub_download(repo_id=MOONVIT_REPO, repo_type="model",
                                          filename="vision_config.json")))
@@ -249,7 +363,8 @@ def precompute():
     vit = load_moonvit_from_safetensors(st, cfg, device="cuda", dtype=torch.bfloat16)
 
     img_paths = sorted(glob.glob(f"{IMG_DIR}/agentic/*") + glob.glob(f"{IMG_DIR}/cauldron/*"))
-    print(f"[precompute] {len(img_paths)} images")
+    img_paths = [p for p in img_paths if not _already_done(p)]
+    print(f"[precompute] total={len(img_paths)} new/todo={len(img_paths)}")
     B = _Const.BATCH  # micro-batch of images per forward
     done = 0
     with torch.no_grad():
@@ -269,6 +384,20 @@ def precompute():
                 print(f"[precompute] {done}/{len(img_paths)}"); vol.commit()
     vol.commit()
     print(f"[precompute] DONE. wrote {done} embeddings to {EMB_DIR}")
+
+
+def _already_done(image_path):
+    """Skip precompute for images whose embedding cache already exists and parses
+    as a (n, 4096) tensor — the same size check the Colab variant performs."""
+    import os, torch
+    p = _emb_path(image_path)
+    if not os.path.exists(p) or os.path.getsize(p) == 0:
+        return False
+    try:
+        d = torch.load(p, map_location="cpu", mmap=True)
+        return isinstance(d, torch.Tensor) and d.dim() == 2 and d.shape[-1] == 4096
+    except Exception:
+        return False
 
 
 def _emb_key(image_path):

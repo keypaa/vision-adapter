@@ -33,10 +33,25 @@ LR = 5e-4
 MAX_SEQ_LEN = 4096
 EPOCHS = 2
 
+# Telemetry / grok-window bookkeeping. Baseten's GLM recipe grokked at ~step 900
+# of 1035 (1 epoch @ batch 64 over 66k imgs) => ~58k samples seen. We have 120k
+# samples and must watch the loss curve for the same cliff, expected somewhere
+# around 7-11k *our* steps at batch 8 (equivalent samples-seen), not at step 900.
+SAMPLES_PER_BASETEN_GROK = int(900 * 64)
+LOG_EVERY = 1
+VAL_EVERY = 250
+SAVE_EVERY = 200
+# Optional: stop after the curve has collapsed. Off by default; the empirically
+# safe move per Baseten is to let the full scheduled epochs run.
+GROK_STOP_AFTER_STEPS = None
+
 VOL_NAME = "vision-adapter-data"
 EMB_ROOT_REL = "embeddings"
 CKPT_DIR_REL = "checkpoints"
 DATASET_MANIFEST_REL = "train_manifest.jsonl"  # produced by Phase3 etl+mix stage
+VAL_MANIFEST_REL = "train_manifest_val.jsonl"  # held-out split (same build fn)
+LOG_DIR_REL = "logs"
+LOG_FILE_REL = "train_log.jsonl"
 
 DS_REPO = "deepseek-ai/DeepSeek-V4-Flash-0731"
 MOONVIT_REPO = "keypa/MoonViT-V2-Standalone"
@@ -110,12 +125,18 @@ class EmbSFT(torch.utils.data.Dataset):
     The embedding file contains the MoonViT-V2 merged tokens [n_vis, 4096]
     (BF16) already projected by the (unchanged-by-us) Kimi merge; the TRAINABLE
     projector produces the final LLM embedding for each token.
+
+    Falls back silently to an empty dataset when the manifest doesn't exist yet
+    (so the optional val split can be absent without breaking training).
     """
 
-    def __init__(self, vol_dir=VOLUME_DIR):
+    def __init__(self, vol_dir=VOLUME_DIR, manifest_rel=DATASET_MANIFEST_REL):
         self.vol = vol_dir
         self.rows = []
-        with open(os.path.join(vol_dir, DATASET_MANIFEST_REL)) as f:
+        manifest_path = os.path.join(vol_dir, manifest_rel)
+        if not os.path.exists(manifest_path):
+            return
+        with open(manifest_path) as f:
             for line in f:
                 r = json.loads(line)
                 r["emb_abs"] = os.path.join(vol_dir, r["emb"])
@@ -216,9 +237,42 @@ def _shared_setup():
     loader = torch.utils.data.DataLoader(
         ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
         collate_fn=collate, num_workers=2, persistent_workers=True)
+
+    # held-out val set (~2% of rows). Not shuffled; only used for the
+    # periodic loss probe so "is it grokking?" isn't judged on train batches.
+    val_ds = EmbSFT(manifest_rel=VAL_MANIFEST_REL)
+    val_loader = None
+    if len(val_ds):
+        val_loader = torch.utils.data.DataLoader(
+            val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False,
+            collate_fn=collate, num_workers=0)
+
     import torch.optim as optim
     opt = optim.AdamW(proj.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.0)
-    return tok, model, proj, opt, loader
+
+    log_path = os.path.join(VOLUME_DIR, LOG_DIR_REL)
+    os.makedirs(log_path, exist_ok=True)
+    logger = open(os.path.join(log_path, LOG_FILE_REL), "a", buffering=1)
+    return tok, model, proj, opt, loader, val_loader, logger
+
+
+def _log(logger, rec):
+    import json as _json
+    logger.write(_json.dumps(rec) + "\n")
+
+
+@torch.no_grad()
+def _val_probe(model, proj, val_loader, tok):
+    """Mean loss over the held-out split (projector-only, same recipe)."""
+    import torch
+    proj.eval()
+    losses, n = [], 0
+    for sig in val_loader:
+        full = inject_visual(sig, proj, model)
+        losses.append(float(model(**full).loss.item()))
+        n += sig["input_ids"].shape[0]
+    proj.train()
+    return sum(losses) / max(1, len(losses)), n
 
 
 @app.function(image=train_image, gpu=GPU, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
@@ -226,7 +280,7 @@ def _shared_setup():
 def train_dryrun():
     import torch
     torch.backends.cuda.matmul.allow_tf32 = True
-    tok, model, proj, opt, loader = _shared_setup()
+    tok, model, proj, opt, loader, _val_loader, _logger = _shared_setup()
     sig = next(iter(loader))
     step_out = _one_step(sig, model, proj, opt, tok)
     cur = torch.cuda.memory_allocated() / 2**30
@@ -246,29 +300,57 @@ def train_dryrun():
 def train():
     import torch
     torch.backends.cuda.matmul.allow_tf32 = True
-    tok, model, proj, opt, loader = _shared_setup()
+    tok, model, proj, opt, loader, val_loader, logger = _shared_setup()
     n_params = sum(p.numel() for p in proj.parameters())
-    print(f"[train] projector params={n_params/1e6:.2f}M | target grok ≈ step 900 @ 64-eff batch")
+    print(f"[train] projector params={n_params/1e6:.2f}M | "
+          f"grok window ≈ step 7.2-11k @ bs{int(BATCH_SIZE)} "
+          f"(~{SAMPLES_PER_BASETEN_GROK} samples == Baseten's step-900 batch-64 recipe)")
     os.makedirs(os.path.join(VOLUME_DIR, CKPT_DIR_REL), exist_ok=True)
     step = 0
     t0 = time.time()
+    samples_seen = 0
     for epoch in range(EPOCHS):
         for sig in loader:
             step += 1
             out = _one_step(sig, model, proj, opt, tok)
+            samples_seen += int(BATCH_SIZE)
+            if step % LOG_EVERY == 0:
+                _log(logger, {
+                    "step": step, "epoch": epoch, "type": "train",
+                    "loss": round(float(out["loss"]), 5),
+                    "samples_seen": samples_seen,
+                    "lr": float(opt.param_groups[0]["lr"]),
+                    "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+                    "it_s": round(step / max(1e-9, time.time() - t0), 3),
+                    "ts": round(time.time(), 1),
+                })
             if step % 20 == 0:
                 rate = step / max(1e-9, time.time() - t0)
                 print(f"[train] e{epoch} step {step} loss={out['loss']:.4f} "
-                      f"peak={torch.cuda.max_memory_allocated()/2**30:.1f}GiB {rate:.2f}it/s")
+                      f"samples={samples_seen} peak={torch.cuda.max_memory_allocated()/2**30:.1f}GiB "
+                      f"{rate:.2f}it/s")
                 torch.save({"proj": proj.state_dict(), "step": step, "loss": float(out["loss"])},
                            os.path.join(VOLUME_DIR, CKPT_DIR_REL, f"latest.pt"))
+                vol.commit()
+            if val_loader and step % VAL_EVERY == 0:
+                # quick probe on the held-out split, thenPROJECTOR back to train mode
+                vloss, n = _val_probe(model, proj, val_loader, tok)
+                _log(logger, {"step": step, "epoch": epoch, "type": "val",
+                              "val_loss": round(vloss, 5), "n_rows": n,
+                              "samples_seen": samples_seen,
+                              "ts": round(time.time(), 1)})
+                print(f"[val]   e{epoch} step {step} val_loss={vloss:.4f} (n={n})")
                 vol.commit()
             if step % 200 == 0:
                 torch.save(proj.state_dict(),
                            os.path.join(VOLUME_DIR, CKPT_DIR_REL, f"projector_step{step}.safetensors"))
                 vol.commit()
+            if GROK_STOP_AFTER_STEPS and step >= GROK_STOP_AFTER_STEPS:
+                print(f"[train] early stop: hit GROK_STOP_AFTER_STEPS={GROK_STOP_AFTER_STEPS}")
+                break
     torch.save(proj.state_dict(), os.path.join(VOLUME_DIR, CKPT_DIR_REL, "projector_final.safetensors"))
     vol.commit()
+    logger.close()
     print(f"[train] DONE after {step} steps")
 
 

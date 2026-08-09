@@ -9,16 +9,17 @@ Contract (verified against modeling_kimi_k3.py):
     grid_thws    : (num_images, 3) int64             -- rows [t, h, w] in patch units
   returns        : list[(n_merged_i, 4, 1024)]       -- one tensor per image, after 2x2 sd2_tpool
 
-Weights load from the stripped standalone safetensors:
-  patch_embed.proj.weight                              [1024, 3, 14, 14]
-  patch_embed.pos_emb.weight                           [64, 64, 1024]   (learnable, bilinear interp)
-  encoder.blocks.{i}.norm0.weight                      [1024]
-  encoder.blocks.{i}.wqkv.weight                       [4608, 1024]
-  encoder.blocks.{i}.wo.weight                         [1536, 1024]
-  encoder.blocks.{i}.norm1.weight                      [1024]
-  encoder.blocks.{i}.mlp.fc0.weight                    [4096, 1024]
-  encoder.blocks.{i}.mlp.fc1.weight                    [1024, 4096]
-  encoder.final_layernorm.weight                       [1024]
+Weights are stored in the standalone safetensors under the canonical Kimi
+`vision_tower.` prefix; load_moonvit_from_safetensors() remaps them onto `_vt.*`:
+  vision_tower.patch_embed.proj.weight                    [1024, 3, 14, 14]
+  vision_tower.patch_embed.pos_emb.weight                 [64, 64, 1024]   (learnable, bilinear interp)
+  vision_tower.encoder.blocks.{i}.norm0.weight            [1024]
+  vision_tower.encoder.blocks.{i}.wqkv.weight             [4608, 1024]
+  vision_tower.encoder.blocks.{i}.wo.weight               [1536, 1024]
+  vision_tower.encoder.blocks.{i}.norm1.weight            [1024]
+  vision_tower.encoder.blocks.{i}.mlp.fc0.weight          [4096, 1024]
+  vision_tower.encoder.blocks.{i}.mlp.fc1.weight          [1024, 4096]
+  vision_tower.encoder.final_layernorm.weight             [1024]
 """
 from __future__ import annotations
 import json, math
