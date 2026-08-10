@@ -91,7 +91,7 @@ def etl():
     # jump straight into Cauldron — no point re-downloading 24 GB to re-derive
     # the same ~80k files.
     vol_img = os.path.join(VOLUME_DIR, "images", "agentic")
-    n existing = 0
+    n_existing = 0
     if os.path.isdir(vol_img):
         n_existing = sum(1 for f in os.listdir(vol_img) if os.path.isfile(os.path.join(vol_img, f)))
     if n_existing >= 75_000:
