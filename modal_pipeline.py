@@ -267,15 +267,51 @@ CONV_SUBSETS = ["vqav2", "okvqa", "aokvqa", "visual7w"]
 
 
 def cauldron_pull():
-    """Stream cauldron permissive subsets; save as json rows + images in Volume."""
-    import json, os
+    """Download-then-open-local for each permissive cauldron subset (robust to
+    HF streaming read-timeouts on >100 MB shards)."""
+    import json, os, requests, shutil
     from datasets import load_dataset
     from PIL import Image
     out_img = f"{IMG_DIR}/cauldron"; os.makedirs(out_img, exist_ok=True)
     manifest = []
+    hdr = {"User-Agent": "vision-adapter/1.0"}
+    cache_root = f"{HF_CACHE}/cauldron_parquet"
+    os.makedirs(cache_root, exist_ok=True)
     for sub in DOC_SUBSETS + CONV_SUBSETS:
         try:
-            ds = load_dataset("HuggingFaceM4/the_cauldron", sub, split="train", streaming=True)
+            # step 1: enumerate the subset's parquet files via the HF API
+            files = [s for s in requests.get(
+                "https://huggingface.co/api/datasets/HuggingFaceM4/the_cauldron",
+                params={"full": "true", "config": sub},
+                headers=hdr, timeout=30).json().get("siblings", [])
+                if f"the_cauldron/{sub}-" in s.get("rfilename", "")
+                and s.get("rfilename", "").endswith(".parquet")]
+            if not files:
+                # fall back to the older single-file layout
+                files = [s for s in requests.get(
+                    "https://huggingface.co/api/datasets/HuggingFaceM4/the_cauldron",
+                    params={"full": "true", "config": sub},
+                    headers=hdr, timeout=30).json().get("siblings", [])
+                    if sub in s.get("rfilename", "") and s.get("rfilename", "").endswith(".parquet")]
+            local_paths = []
+            for fmeta in files:
+                rel = fmeta["rfilename"]
+                dest = os.path.join(cache_root, rel.replace("/", "__"))
+                url = (f"https://huggingface.co/datasets/HuggingFaceM4/the_cauldron"
+                       f"/resolve/main/{rel}")
+                want = fmeta.get("size", -1)
+                if not os.path.exists(dest) or (want > 0 and os.path.getsize(dest) != want):
+                    with requests.get(url, headers=hdr, stream=True,
+                                      timeout=(30, 600), allow_redirects=True) as r:
+                        r.raise_for_status()
+                        with open(dest + ".part", "wb") as fh:
+                            for chunk in r.iter_content(1 << 20):
+                                if chunk: fh.write(chunk)
+                    os.replace(dest + ".part", dest)
+                local_paths.append(dest)
+                print(f"[cauldron] {sub}: cached {rel.split('/')[-1]} ({os.path.getsize(dest)/1e6:.0f} MB)")
+            # step 2: open the local files — no network inside the row loop
+            ds = load_dataset("parquet", data_files=local_paths, split="train")
         except Exception as e:
             print(f"[cauldron] SKIP {sub}: {e}"); continue
         n = 0
