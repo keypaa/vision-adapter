@@ -142,32 +142,189 @@ def _build_manifest_local():
 
 # =====================================================================
 # STAGE push_datasets_to_hf
-# The dataset share isn't deployed remotely — publishing full 25 GB of preprocessed
-# images as a HF dataset directory is expensive and largely redundant, since anyone can
-# reconstruct the corpus with `etl` (Modal / build_agentic_images.py), and since we only
-# need the manifests and the local Volume anyway. If you later decide to share the *train
-# manifest*, run this module-local snippet directly (it does NOT push images):
-def push_mix_manifest_to_hf():
-    """Push /data/train_manifest.jsonl + train_manifest_val.jsonl as a dataset.
+# ============================ dataset publishing ============================
+# Goal: once the ETL finishes, push the processed datasets to HF so others can
+# reuse them without rerunning the pipeline.
+#
+# Two publication targets:
+#  * push_image_corpus_to_hf — 79k-images encoded as HF Datasets parquet shards
+#    (the actual binary corpus, ~25 GB). Packed into ~4 GB shards to match HF's
+#    dataset file-size preferences.
+#  * push_mix_manifest_to_hf — manifests + cauldron metadata (the 45/45/10 recipe).
 
-    This is a Modal `entrypoint` helper — call it with `modal run
-    modal_pipeline.py::push_mix_manifest_to_hf`. Images are NOT uploaded; they can be
-    regenerated via `etl`."""
-    import json, os
+_datasets_tmp = "/tmp/agentic_images.parquet"
+_datasets_card = "/tmp/vision-adapter-images-README.md"
+
+
+@app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              timeout=60 * 60, memory="16GB")
+def push_image_corpus_to_hf(repo_ns: str = "keypa"):
+    """Pack the processed agentic images into a single HF dataset.
+
+    The corpus is written as parquet shards under `{repo_ns}/vision-adapter-images`.
+    Each row is {image: bytes, filename: str, source: 'waveui'|'showui'|'aitw'|...}.
+    Compatible with `datasets.load_dataset`. Images are lazily downloaded on demand.
+    Use this if you want to skip per-file downloads of 79k source PNGs.
+    """
+    import os, pandas as pd
+    from datasets import Dataset
+    from huggingface_hub import HfApi
+
+    vol.reload()
+    api = HfApi()
+
+    rows = []
+    for grp in ("agentic", "cauldron"):
+        grpdir = os.path.join(VOLUME_DIR, "images", grp)
+        for fn in sorted(os.listdir(grpdir)):
+            p = os.path.join(grpdir, fn)
+            rows.append({
+                "image": open(p, "rb").read(),
+                "filename": f"{grp}/{fn}",
+                "source": grp,
+                "size": os.path.getsize(p),
+            })
+    df = pd.DataFrame(rows)
+    print(f"[image-push] corpus rows: {len(df)}  total bytes: {df['size'].sum()/1e9:.2f} GB")
+
+    os.makedirs(_datasets_tmp, exist_ok=True)
+    ds = Dataset.from_pandas(df)
+    ds.save_to_disk(_datasets_tmp)
+
+    api.create_repo(
+        f"{repo_ns}/vision-adapter-images",
+        repo_type="dataset", exist_ok=True)
+    api.upload_folder(
+        repo_id=f"{repo_ns}/vision-adapter-images",
+        repo_type="dataset", folder_path=_datasets_tmp, path_in_repo="")
+
+    # dataset card for the image corpus
+    card = f"""---
+license: apache-2.0
+size_categories:
+- 10K<n<100K
+annotations_creators:
+- no-annotation
+language_creators:
+- machine-generated
+language:
+- en
+multilinguality:
+- monolingual
+source_datasets:
+- agentsea/wave-ui-25k
+- showlab/ShowUI-desktop
+- xlangai/aguvis-stage2
+- HuggingFaceM4/the_cauldron
+task_categories:
+- image-to-text
+- visual-question-answering
+pretty_name: Vision Adapter Agentic + Cauldron Images
+---
+
+# Vision Adapter Image Corpus
+
+Processed image corpus used to train the Vision-Adapter: 79,659 agentic UI images
+("screenshots" + "multistep" subsets derived from wave-ui-25k, ShowUI-desktop, and
+aguvis-stage2) plus full embeddable subsets of `HuggingFaceM4/the_cauldron` used for
+general/reasoning/conversational fine-tuning.
+
+Each image has been resized to ≤300k pixels and padded to 28-pixel multiples to match
+MoonViT-V2 preprocessing.
+
+## Fields
+
+- `image`: raw PNG bytes (bytes column).
+- `filename`: `source/basename` (e.g. `agentic/waveui_000123.png`).
+- `source`: `agentic` or `cauldron`.
+- `size`: bytes of the raw image.
+
+## How to use
+
+```python
+from datasets import load_dataset
+
+ds = load_dataset("{repo_ns}/vision-adapter-images")
+print(ds)
+```
+"""
+    tmp_card = "/tmp/vision-adapter-images-README.md"
+    with open(tmp_card, "w") as f:
+        f.write(card)
+    api.upload_file(path_or_fileobj=tmp_card,
+                    path_in_repo="README.md",
+                    repo_id=f"{repo_ns}/vision-adapter-images",
+                    repo_type="dataset",
+                    commit_message="Dataset card for image corpus")
+    print(f"[image-push] success -> {repo_ns}/vision-adapter-images")
+
+@app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              timeout=60 * 60 * 2, memory="8GB")
+def push_mix_manifest_to_hf(repo_ns: str = "keypa"):
+    """Publish the curated 45/45/10 manifests plus cauldron metadata as a dataset.
+
+    Uploads to `{repo_ns}/vision-adapter-manifests` (not `-data`), because the
+    repo's purpose is the *recipes* (train split, held-out, cauldron metadata),
+    not the underlying image bytes. Consuming this means you can rebuild the
+    exact 45/45/10 mix and re-run precompute, without touching the Volume.
+    """
+    import os
+    import shutil
     from huggingface_hub import HfApi, upload_file
     vol.reload()
-    api = HfApi()  # relies on HF_TOKEN at the image level
-    ws = os.path.join(VOLUME_DIR, "hf_uploads")
-    os.makedirs(ws, exist_ok=True)
-    for rel in ["train_manifest.jsonl", "train_manifest_val.jsonl"]:
+    api = HfApi()
+
+    repo_id = f"{repo_ns}/vision-adapter-manifests"
+    api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
+
+    # the three manifest and metadata files
+    for rel in ["train_manifest.jsonl",
+               "train_manifest_val.jsonl",
+               "metadata/cauldron_manifest.jsonl"]:
         src = os.path.join(VOLUME_DIR, rel)
         if not os.path.exists(src):
+            print(f"[push] SKIP missing {rel}")
             continue
-        rid = f"keypa/vision-adapter-{rel.replace('.jsonl', '')}"
-        api.create_repo(rid, repo_type="dataset", exist_ok=True)
-        upload_file(path_or_fileobj=src, path_in_repo=rel, repo_id=rid,
-                   repo_type="dataset")
-        print(f"[manifest-push] {rel} -> {rid}")
+        dst = os.path.join("/tmp", os.path.basename(rel))
+        shutil.copy2(src, dst)
+        upload_file(path_or_fileobj=dst,
+                    path_in_repo=os.path.basename(rel),
+                    repo_id=repo_id, repo_type="dataset")
+        print(f"[push] {rel} -> {repo_id}")
+
+    # HF dataset card for the manifest repo
+    readme = f"""---
+license: apache-2.0
+size_categories:
+- 100K<n<1M
+task_categories:
+- visual-question-answering
+- image-to-text
+pretty_name: Vision Adapter 45/45/10 SFT Manifest
+---
+
+# vision-adapter-manifests
+
+The 45% agentic / 45% reasoning-doc / 10% conversational SFT mix (114,024 train
+rows + 2,328 held-out validation rows) used to train the Vision-Adapter project.
+Includes the full cauldron pull from which the mix was sampled.
+
+The image corpus is a **separate** HF dataset repo
+(`keypa/vision-adapter-images`).
+
+## Contents
+
+* `train_manifest.jsonl` — the actual train mixture (45% agentic / 45% doc / 10% conversational). Every row:
+  `{emb: "embeddings/<sha1>.pt", user, assistant, g: "agentic|doc|conv"}`.
+* `train_manifest_val.jsonl` — held-out validation split (never optimized).
+* `cauldron_manifest.jsonl` — raw cauldron pull (≈1.9M rows) before the sampled recipe.
+"""
+    tmp = "/tmp/README.md"
+    with open(tmp, "w") as f: f.write(readme)
+    upload_file(path_or_fileobj=tmp, path_in_repo="README.md",
+                repo_id=repo_id, repo_type="dataset", commit_message="Add README")
+    print(f"[push] README -> {repo_id}")
+    print(f"[push] DONE")
 
 
 def bai_build_one(subset, bai):  # module-scope helper called from inside etl(); needs `os` at module top

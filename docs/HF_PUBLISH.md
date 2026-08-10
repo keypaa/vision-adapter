@@ -9,11 +9,11 @@ is opt-in per repo via the `repo_ns` (namespace) and `public` flags.
 | Repo | Type | Visibility | What it holds |
 |---|---|---|---|
 | `keypa/MoonViT-V2-Standalone` | **model** | public | 401 M-param BF16 MoonViT-V2 weights, `vision_config.json`, Kimi's own `mm_projector`, and the runtime code (`moonvit.py`, `preprocess.py`, etc.) |
-| `{you}/vision-adapter-agentic-images` | dataset | public by default | the full 79 659-file processed-image corpus (agentic + cauldron), id of original source, original Sero/Cauldron ID, image size |
-| `{you}/vision-adapter-mix-manifest` | dataset | public by default | `train_manifest.jsonl` (117 600 train rows) + `train_manifest_val.jsonl` (2 400 val rows) — the exact mix the trainer reads |
-| `{you}/vision-adapter-cauldron-manifest` | dataset | public by default | raw `cauldron_manifest.jsonl` (≈ 1.9 M rows) before 45/45/10 sampling — useful if you want a different ratio later |
+| `keypa/vision-adapter-data` | dataset | public by default | `train_manifest.jsonl` + `train_manifest_val.jsonl` + `cauldron_manifest.jsonl` (the post-ETL mix; images themselves link back to source via the manifest rows) |
 
-## How consumers use them
+The processed image bytes (≈ 25 GB) are deliberately **not** rehosted — they reconstruct deterministically from the upstream sources at Modal via `modal run modal_pipeline.py::etl`. If you want a dataset with the actual image payloads, publish the images via the source datasets' native flow; the manifests are what you share for training.
+
+### How consumers use it
 
 ### 1. The model repo (already public)
 
