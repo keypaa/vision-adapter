@@ -86,6 +86,33 @@ app = modal.App(APP_NAME)
 @app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
               timeout=60 * 60 * 6, ephemeral_disk=524288)  # 512 GiB (Modal floor for this SKU)
 def etl():
+    # Short-circuit: if the volume already holds the final agentic corpus (this is
+    # what stays when Modal preempts us mid-run), skip the whole build phase and
+    # jump straight into Cauldron — no point re-downloading 24 GB to re-derive
+    # the same ~80k files.
+    vol_img = os.path.join(VOLUME_DIR, "images", "agentic")
+    n existing = 0
+    if os.path.isdir(vol_img):
+        n_existing = sum(1 for f in os.listdir(vol_img) if os.path.isfile(os.path.join(vol_img, f)))
+    if n_existing >= 75_000:
+        print(f"[etl] agentic corpus already on disk ({n_existing} images) — skipping agentic phase")
+    else:
+        needed = _hf_has("0xSero/glm-vision-sft-mix", "sero_manifest.parquet")
+        mp_manifest = needed and "sero_manifest.parquet"
+        if not mp_manifest:
+            mp_manifest = _build_manifest_local()
+        print("[etl] rebuilding agentic corpus from scratch …")
+        needed = _load_needed_indices(limit=None, manifest_path=mp_manifest)
+        for subset in _all_agentic_subsets():
+            idx_map = needed.get(subset, {})
+            if not idx_map:
+                continue
+            print(f"[etl] subset={subset} → building {len(idx_map)} images")
+            bai = _load_agentic_bai()  # build_agentic_images.py
+            bai_build_one(subset, bai)
+            # commit after every subset so a preemption preserves all completed groups
+            vol.commit()
+        print("[etl] agentic corpus committed to Volume.")
     import os, sys, json
     sys.path.insert(0, "/root")  # we'll mount uploaded modules
     from huggingface_hub import hf_hub_download
@@ -376,7 +403,9 @@ def cauldron_pull():
     out_img = f"{IMG_DIR}/cauldron"; os.makedirs(out_img, exist_ok=True)
     manifest = []
     hdr = {"User-Agent": "vision-adapter/1.0"}
-    cache_root = f"{HF_CACHE}/cauldron_parquet"
+    # Cache goes inside the persistent data Volume so restarts reuse whatever is
+    # already downloaded (HF /hf is ephemeral across workers).
+    cache_root = f"{VOLUME_DIR}/hf_cache/cauldron_parquet"
     os.makedirs(cache_root, exist_ok=True)
     for sub in DOC_SUBSETS + CONV_SUBSETS:
         try:
@@ -401,7 +430,7 @@ def cauldron_pull():
                 url = (f"https://huggingface.co/datasets/HuggingFaceM4/the_cauldron"
                        f"/resolve/main/{rel}")
                 want = fmeta.get("size", -1)
-                if not os.path.exists(dest) or (want > 0 and os.path.getsize(dest) != want):
+                if not os.path.exists(dest) or os.path.getsize(dest) != want:
                     with requests.get(url, headers=hdr, stream=True,
                                       timeout=(30, 600), allow_redirects=True) as r:
                         r.raise_for_status()
