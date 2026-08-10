@@ -227,18 +227,38 @@ def push_datasets_to_hf(repo_ns: str = "keypa",
 
 
 def bai_build_one(subset, bai):  # module-scope helper called from inside etl(); needs `os` at module top
-    """Invoke the verified per-subset positional join and write into the Volume."""
+    """Invoke the verified per-subset positional join and write into the Volume in parallel.
+
+    Redirects the aguvis peek/zip dirs into the Modal Volume so the HF-sourced
+    <name>-l1.json manifests and <name>.zip files survive across containers.
+    """
+    import concurrent.futures
+    # redirect the /tmp/opencode dirs into the Modal volume so the manifests/zips persist
+    if subset in ("aitw", "guiact-web-multi", "mind2web", "miniwob"):
+        bai.AGUVIS_PEEK_DIR = os.path.join(VOLUME_DIR, "aguvis", "peek")
+        bai.AGUVIS_ZIP_DIR = os.path.join(VOLUME_DIR, "aguvis", "zips")
+        os.makedirs(bai.AGUVIS_PEEK_DIR, exist_ok=True)
+        os.makedirs(bai.AGUVIS_ZIP_DIR, exist_ok=True)
     needed = bai.load_needed_indices()          # reads bai.MANIFEST
     idx_map = needed.get(subset, {})
     if not idx_map:  # nothing needed
         return
     datas = bai.build_subset(subset, idx_map)
+    # Build all jobs *first* so we only decode+resize rows with real bytes
+    jobs = []
     for i, _base in idx_map.items():
         ext = idx_map[i].rsplit(".", 1)[-1]
         out = os.path.join(bai.DEFAULT_OUT, f"{bai.sero_basename(subset, i, ext)}")
         if os.path.exists(out):
             continue
-        bai.process_one((os.path.basename(out), datas[i], ext, bai.DEFAULT_OUT))
+        jobs.append((os.path.basename(out), datas[i], ext, bai.DEFAULT_OUT))
+    if not jobs:
+        print(f"  [{subset}] all {len(idx_map)} images already present — skipping")
+        return
+    print(f"  [{subset}] writing {len(jobs)} images via 8-way pool...")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(bai.process_one, jobs))
+    print(f"  [{subset}] done")
 
 
 DOC_SUBSETS = ["chartqa", "docvqa", "infographic_vqa", "screen2words", "websight",

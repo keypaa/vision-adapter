@@ -97,16 +97,25 @@ def _url_to_relpath(url):
     return m.group(1) if m else url
 
 
-def local_parquet_shards(dataset, needed_max_idx, counts):
-    """Download (resume-safe, CDN-cached) the leading shards covering needed_max_idx."""
-    n = shards_covering(counts, needed_max_idx)
-    urls = get_parquet_shard_urls(dataset)[:n]
+def local_parquet_shards(dataset, needed_max_idx, counts=None):
+    """Resume-safe, CDN-cached download of the shards covering needed_max_idx.
+
+    `counts` is ignored on purpose (kept for call-site compatibility); we always
+    ask HF for the full shard path set and let hf_hub_download's cache do the work.
+    """
+    if counts is None:
+        counts = [None]  # placeholder; hf_hub_download does not need row counts
+    n = shards_covering(counts, needed_max_idx) if counts[0] is not None else None
+    urls = get_parquet_shard_urls(dataset)
+    urls = urls[:n] if n else urls
     paths = []
-    for u in urls:
+    for i, u in enumerate(urls):
         rel = _url_to_relpath(u)
+        # idempotent: re-uses the global HF hub cache
         p = hf_hub_download(repo_id=dataset, repo_type="dataset",
                             filename=rel, revision="refs/convert/parquet")
         paths.append(p)
+        print(f"  [dl] {dataset} shard {i+1}/{len(urls)} -> {os.path.basename(p)}")
     return paths
 
 
@@ -169,7 +178,21 @@ def aguvis_manifest_path(name):
 
 
 def load_aguvis_manifest(name):
-    with open(aguvis_manifest_path(name)) as f:
+    """Load the per-subset manifest. Falls back to fetching from HF Hub if missing."""
+    path = aguvis_manifest_path(name)
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        print(f"  [aguvis] {name}-l1.json not on disk; fetching from HF hub ...")
+        fetched = hf_hub_download(
+            repo_id="xlangai/aguvis-stage2",
+            repo_type="dataset",
+            filename=f"{name}-l1.json",
+            local_files_only=False,
+        )
+        # Copy into the expected local path so reruns are instant and idempotent
+        import shutil
+        shutil.copyfile(fetched, path)
+    with open(path) as f:
         return json.load(f)
 
 
