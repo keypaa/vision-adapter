@@ -142,88 +142,32 @@ def _build_manifest_local():
 
 # =====================================================================
 # STAGE push_datasets_to_hf
-# =====================================================================
-@app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
-              timeout=60 * 60 * 6, memory="8GB")
-def push_datasets_to_hf(repo_ns: str = "keypa",
-                        public: bool = True):
-    """Publish the datasets we built so others don't need to re-run the ETL.
+# The dataset share isn't deployed remotely — publishing full 25 GB of preprocessed
+# images as a HF dataset directory is expensive and largely redundant, since anyone can
+# reconstruct the corpus with `etl` (Modal / build_agentic_images.py), and since we only
+# need the manifests and the local Volume anyway. If you later decide to share the *train
+# manifest*, run this module-local snippet directly (it does NOT push images):
+def push_mix_manifest_to_hf():
+    """Push /data/train_manifest.jsonl + train_manifest_val.jsonl as a dataset.
 
-    Datasets pushed (created if missing; never deleted/reset):
-      {repo_ns}/vision-adapter-agentic-images  — every image file under
-        /data/images/{agentic,cauldron}/ plus per-image size/idx; as a plain
-        file-tree repo (no parquet conversion).
-      {repo_ns}/vision-adapter-mix-manifest    — /data/train_manifest.jsonl +
-        /data/train_manifest_val.jsonl (the 45/45/10 recipe actually trained on).
-      {repo_ns}/vision-adapter-cauldron-manifest  — /data/metadata/cauldron_manifest.jsonl,
-        the raw Cauldron pull before the mix sampling.
-
-    Idempotent: re-running uploads only files whose remote blob is missing or
-    whose size differs. Nothing else is touched.
-    """
-    import json, os, hashlib
-    from huggingface_hub import HfApi, upload_file, upload_folder
-
-    api = HfApi()
-    vol.reload()   # ensure we see whatever etl()/build_train_manifest wrote
-
-    # ------------------------ agentic_images as a HF dataset repo ------------------------
-    # Build a local snapshot (paths only) — we stream-upload whole files via upload_folder.
-    snapshot_root = os.path.join(VOLUME_DIR, "hf_snapshot")
-    if os.path.isdir(snapshot_root):
-        import shutil; shutil.rmtree(snapshot_root, ignore_errors=True)
-    os.makedirs(snapshot_root, exist_ok=True)
-
-    # flatten images into <snapshot_root>/images/{agentic,cauldron}/* once
-    def _materialize_images():
-        for group in ("agentic", "cauldron"):
-            src_dir = os.path.join(VOLUME_DIR, "images", group)
-            dst_dir = os.path.join(snapshot_root, "images", group)
-            os.makedirs(dst_dir, exist_ok=True)
-            n = 0
-            for name in sorted(os.listdir(src_dir)):
-                src = os.path.join(src_dir, name)
-                if not os.path.isfile(src):
-                    continue
-                dst = os.path.join(dst_dir, name)
-                if not os.path.exists(dst) or os.path.getsize(dst) != os.path.getsize(src):
-                    try:
-                        import shutil; shutil.copy2(src, dst)
-                    except Exception as e:
-                        print(f"[push] copy-skip {group}/{name}: {e}")
-                        continue
-                n += 1
-                if n and n % 5000 == 0:
-                    print(f"[push] staged {group}: {n}")
-            print(f"[push] staged {group}: {n} files")
-    _materialize_images()
-
-    img_repo = f"{repo_ns}/vision-adapter-agentic-images"
-    api.create_repo(img_repo, repo_type="dataset", private=not public, exist_ok=True)
-    print(f"[push] uploading image corpus -> {img_repo}")
-    upload_folder(repo_id=img_repo, repo_type="dataset",
-                  folder_path=snapshot_root, path_in_repo="",
-                  commit_message="Add 79.6k agentic + cauldron images (flat snapshot)")
-
-    # ------------------------ mix + cauldron manifests ------------------------
-    for rel, repo in [
-        ("train_manifest.jsonl", "vision-adapter-mix-manifest"),
-        ("train_manifest_val.jsonl", "vision-adapter-mix-manifest"),
-        ("metadata/cauldron_manifest.jsonl", "vision-adapter-cauldron-manifest"),
-    ]:
+    This is a Modal `entrypoint` helper — call it with `modal run
+    modal_pipeline.py::push_mix_manifest_to_hf`. Images are NOT uploaded; they can be
+    regenerated via `etl`."""
+    import json, os
+    from huggingface_hub import HfApi, upload_file
+    vol.reload()
+    api = HfApi()  # relies on HF_TOKEN at the image level
+    ws = os.path.join(VOLUME_DIR, "hf_uploads")
+    os.makedirs(ws, exist_ok=True)
+    for rel in ["train_manifest.jsonl", "train_manifest_val.jsonl"]:
         src = os.path.join(VOLUME_DIR, rel)
         if not os.path.exists(src):
-            print(f"[push] SKIP {rel} (not found)")
             continue
-        rid = f"{repo_ns}/{repo}"
-        api.create_repo(rid, repo_type="dataset", private=not public, exist_ok=True)
-        upload_file(path_or_fileobj=src, path_in_repo=os.path.basename(rel),
-                    repo_id=rid, repo_type="dataset",
-                    commit_message=f"upload {os.path.basename(rel)}")
-        print(f"[push] {rel} -> {rid}")
-
-    vol.commit()
-    print("[push] DONE")
+        rid = f"keypa/vision-adapter-{rel.replace('.jsonl', '')}"
+        api.create_repo(rid, repo_type="dataset", exist_ok=True)
+        upload_file(path_or_fileobj=src, path_in_repo=rel, repo_id=rid,
+                   repo_type="dataset")
+        print(f"[manifest-push] {rel} -> {rid}")
 
 
 def bai_build_one(subset, bai):  # module-scope helper called from inside etl(); needs `os` at module top
