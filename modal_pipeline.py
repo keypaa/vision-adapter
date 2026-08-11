@@ -94,25 +94,9 @@ def etl():
     n_existing = 0
     if os.path.isdir(vol_img):
         n_existing = sum(1 for f in os.listdir(vol_img) if os.path.isfile(os.path.join(vol_img, f)))
-    if n_existing >= 75_000:
+    skip_agentic = n_existing >= 75_000
+    if skip_agentic:
         print(f"[etl] agentic corpus already on disk ({n_existing} images) — skipping agentic phase")
-    else:
-        needed = _hf_has("0xSero/glm-vision-sft-mix", "sero_manifest.parquet")
-        mp_manifest = needed and "sero_manifest.parquet"
-        if not mp_manifest:
-            mp_manifest = _build_manifest_local()
-        print("[etl] rebuilding agentic corpus from scratch …")
-        needed = _load_needed_indices(limit=None, manifest_path=mp_manifest)
-        for subset in _all_agentic_subsets():
-            idx_map = needed.get(subset, {})
-            if not idx_map:
-                continue
-            print(f"[etl] subset={subset} → building {len(idx_map)} images")
-            bai = _load_agentic_bai()  # build_agentic_images.py
-            bai_build_one(subset, bai)
-            # commit after every subset so a preemption preserves all completed groups
-            vol.commit()
-        print("[etl] agentic corpus committed to Volume.")
     import sys, json
     sys.path.insert(0, "/root")  # we'll mount uploaded modules
     from huggingface_hub import hf_hub_download
@@ -129,16 +113,17 @@ def etl():
     bai.DEFAULT_OUT = f"{IMG_DIR}/agentic"
     os.makedirs(bai.DEFAULT_OUT, exist_ok=True)
 
-    # fetch the sero manifest (conversation rows) — a small parquet of unique image names
-    mp = hf_hub_download(
-        repo_id="0xSero/glm-vision-sft-mix", repo_type="dataset",
-        filename="sero_manifest.parquet") if _hf_has("0xSero/glm-vision-sft-mix", "sero_manifest.parquet") else _build_manifest_local()
+    if not skip_agentic:
+        # fetch the sero manifest (conversation rows) — a small parquet of unique image names
+        mp = hf_hub_download(
+            repo_id="0xSero/glm-vision-sft-mix", repo_type="dataset",
+            filename="sero_manifest.parquet") if _hf_has("0xSero/glm-vision-sft-mix", "sero_manifest.parquet") else _build_manifest_local()
 
-    print("[etl] building agentic images (direct-from-source positional join) ...")
-    for subset in bai.ALL_SUBSETS:
-        print(f"[etl] subset={subset}")
-        bai_build_one(subset, bai)   # runs bai for that subset into IMG_DIR/agentic
-    vol.commit()
+        print("[etl] building agentic images (direct-from-source positional join) ...")
+        for subset in bai.ALL_SUBSETS:
+            print(f"[etl] subset={subset}")
+            bai_build_one(subset, bai)   # runs bai for that subset into IMG_DIR/agentic
+        vol.commit()
 
     # ---- cauldron: download permissive subsets, split doc/conversational ----
     print("[etl] downloading Cauldron permissive subsets ...")
