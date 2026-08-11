@@ -467,8 +467,6 @@ def cauldron_pull():
         os.replace(dest + ".part", dest)
         return dest
 
-    import pyarrow.parquet as pq  # instant row-count metadata reads
-
     def subset_is_complete(sub, local_paths):
         """Return True if every row of this subset is already in the done set.
 
@@ -476,12 +474,14 @@ def cauldron_pull():
         expected rec_id range, then checks the checkpoint set.  This avoids the
         cost of re-reading + re-deserializing 100+ MB shards when a subset was
         fully processed in a previous run."""
+        import pyarrow.parquet as pq
         try:
-            total_rows = sum(pq.read_schema(p).num_rows for p in local_paths)
+            total_rows = sum(pq.read_metadata(p).num_rows for p in local_paths)
         except Exception:
             return False
-        expected = {f"{sub}-{i:07d}" for i in range(total_rows)}
-        return expected and expected.issubset(done)
+        # count how many done rec_ids belong to this subset
+        n_done_sub = sum(1 for r in done if r.startswith(f"{sub}-"))
+        return n_done_sub >= total_rows
 
     for sub in DOC_SUBSETS + CONV_SUBSETS:
         try:
