@@ -201,35 +201,31 @@ def aguvis_zip_path(name):
 
 
 def download_aguvis_zip(name):
-    """Stream-download <name>.zip to AGUVIS_ZIP_DIR, resume-safe (skip if complete)."""
+    """Download <name>.zip via HF's parallel chunked downloader (fast, CDN-aware).
+
+    hf_hub_download uses multiple connections + CloudFront CDN vs the
+    single-connection requests.get which peaks at ~3 MB/s for these zips."""
+    from huggingface_hub import hf_hub_download
     os.makedirs(AGUVIS_ZIP_DIR, exist_ok=True)
     dest = aguvis_zip_path(name)
-    url = f"https://huggingface.co/datasets/xlangai/aguvis-stage2/resolve/main/{name}.zip"
-    head = requests.head(url, allow_redirects=True, timeout=60,
-                         headers={"User-Agent": USER_AGENT})
-    head.raise_for_status()
-    total = int(head.headers.get("Content-Length", -1))
-    if os.path.exists(dest) and total > 0 and os.path.getsize(dest) == total:
-        print(f"  [zip] {name}.zip already complete ({total} bytes)")
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        print(f"  [zip] {name}.zip already complete ({os.path.getsize(dest)} bytes)")
         return dest
-    tmp = dest + ".part"
-    have = os.path.getsize(tmp) if os.path.exists(tmp) else 0
-    headers = {"User-Agent": USER_AGENT}
-    if have and total > 0:
-        headers["Range"] = f"bytes={have}-"
-    print(f"  [zip] downloading {url} ({total} bytes, resuming at {have}) ...")
-    with requests.get(url, stream=True, timeout=120, headers=headers) as r:
-        if have and r.status_code != 206:
-            have = 0  # server didn't honor range; restart
-        r.raise_for_status()
-        mode = "ab" if have else "wb"
-        with open(tmp, mode) as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                f.write(chunk)
-    if total > 0 and os.path.getsize(tmp) != total:
-        raise RuntimeError(f"incomplete download of {name}.zip: "
-                           f"{os.path.getsize(tmp)} != {total}")
-    os.replace(tmp, dest)
+    print(f"  [zip] downloading {name}.zip via hf_hub_download ...")
+    downloaded = hf_hub_download(
+        repo_id="xlangai/aguvis-stage2",
+        repo_type="dataset",
+        filename=f"{name}.zip",
+        local_dir=AGUVIS_ZIP_DIR,
+        local_dir_use_symlinks=False,
+    )
+    # hf_hub_download saves to {local_dir}/xlangai--aguvis-stage2/{name}.zip
+    if downloaded != dest and os.path.exists(downloaded):
+        os.rename(downloaded, dest)
+        # clean up HF cache dir
+        hf_cache_dir = os.path.dirname(downloaded)
+        if os.path.isdir(hf_cache_dir) and not os.listdir(hf_cache_dir):
+            os.rmdir(hf_cache_dir)
     print(f"  [zip] {name}.zip ready ({os.path.getsize(dest)} bytes)")
     return dest
 
