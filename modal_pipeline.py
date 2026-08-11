@@ -582,6 +582,14 @@ def cauldron_pull():
         print(f"[cauldron] {sub}: done ({n_done} skipped, {len(futures)} processed)")
         vol.commit()
 
+        # free disk: delete this subset's parquet cache (no longer needed)
+        import shutil
+        for p in local_paths:
+            if os.path.exists(p):
+                os.remove(p)
+        vol.commit()
+        print(f"[cauldron] {sub}: parquet cache deleted")
+
     manifest_fh.close()
     # count final manifest rows
     with open(manifest_path) as f:
