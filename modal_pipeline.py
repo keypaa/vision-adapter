@@ -113,7 +113,7 @@ def etl():
             # commit after every subset so a preemption preserves all completed groups
             vol.commit()
         print("[etl] agentic corpus committed to Volume.")
-    import os, sys, json
+    import sys, json
     sys.path.insert(0, "/root")  # we'll mount uploaded modules
     from huggingface_hub import hf_hub_download
     os.makedirs(IMG_DIR, exist_ok=True); os.makedirs(META_DIR, exist_ok=True)
@@ -395,21 +395,80 @@ CONV_SUBSETS = ["vqav2", "okvqa", "aokvqa", "visual7w"]
 
 
 def cauldron_pull():
-    """Download-then-open-local for each permissive cauldron subset (robust to
-    HF streaming read-timeouts on >100 MB shards)."""
-    import json, os, requests, shutil
+    """Download-then-open-local for each permissive cauldron subset.
+
+    Parallelised: parquet shards download concurrently, rows are saved via a
+    ThreadPoolExecutor (PNG encode is CPU-bound).  A checkpoint file tracks
+    completed rec_ids so re-runs resume in seconds instead of hours."""
+    import json, os, requests, threading
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from datasets import load_dataset
     from PIL import Image
+
     out_img = f"{IMG_DIR}/cauldron"; os.makedirs(out_img, exist_ok=True)
-    manifest = []
+    manifest_path = f"{META_DIR}/cauldron_manifest.jsonl"
+    done_path = f"{META_DIR}/cauldron_done.txt"
+    os.makedirs(META_DIR, exist_ok=True)
+
+    # --- checkpoint: rec_ids already fully processed ---
+    done = set()
+    if os.path.exists(done_path):
+        with open(done_path) as f:
+            done = set(f.read().splitlines())
+    print(f"[cauldron] checkpoint: {len(done)} rows already done")
+
+    manifest_fh = open(manifest_path, "a")
+    done_lock = threading.Lock()
+
     hdr = {"User-Agent": "vision-adapter/1.0"}
-    # Cache goes inside the persistent data Volume so restarts reuse whatever is
-    # already downloaded (HF /hf is ephemeral across workers).
     cache_root = f"{VOLUME_DIR}/hf_cache/cauldron_parquet"
     os.makedirs(cache_root, exist_ok=True)
+
+    N_DL = 6      # parallel parquet downloads
+    N_SAVE = 12   # parallel PNG encodes (saturates CPU on 16-core)
+
+    def save_one(rec_id, sub, imgs, texts):
+        """Save images + append manifest for one row. Thread-safe."""
+        paths = []
+        for j, im in enumerate(imgs):
+            p = f"{out_img}/{rec_id}-{j}.png"
+            if not os.path.exists(p):
+                if im.mode != "RGB":
+                    im = im.convert("RGB")
+                im.save(p, optimize=False)
+            paths.append(p)
+        group = "doc" if sub in DOC_SUBSETS else "conv"
+        lines = []
+        for turn in texts:
+            lines.append(json.dumps({"id": rec_id, "subset": sub, "group": group,
+                                     "images": paths, "user": turn["user"],
+                                     "assistant": turn["assistant"]}))
+        with done_lock:
+            manifest_fh.write("\n".join(lines) + "\n")
+            manifest_fh.flush()
+            with open(done_path, "a") as df:
+                df.write(rec_id + "\n")
+        sub
+
+    def download_one(fmeta):
+        rel = fmeta["rfilename"]
+        dest = os.path.join(cache_root, rel.replace("/", "__"))
+        url = (f"https://huggingface.co/datasets/HuggingFaceM4/the_cauldron"
+               f"/resolve/main/{rel}")
+        want = fmeta.get("size", -1)
+        if os.path.exists(dest) and os.path.getsize(dest) == want:
+            return dest
+        with requests.get(url, headers=hdr, stream=True,
+                          timeout=(30, 600), allow_redirects=True) as r:
+            r.raise_for_status()
+            with open(dest + ".part", "wb") as fh:
+                for chunk in r.iter_content(1 << 20):
+                    if chunk: fh.write(chunk)
+        os.replace(dest + ".part", dest)
+        return dest
+
     for sub in DOC_SUBSETS + CONV_SUBSETS:
         try:
-            # step 1: enumerate the subset's parquet files via the HF API
             files = [s for s in requests.get(
                 "https://huggingface.co/api/datasets/HuggingFaceM4/the_cauldron",
                 params={"full": "true", "config": sub},
@@ -417,58 +476,50 @@ def cauldron_pull():
                 if f"the_cauldron/{sub}-" in s.get("rfilename", "")
                 and s.get("rfilename", "").endswith(".parquet")]
             if not files:
-                # fall back to the older single-file layout
                 files = [s for s in requests.get(
                     "https://huggingface.co/api/datasets/HuggingFaceM4/the_cauldron",
                     params={"full": "true", "config": sub},
                     headers=hdr, timeout=30).json().get("siblings", [])
                     if sub in s.get("rfilename", "") and s.get("rfilename", "").endswith(".parquet")]
+            # parallel download
             local_paths = []
-            for fmeta in files:
-                rel = fmeta["rfilename"]
-                dest = os.path.join(cache_root, rel.replace("/", "__"))
-                url = (f"https://huggingface.co/datasets/HuggingFaceM4/the_cauldron"
-                       f"/resolve/main/{rel}")
-                want = fmeta.get("size", -1)
-                if not os.path.exists(dest) or os.path.getsize(dest) != want:
-                    with requests.get(url, headers=hdr, stream=True,
-                                      timeout=(30, 600), allow_redirects=True) as r:
-                        r.raise_for_status()
-                        with open(dest + ".part", "wb") as fh:
-                            for chunk in r.iter_content(1 << 20):
-                                if chunk: fh.write(chunk)
-                    os.replace(dest + ".part", dest)
-                local_paths.append(dest)
-                print(f"[cauldron] {sub}: cached {rel.split('/')[-1]} ({os.path.getsize(dest)/1e6:.0f} MB)")
-            # step 2: open the local files — no network inside the row loop
+            with ThreadPoolExecutor(max_workers=N_DL) as ex:
+                for path in ex.map(download_one, files):
+                    local_paths.append(path)
+                    print(f"[cauldron] {sub}: cached {os.path.basename(path)} ({os.path.getsize(path)/1e6:.0f} MB)")
             ds = load_dataset("parquet", data_files=local_paths, split="train")
         except Exception as e:
             print(f"[cauldron] SKIP {sub}: {e}"); continue
-        n = 0
-        for i, row in enumerate(ds):
-            try:
-                imgs = row["images"]          # list[PIL]
+
+        # parallel row processing
+        n_done = 0
+        with ThreadPoolExecutor(max_workers=N_SAVE) as ex:
+            futures = {}
+            for i, row in enumerate(ds):
                 rec_id = f"{sub}-{i:07d}"
-                paths = []
-                for j, im in enumerate(imgs):
-                    p = f"{out_img}/{rec_id}-{j}.png"
-                    if not os.path.exists(p): im.save(p)
-                    paths.append(p)
-                for turn in row["texts"]:
-                    manifest.append({"id": rec_id, "subset": sub,
-                                     "group": ("doc" if sub in DOC_SUBSETS else "conv"),
-                                     "images": paths,
-                                     "user": turn["user"], "assistant": turn["assistant"]})
-                n += 1
-            except Exception as e:
-                print(f"[cauldron] row error {sub}#{i}: {e}")
-            if i and i % 5000 == 0:
-                print(f"[cauldron] {sub}: {i} rows"); vol.commit()
-        print(f"[cauldron] {sub}: {n} rows")
+                if rec_id in done:
+                    n_done += 1
+                    continue
+                fut = ex.submit(save_one, rec_id, sub, row["images"], row["texts"])
+                futures[fut] = i
+
+            for fut in as_completed(futures):
+                i = futures[fut]
+                try:
+                    fut.result()
+                except Exception as e:
+                    print(f"[cauldron] row error {sub}#{i}: {e}")
+                if i and i % 5000 == 0:
+                    print(f"[cauldron] {sub}: {i} rows"); vol.commit()
+
+        print(f"[cauldron] {sub}: done ({n_done} skipped, {len(futures)} processed)")
         vol.commit()
-    with open(f"{META_DIR}/cauldron_manifest.jsonl", "w") as f:
-        for m in manifest: f.write(json.dumps(m) + "\n")
-    print(f"[cauldron] manifest rows={len(manifest)}")
+
+    manifest_fh.close()
+    # count final manifest rows
+    with open(manifest_path) as f:
+        n_total = sum(1 for _ in f)
+    print(f"[cauldron] manifest rows={n_total}")
 
 
 # =====================================================================
