@@ -452,34 +452,43 @@ def cauldron_pull():
 
     def download_subset(sub, files):
         """Download all parquet shards for one subset using HF's parallel
-        chunked downloader (snapshot_download).  Much faster than sequential
-        requests.get — uses multiple connections per file, CDN-aware."""
-        from huggingface_hub import snapshot_download
+        chunked downloader.  Much faster than sequential requests.get — uses
+        multiple connections per file, CDN-aware.  Files are stored in a flat
+        layout ({sub}__<filename>) so cache checks are instant."""
+        from huggingface_hub import hf_hub_download
+        from concurrent.futures import ThreadPoolExecutor as _TPE
         want = {f["rfilename"]: f.get("size", -1) for f in files}
-        # check if all already cached
-        all_cached = True
-        for rel in want:
-            dest = os.path.join(cache_root, rel.replace("/", "__"))
-            if not (os.path.exists(dest) and os.path.getsize(dest) == want[rel]):
-                all_cached = False
-                break
-        if all_cached:
-            return [(os.path.join(cache_root, rel.replace("/", "__")), True)
-                    for rel in want]
-        # download all shards for this subset in parallel
-        snapshot_download(
-            repo_id="HuggingFaceM4/the_cauldron",
-            repo_type="dataset",
-            allow_patterns=[f"the_cauldron/{sub}-*.parquet"],
-            local_dir=cache_root,
-            local_dir_use_symlinks=False,
-            max_workers=N_DL,
-        )
-        results = []
-        for rel in want:
-            dest = os.path.join(cache_root, rel.replace("/", "__"))
-            was_cached = os.path.exists(dest) and os.path.getsize(dest) == want[rel]
-            results.append((dest, was_cached))
+        flat = {rel: os.path.join(cache_root, rel.replace("/", "__")) for rel in want}
+        # check if all already cached (flat layout from a previous run)
+        if all(os.path.exists(dest) and os.path.getsize(dest) == want[rel]
+               for rel, dest in flat.items()):
+            return [(dest, True) for dest in flat.values()]
+        # download each shard in parallel; hf_hub_download is multi-connection
+        def _dl(rel):
+            dest = flat[rel]
+            if os.path.exists(dest) and os.path.getsize(dest) == want[rel]:
+                return dest, True
+            hf_hub_download(
+                repo_id="HuggingFaceM4/the_cauldron",
+                repo_type="dataset",
+                filename=rel,
+                local_dir=cache_root,
+                local_dir_use_symlinks=False,
+            )
+            # hf_hub_download puts files in {local_dir}/{rel}; move to flat
+            src = os.path.join(cache_root, rel)
+            if src != dest and os.path.exists(src):
+                os.rename(src, dest)
+            return dest, False
+        with _TPE(max_workers=N_DL) as ex:
+            results = list(ex.map(_dl, want))
+        # clean up any empty HF directory structure left behind
+        hf_sub_dir = os.path.join(cache_root, "the_cauldron", sub)
+        if os.path.isdir(hf_sub_dir) and not os.listdir(hf_sub_dir):
+            os.rmdir(hf_sub_dir)
+            parent = os.path.join(cache_root, "the_cauldron")
+            if os.path.isdir(parent) and not os.listdir(parent):
+                os.rmdir(parent)
         return results
 
     def subset_is_complete(sub, local_paths):
