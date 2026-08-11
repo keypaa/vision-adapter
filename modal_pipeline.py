@@ -521,9 +521,9 @@ def cauldron_pull():
             # parallel download (HF snapshot_download, multi-connection per file)
             results = download_subset(sub, files)
             local_paths = [p for p, _ in results]
-            for p in results:
-                tag = "cached" if p[1] else "downloaded"
-                print(f"[cauldron] {sub}: {tag} {os.path.basename(p[0])} ({os.path.getsize(p[0])/1e6:.0f} MB)")
+            total_mb = sum(os.path.getsize(p[0]) for p in results) / 1e6
+            n_new = sum(1 for p in results if not p[1])
+            print(f"[cauldron] {sub}: {len(results)} shards, {total_mb:.0f} MB total, {n_new} downloaded")
             # subset-level skip: if every row already done, no need to re-read parquet
             if subset_is_complete(sub, local_paths):
                 print(f"[cauldron] {sub}: all rows already processed — skipping")
