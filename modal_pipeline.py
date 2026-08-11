@@ -429,10 +429,16 @@ def cauldron_pull():
 
     def save_one(rec_id, sub, imgs, texts):
         """Save images + append manifest for one row. Thread-safe."""
+        from io import BytesIO
         paths = []
         for j, im in enumerate(imgs):
             p = f"{out_img}/{rec_id}-{j}.png"
             if not os.path.exists(p):
+                # images can be bytes, dict{"bytes": ...}, or PIL depending on source
+                if isinstance(im, dict):
+                    im = Image.open(BytesIO(im["bytes"]))
+                elif isinstance(im, bytes):
+                    im = Image.open(BytesIO(im))
                 if im.mode != "RGB":
                     im = im.convert("RGB")
                 im.save(p, optimize=False)
