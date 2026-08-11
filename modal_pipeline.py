@@ -531,11 +531,16 @@ def cauldron_pull():
             if subset_is_complete(sub, local_paths):
                 print(f"[cauldron] {sub}: all rows already processed — skipping")
                 continue
-            import time
+            import time, pyarrow.parquet as pq
             t0 = time.time()
-            ds = load_dataset("parquet", data_files=local_paths, split="train")
+            # read parquet directly with PyArrow (10-50x faster than HF datasets
+            # for image columns — avoids per-row PIL deserialization overhead)
+            table = pq.read_table(local_paths[0]) if len(local_paths) == 1 else pq.ParquetDataset(local_paths).read()
+            images_col = table.column("images").to_pylist()
+            texts_col = table.column("texts").to_pylist()
+            n_rows = len(images_col)
             t_read = time.time() - t0
-            print(f"[cauldron] {sub}: parquet read {t_read:.1f}s ({len(ds)} rows)")
+            print(f"[cauldron] {sub}: parquet read {t_read:.1f}s ({n_rows} rows)")
         except Exception as e:
             print(f"[cauldron] SKIP {sub}: {e}"); continue
 
@@ -544,17 +549,17 @@ def cauldron_pull():
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=N_SAVE) as ex:
             futures = {}
-            for i, row in enumerate(ds):
+            for i in range(n_rows):
                 rec_id = f"{sub}-{i:07d}"
                 if rec_id in done:
                     n_done += 1
                     continue
-                fut = ex.submit(save_one, rec_id, sub, row["images"], row["texts"])
+                fut = ex.submit(save_one, rec_id, sub, images_col[i], texts_col[i])
                 futures[fut] = i
 
             t_iter = time.time() - t0
-            print(f"[cauldron] {sub}: iterate {t_iter:.1f}s ({len(futures)} queued, {n_done} skipped)")
             n_total = len(futures)
+            print(f"[cauldron] {sub}: iterate {t_iter:.1f}s ({n_total} queued, {n_done} skipped)")
             for fut in as_completed(futures):
                 i = futures[fut]
                 try:
