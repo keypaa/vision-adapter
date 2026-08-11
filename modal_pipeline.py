@@ -552,6 +552,8 @@ def cauldron_pull():
                 fut = ex.submit(save_one, rec_id, sub, row["images"], row["texts"])
                 futures[fut] = i
 
+            t_iter = time.time() - t0
+            print(f"[cauldron] {sub}: iterate {t_iter:.1f}s ({len(futures)} queued, {n_done} skipped)")
             n_total = len(futures)
             for fut in as_completed(futures):
                 i = futures[fut]
@@ -564,7 +566,7 @@ def cauldron_pull():
 
         t_save = time.time() - t0
         rate = n_total / t_save if t_save > 0 else 0
-        print(f"[cauldron] {sub}: save {t_save:.1f}s ({n_total} rows, {rate:.0f} rows/s)")
+        print(f"[cauldron] {sub}: save {t_save:.1f}s total ({n_total} rows, {rate:.0f} rows/s)")
 
         print(f"[cauldron] {sub}: done ({n_done} skipped, {len(futures)} processed)")
         vol.commit()
