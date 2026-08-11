@@ -378,6 +378,12 @@ DOC_SUBSETS = ["chartqa", "docvqa", "infographic_vqa", "screen2words", "websight
                "ocrvqa", "textvqa", "plotqa", "ai2d", "scienceqa"]
 CONV_SUBSETS = ["vqav2", "okvqa", "aokvqa", "visual7w"]
 
+# Per-subset row caps: sample evenly from every subset for diversity without
+# processing all 1.8M Cauldron rows.  Targets: 54k doc + 12k conv = 66k total.
+# Doc: 54k / 10 subsets = 5400 each.  Conv: 12k / 4 subsets = 3000 each.
+DOC_MAX_ROWS = 5400
+CONV_MAX_ROWS = 3000
+
 
 def cauldron_pull():
     """Download-then-open-local for each permissive cauldron subset.
@@ -541,10 +547,15 @@ def cauldron_pull():
 
         # parallel row processing
         n_done = 0
+        # per-subset cap: sample evenly from every subset for diversity
+        max_rows = DOC_MAX_ROWS if sub in DOC_SUBSETS else CONV_MAX_ROWS
+        n_cap = min(n_rows, max_rows)
+        if n_cap < n_rows:
+            print(f"[cauldron] {sub}: capping {n_rows} → {n_cap} rows")
         t0 = time.time()
         with ThreadPoolExecutor(max_workers=N_SAVE) as ex:
             futures = {}
-            for i in range(n_rows):
+            for i in range(n_cap):
                 rec_id = f"{sub}-{i:07d}"
                 if rec_id in done:
                     n_done += 1
@@ -555,7 +566,7 @@ def cauldron_pull():
             t_iter = time.time() - t0
             n_total = len(futures)
             print(f"[cauldron] {sub}: iterate {t_iter:.1f}s ({n_total} queued, {n_done} skipped)")
-            for fut in as_completed(futures):
+            for fut as_completed(futures):
                 i = futures[fut]
                 try:
                     fut.result()
