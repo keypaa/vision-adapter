@@ -453,11 +453,11 @@ def cauldron_pull():
     def download_one(fmeta):
         rel = fmeta["rfilename"]
         dest = os.path.join(cache_root, rel.replace("/", "__"))
-        url = (f"https://huggingface.co/datasets/HuggingFaceM4/the_cauldron"
-               f"/resolve/main/{rel}")
         want = fmeta.get("size", -1)
         if os.path.exists(dest) and os.path.getsize(dest) == want:
-            return dest
+            return dest, True  # (path, was_cached)
+        url = (f"https://huggingface.co/datasets/HuggingFaceM4/the_cauldron"
+               f"/resolve/main/{rel}")
         with requests.get(url, headers=hdr, stream=True,
                           timeout=(30, 600), allow_redirects=True) as r:
             r.raise_for_status()
@@ -465,7 +465,7 @@ def cauldron_pull():
                 for chunk in r.iter_content(1 << 20):
                     if chunk: fh.write(chunk)
         os.replace(dest + ".part", dest)
-        return dest
+        return dest, False
 
     def subset_is_complete(sub, local_paths):
         """Return True if every row of this subset is already in the done set.
@@ -499,10 +499,16 @@ def cauldron_pull():
                     if sub in s.get("rfilename", "") and s.get("rfilename", "").endswith(".parquet")]
             # parallel download
             local_paths = []
+            n_cached = 0
             with ThreadPoolExecutor(max_workers=N_DL) as ex:
-                for path in ex.map(download_one, files):
+                for path, was_cached in ex.map(download_one, files):
                     local_paths.append(path)
-                    print(f"[cauldron] {sub}: cached {os.path.basename(path)} ({os.path.getsize(path)/1e6:.0f} MB)")
+                    tag = "cached" if was_cached else "downloaded"
+                    if was_cached:
+                        n_cached += 1
+                    print(f"[cauldron] {sub}: {tag} {os.path.basename(path)} ({os.path.getsize(path)/1e6:.0f} MB)")
+            if n_cached == len(files):
+                print(f"[cauldron] {sub}: all {len(files)} shards already cached")
             # subset-level skip: if every row already done, no need to re-read parquet
             if subset_is_complete(sub, local_paths):
                 print(f"[cauldron] {sub}: all rows already processed — skipping")
