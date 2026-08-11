@@ -536,6 +536,10 @@ def cauldron_pull():
             # subset-level skip: if every row already done, no need to re-read parquet
             if subset_is_complete(sub, local_paths):
                 print(f"[cauldron] {sub}: all rows already processed — skipping")
+                # still delete parquet to free disk
+                for p in local_paths:
+                    if os.path.exists(p):
+                        os.remove(p)
                 continue
             import time, pyarrow.parquet as pq
             t0 = time.time()
