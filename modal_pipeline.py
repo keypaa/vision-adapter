@@ -507,12 +507,17 @@ def cauldron_pull():
             if subset_is_complete(sub, local_paths):
                 print(f"[cauldron] {sub}: all rows already processed — skipping")
                 continue
+            import time
+            t0 = time.time()
             ds = load_dataset("parquet", data_files=local_paths, split="train")
+            t_read = time.time() - t0
+            print(f"[cauldron] {sub}: parquet read {t_read:.1f}s ({len(ds)} rows)")
         except Exception as e:
             print(f"[cauldron] SKIP {sub}: {e}"); continue
 
         # parallel row processing
         n_done = 0
+        t0 = time.time()
         with ThreadPoolExecutor(max_workers=N_SAVE) as ex:
             futures = {}
             for i, row in enumerate(ds):
@@ -523,6 +528,7 @@ def cauldron_pull():
                 fut = ex.submit(save_one, rec_id, sub, row["images"], row["texts"])
                 futures[fut] = i
 
+            n_total = len(futures)
             for fut in as_completed(futures):
                 i = futures[fut]
                 try:
@@ -531,6 +537,10 @@ def cauldron_pull():
                     print(f"[cauldron] row error {sub}#{i}: {e}")
                 if i and i % 5000 == 0:
                     print(f"[cauldron] {sub}: {i} rows"); vol.commit()
+
+        t_save = time.time() - t0
+        rate = n_total / t_save if t_save > 0 else 0
+        print(f"[cauldron] {sub}: save {t_save:.1f}s ({n_total} rows, {rate:.0f} rows/s)")
 
         print(f"[cauldron] {sub}: done ({n_done} skipped, {len(futures)} processed)")
         vol.commit()
