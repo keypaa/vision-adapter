@@ -467,6 +467,22 @@ def cauldron_pull():
         os.replace(dest + ".part", dest)
         return dest
 
+    import pyarrow.parquet as pq  # instant row-count metadata reads
+
+    def subset_is_complete(sub, local_paths):
+        """Return True if every row of this subset is already in the done set.
+
+        Uses parquet metadata (num_rows only, no deserialization) to compute the
+        expected rec_id range, then checks the checkpoint set.  This avoids the
+        cost of re-reading + re-deserializing 100+ MB shards when a subset was
+        fully processed in a previous run."""
+        try:
+            total_rows = sum(pq.read_schema(p).num_rows for p in local_paths)
+        except Exception:
+            return False
+        expected = {f"{sub}-{i:07d}" for i in range(total_rows)}
+        return expected and expected.issubset(done)
+
     for sub in DOC_SUBSETS + CONV_SUBSETS:
         try:
             files = [s for s in requests.get(
@@ -487,6 +503,10 @@ def cauldron_pull():
                 for path in ex.map(download_one, files):
                     local_paths.append(path)
                     print(f"[cauldron] {sub}: cached {os.path.basename(path)} ({os.path.getsize(path)/1e6:.0f} MB)")
+            # subset-level skip: if every row already done, no need to re-read parquet
+            if subset_is_complete(sub, local_paths):
+                print(f"[cauldron] {sub}: all rows already processed — skipping")
+                continue
             ds = load_dataset("parquet", data_files=local_paths, split="train")
         except Exception as e:
             print(f"[cauldron] SKIP {sub}: {e}"); continue
