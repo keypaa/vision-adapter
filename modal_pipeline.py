@@ -566,7 +566,7 @@ def cauldron_pull():
             t_iter = time.time() - t0
             n_total = len(futures)
             print(f"[cauldron] {sub}: iterate {t_iter:.1f}s ({n_total} queued, {n_done} skipped)")
-            for fut as_completed(futures):
+            for fut in as_completed(futures):
                 i = futures[fut]
                 try:
                     fut.result()
