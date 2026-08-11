@@ -211,7 +211,9 @@ def download_aguvis_zip(name):
     if os.path.exists(dest) and os.path.getsize(dest) > 0:
         print(f"  [zip] {name}.zip already complete ({os.path.getsize(dest)} bytes)")
         return dest
+    import time
     print(f"  [zip] downloading {name}.zip via hf_hub_download ...")
+    t0 = time.time()
     downloaded = hf_hub_download(
         repo_id="xlangai/aguvis-stage2",
         repo_type="dataset",
@@ -226,7 +228,10 @@ def download_aguvis_zip(name):
         hf_cache_dir = os.path.dirname(downloaded)
         if os.path.isdir(hf_cache_dir) and not os.listdir(hf_cache_dir):
             os.rmdir(hf_cache_dir)
-    print(f"  [zip] {name}.zip ready ({os.path.getsize(dest)} bytes)")
+    elapsed = time.time() - t0
+    size_mb = os.path.getsize(dest) / 1e6
+    speed = size_mb / elapsed if elapsed > 0 else 0
+    print(f"  [zip] {name}.zip ready ({size_mb:.0f} MB, {elapsed:.1f}s, {speed:.1f} MB/s)")
     return dest
 
 
