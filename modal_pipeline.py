@@ -327,7 +327,7 @@ The image corpus is a **separate** HF dataset repo
 ## Contents
 
 * `train_manifest.jsonl` — the actual train mixture (45% agentic / 45% doc / 10% conversational). Every row:
-  `{emb: "embeddings/<sha1>.pt", user, assistant, g: "agentic|doc|conv"}`.
+  `{{emb: "embeddings/<sha1>.pt", user, assistant, g: "agentic|doc|conv"}}`.
 * `train_manifest_val.jsonl` — held-out validation split (never optimized).
 * `cauldron_manifest.jsonl` — raw cauldron pull (≈1.9M rows) before the sampled recipe.
 """
