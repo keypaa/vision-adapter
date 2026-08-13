@@ -220,6 +220,31 @@ def push_image_corpus_to_hf(repo_ns: str = "keypa", shard_rows: int = 8192):
     def shard_name(i):
         return f"train-{i:05d}-of-{n_shards:05d}.parquet"
 
+    import time
+    from concurrent.futures import ThreadPoolExecutor
+
+    def read_chunk(chunk):
+        """Read one shard's images off the Volume in parallel.
+
+        Modal Volumes are network-backed: per-file open/read has ~50-100 ms
+        round-trip latency, so serial reads are latency-bound (8192 files *
+        ~73 ms ≈ 10 min/shard).  Parallel reads saturate the volume's
+        throughput instead of waiting on latency."""
+        def _read(item):
+            rel, p = item
+            with open(p, "rb") as f:
+                b = f.read()
+            return rel, b
+        with ThreadPoolExecutor(max_workers=32) as ex:
+            rows = list(ex.map(_read, chunk))
+        cols = {"image": [], "filename": [], "source": [], "size": []}
+        for rel, b in rows:
+            cols["image"].append(b)
+            cols["filename"].append(rel)
+            cols["source"].append(rel.split("/", 1)[0])
+            cols["size"].append(len(b))
+        return cols
+
     total_bytes = 0
     skipped = 0
     for i in range(n_shards):
@@ -229,22 +254,23 @@ def push_image_corpus_to_hf(repo_ns: str = "keypa", shard_rows: int = 8192):
             skipped += 1
             continue
         chunk = files[i * shard_rows:(i + 1) * shard_rows]
-        cols = {"image": [], "filename": [], "source": [], "size": []}
-        for rel, p in chunk:
-            b = open(p, "rb").read()
-            cols["image"].append(b)
-            cols["filename"].append(rel)
-            cols["source"].append(rel.split("/", 1)[0])
-            cols["size"].append(len(b))
+        t0 = time.time()
+        cols = read_chunk(chunk)
+        t_read = time.time() - t0
         table = pa.Table.from_pydict(cols, schema=schema)
         local = os.path.join(shard_dir, name)
+        t1 = time.time()
         pq.write_table(table, local)
+        t_write = time.time() - t1
         total_bytes += sum(len(b) for b in cols["image"])
         del cols, table
+        t2 = time.time()
         api.upload_file(path_or_fileobj=local, path_in_repo=os.path.join(data_rel, name),
                         repo_id=repo_id, repo_type="dataset",
                         commit_message=f"shard {name}")
-        print(f"[image-push] uploaded {name} ({len(chunk)} rows)")
+        t_upload = time.time() - t2
+        print(f"[image-push] uploaded {name} ({len(chunk)} rows) "
+              f"read={t_read:.0f}s write={t_write:.0f}s upload={t_upload:.0f}s")
 
     # dataset_info.json so the Hub viewer/server can validate + serve the dataset
     info = {
@@ -833,9 +859,60 @@ def build_train_manifest():
     print("[mix] train", Counter(r["g"] for r in train), "total", len(train))
     print("[mix] val  ", Counter(r["g"] for r in val), "total", len(val))
 
+def _prefetch_packs(image_paths, batch, workers=8, ahead=1):
+    """Generator of (chunk, pixel_values, grid_thws) with CPU decode+patchify
+    running ahead of the GPU consumer.
+
+    Decoding PNG + numpy patchify (collate_images) is the measured bottleneck of
+    precompute — GPU saturates ~60% with serial decode because it idles waiting
+    for the CPU.  Here a worker thread pool decodes images off-GPU while the
+    accelerator computes the previous batch; `ahead` batches are prefetched, so
+    util climbs toward the GPU's ceiling regardless of batch size.
+    """
+    import torch
+    from concurrent.futures import ThreadPoolExecutor
+    from queue import Queue
+    from threading import Thread
+
+    def _one(p):
+        from PIL import Image
+        from preprocess import process_image
+        return process_image(Image.open(p).convert("RGB"))
+
+    ex = ThreadPoolExecutor(max_workers=workers)
+    q = Queue(maxsize=ahead)
+
+    def _produce():
+        try:
+            for s in range(0, len(image_paths), batch):
+                chunk = image_paths[s:s + batch]
+                outs = list(ex.map(_one, chunk))
+                pv = torch.cat([o["pixel_values"] for o in outs], dim=0)
+                gt = torch.cat([o["grid_thws"] for o in outs], dim=0)
+                q.put((chunk, pv, gt))
+        finally:
+            q.put(None)
+
+    Thread(target=_produce, daemon=True).start()
+    while True:
+        item = q.get()
+        if item is None:
+            ex.shutdown(wait=True)
+            return
+        yield item
+
+
 @app.function(image=_vit_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
               gpu=GPU, timeout=60 * 60 * 12, memory="64GB")
-def precompute():
+def precompute(batch: int = _Const.BATCH, workers: int = 8):
+    """Frozen MoonViT-V2 over every image -> /data/embeddings/<sha1>.pt (BF16).
+
+    `batch` is the micro-batch of images per forward; `workers` threads decode
+    and patchify the *next* batch while the GPU computes the current one (the
+    CPU decode is the real bottleneck, not the A100).  Bench showed img/s flat
+    beyond B=32 at ~41 img/s with serial decode but VRAM still climbing, so
+    batching past ~128 costs memory for nothing — prefer more `workers` instead.
+    """
     import os, sys, glob, json, torch
     from huggingface_hub import hf_hub_download
     os.makedirs(EMB_DIR, exist_ok=True)
@@ -844,8 +921,6 @@ def precompute():
         with open(p) as f: open(f"/root/{m}", "w").write(f.read())
     sys.path.insert(0, "/root")
     from moonvit import load_moonvit_from_safetensors
-    from preprocess import collate_images  # packs PIL list -> pixel_values, grid_thws
-    from preprocess import process_image
 
     cfg = json.load(open(hf_hub_download(repo_id=MOONVIT_REPO, repo_type="model",
                                          filename="vision_config.json")))
@@ -855,17 +930,13 @@ def precompute():
 
     img_paths = sorted(glob.glob(f"{IMG_DIR}/agentic/*") + glob.glob(f"{IMG_DIR}/cauldron/*"))
     img_paths = [p for p in img_paths if not _already_done(p)]
-    print(f"[precompute] total={len(img_paths)} new/todo={len(img_paths)}")
-    B = _Const.BATCH  # micro-batch of images per forward
+    print(f"[precompute] total={len(img_paths)} new/todo={len(img_paths)} "
+          f"batch={batch} workers={workers}")
+    B = batch  # micro-batch of images per forward
     done = 0
     with torch.no_grad():
-        for s in range(0, len(img_paths), B):
-            chunk = img_paths[s:s + B]
-            outs = []
-            from PIL import Image
-            ims = [Image.open(p).convert("RGB") for p in chunk]
-            pack = collate_images(ims)
-            merged = vit(pack["pixel_values"].cuda(), pack["grid_thws"].cuda())
+        for chunk, pv, gt in _prefetch_packs(img_paths, B, workers=workers):
+            merged = vit(pv.cuda(), gt.cuda())
             for p, emb in zip(chunk, merged):
                 # emb: [n_merged, 4, 1024]; cache the 4096-flattened projector input
                 flat = emb.reshape(emb.shape[0], -1).to(torch.bfloat16).cpu()
@@ -875,6 +946,121 @@ def precompute():
                 print(f"[precompute] {done}/{len(img_paths)}"); vol.commit()
     vol.commit()
     print(f"[precompute] DONE. wrote {done} embeddings to {EMB_DIR}")
+
+
+@app.function(image=_vit_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              gpu=GPU, timeout=60 * 60 * 2, memory="64GB")
+def precompute_bench(batch_sizes=(16, 32, 64, 128, 256, 512),
+                     n_images: int = 512, n_iter: int = 3):
+    """Measure GPU memory % and GPU utilization % for a range of micro-batch sizes.
+
+    Same data path as `precompute` (decode PNG -> collate -> MoonViT-V2 forward),
+    but runs `n_iter` passes over a fixed `n_images` sample per batch size and
+    reports per size: wall img/s, peak GPU mem (GiB + % of the 80 GB A100), and
+    GPU utilization % (sampled from nvidia-smi in a background thread). Use the
+    numbers to pick the biggest batch that (a) fits comfortably and (b) drives
+    util > 90% before spending A100-hours on the full 145k-image run.
+    """
+    import os, sys, glob, json, time, threading, subprocess, torch
+    from huggingface_hub import hf_hub_download
+    from PIL import Image
+    os.makedirs(EMB_DIR, exist_ok=True)
+    for m in ["moonvit.py", "preprocess.py"]:
+        p = hf_hub_download(repo_id=MOONVIT_REPO, repo_type="model", filename=m)
+        with open(p) as f: open(f"/root/{m}", "w").write(f.read())
+    sys.path.insert(0, "/root")
+    from moonvit import load_moonvit_from_safetensors
+
+    cfg = json.load(open(hf_hub_download(repo_id=MOONVIT_REPO, repo_type="model",
+                                         filename="vision_config.json")))
+    st  = hf_hub_download(repo_id=MOONVIT_REPO, repo_type="model",
+                          filename="moonvit_v2.safetensors")
+    vit = load_moonvit_from_safetensors(st, cfg, device="cuda", dtype=torch.bfloat16)
+    n_param = sum(p.numel() for p in vit.parameters())
+    try:
+        import flash_attn  # noqa: F401
+        flash_ok = True
+    except Exception:
+        flash_ok = False
+
+    prop = torch.cuda.get_device_properties(0)
+    total_gb = prop.total_memory / 2 ** 30
+
+    vol.reload()
+    img_paths = sorted(glob.glob(f"{IMG_DIR}/agentic/*") + glob.glob(f"{IMG_DIR}/cauldron/*"))
+    img_paths = img_paths[:n_images]
+    print(f"[bench] model={n_param/1e6:.0f}M params  flash_attn={'YES' if flash_ok else 'NO (slow fallback)'}  "
+          f"card={prop.name} {total_gb:.0f} GiB  sample={len(img_paths)} images")
+
+    n_stop = max(batch_sizes)
+    n_use = (len(img_paths) // n_stop) * n_stop
+    if n_use <= 0:
+        raise RuntimeError(f"need >= {n_stop} images, found {len(img_paths)}")
+    sample = img_paths[:n_use]
+
+    # background nvidia-smi sampler for GPU % during each timed run
+    def run_timed(B):
+        res = {"util": [], "mem": []}
+        stop = threading.Event()
+        def _sample():
+            while not stop.is_set():
+                try:
+                    out = subprocess.run(
+                        ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                         "--format=csv,noheader,nounits"],
+                        capture_output=True, text=True, timeout=3).stdout.strip()
+                    u, m = [int(x) for x in out.split(",")]
+                    res["util"].append(u); res["mem"].append(m)
+                except Exception:
+                    pass
+                time.sleep(0.05)
+        def _loop(pf):
+            with torch.no_grad():
+                for _ in range(n_iter):
+                    if pf:
+                        # prefetch pipeline: decode batch k+1 while GPU runs batch k
+                        for chunk, pv, gt in _prefetch_packs(sample, B, workers=8):
+                            out = vit(pv.cuda(), gt.cuda())
+                            for p, emb in zip(chunk, out):
+                                emb.reshape(emb.shape[0], -1).to(torch.bfloat16).cpu()
+                    else:
+                        # serial baseline (old behavior)
+                        for s in range(0, n_use, B):
+                            chunk = sample[s:s + B]
+                            ims = [Image.open(p).convert("RGB") for p in chunk]
+                            pack = collate_images(ims)
+                            out = vit(pack["pixel_values"].cuda(), pack["grid_thws"].cuda())
+                            for p, emb in zip(chunk, out):
+                                emb.reshape(emb.shape[0], -1).to(torch.bfloat16).cpu()
+            torch.cuda.synchronize()
+        thr = threading.Thread(target=_sample, daemon=True); thr.start()
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.time()
+        _loop(pf=True)  # measure prefetch path for mem/util
+        wall = time.time() - t0
+        torch.cuda.synchronize()
+        t_ser = time.time()
+        _loop(pf=False)  # serial baseline for comparison
+        wall_ser = time.time() - t_ser
+        torch.cuda.synchronize()
+        stop.set(); thr.join(timeout=5)
+        peak = torch.cuda.max_memory_allocated() / 2 ** 30
+        avg_util = sum(res["util"]) / len(res["util"]) if res["util"] else float("nan")
+        img_per_s = (n_use * n_iter) / wall
+        img_per_s_ser = (n_use * n_iter) / wall_ser
+        return wall, img_per_s, img_per_s_ser, peak, avg_util
+
+    print(f"[bench] {'B':>5} {'pf img/s':>9} {'ser img/s':>9} {'peak GiB':>9} {'mem %':>7} {'gpu util %':>10}")
+    results = []
+    for B in batch_sizes:
+        wall, imgps, imgps_ser, peak, util = run_timed(B)
+        spd = imgps / imgps_ser if imgps_ser else float("nan")
+        results.append((B, imgps, imgps_ser, peak, util))
+        print(f"[bench] {B:>5} {imgps:>9.1f} {imgps_ser:>9.1f} {peak:>9.2f} {peak/total_gb*100:>6.1f}% {util:>9.1f}%  "
+              f"({spd:.2f}x vs serial)")
+    print("[bench] DONE. prefer `precompute(workers=N)` over raising batch; pick B with mem% < ~85.")
+    return {"results": results, "flash_attn": flash_ok,
+            "total_gb": total_gb, "n_images": n_use}
 
 
 def _already_done(image_path):
