@@ -169,46 +169,108 @@ _datasets_card = "/tmp/vision-adapter-images-README.md"
 
 
 @app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
-              timeout=60 * 60, memory="16GB")
-def push_image_corpus_to_hf(repo_ns: str = "keypa"):
-    """Pack the processed agentic images into a single HF dataset.
+              timeout=60 * 60 * 8, memory="32GB",
+              ephemeral_disk=524288)  # 512 GiB, matches etl()
+def push_image_corpus_to_hf(repo_ns: str = "keypa", shard_rows: int = 8192):
+    """Pack the processed agentic + cauldron images into a single HF dataset.
 
-    The corpus is written as parquet shards under `{repo_ns}/vision-adapter-images`.
-    Each row is {image: bytes, filename: str, source: 'waveui'|'showui'|'aitw'|...}.
-    Compatible with `datasets.load_dataset`. Images are lazily downloaded on demand.
-    Use this if you want to skip per-file downloads of 79k source PNGs.
+    The corpus (~25-40 GB of raw PNG/JPEG bytes across ~145k files) is streamed
+    row-by-row, so memory stays flat: instead of materialising every image in
+    RAM, each parquet shard is written then uploaded immediately.  Shards that
+    already exist on the Hub are skipped, so an interrupted push resumes instead
+    of restarting.  (The original build loaded the whole corpus into a single
+    pandas DataFrame inside a 16 GB container and then uploaded the folder — it
+    thrashed/OOM'd and repeatedly blew the old 1h timeout.)
+
+    Each row is {image: bytes, filename: str, source: 'agentic'|'cauldron', size: int}.
+    Compatible with `datasets.load_dataset`.
     """
-    import os, pandas as pd
-    from datasets import Dataset
+    import os, json
+    import pyarrow as pa
+    import pyarrow.parquet as pq
     from huggingface_hub import HfApi
 
     vol.reload()
+    repo_id = f"{repo_ns}/vision-adapter-images"
     api = HfApi()
+    api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
+    remote = set(api.list_repo_files(repo_id, repo_type="dataset"))
 
-    rows = []
+    # enumerate all corpus files once so we know the shard count up front
+    files = []
     for grp in ("agentic", "cauldron"):
         grpdir = os.path.join(VOLUME_DIR, "images", grp)
         for fn in sorted(os.listdir(grpdir)):
-            p = os.path.join(grpdir, fn)
-            rows.append({
-                "image": open(p, "rb").read(),
-                "filename": f"{grp}/{fn}",
-                "source": grp,
-                "size": os.path.getsize(p),
-            })
-    df = pd.DataFrame(rows)
-    print(f"[image-push] corpus rows: {len(df)}  total bytes: {df['size'].sum()/1e9:.2f} GB")
+            files.append((f"{grp}/{fn}", os.path.join(grpdir, fn)))
+    total = len(files)
+    n_shards = (total + shard_rows - 1) // shard_rows
+    print(f"[image-push] corpus rows: {total}  shards: {n_shards}")
 
-    os.makedirs(_datasets_tmp, exist_ok=True)
-    ds = Dataset.from_pandas(df)
-    ds.save_to_disk(_datasets_tmp)
+    data_rel = "data"
+    shard_dir = os.path.join(_datasets_tmp, data_rel)
+    os.makedirs(shard_dir, exist_ok=True)
 
-    api.create_repo(
-        f"{repo_ns}/vision-adapter-images",
-        repo_type="dataset", exist_ok=True)
-    api.upload_folder(
-        repo_id=f"{repo_ns}/vision-adapter-images",
-        repo_type="dataset", folder_path=_datasets_tmp, path_in_repo="")
+    schema = pa.schema([
+        pa.field("image", pa.binary()),
+        pa.field("filename", pa.string()),
+        pa.field("source", pa.string()),
+        pa.field("size", pa.int64()),
+    ])
+
+    def shard_name(i):
+        return f"train-{i:05d}-of-{n_shards:05d}.parquet"
+
+    total_bytes = 0
+    skipped = 0
+    for i in range(n_shards):
+        name = shard_name(i)
+        if os.path.join(data_rel, name) in remote:
+            print(f"[image-push] shard {name} already on hub — skipping")
+            skipped += 1
+            continue
+        chunk = files[i * shard_rows:(i + 1) * shard_rows]
+        cols = {"image": [], "filename": [], "source": [], "size": []}
+        for rel, p in chunk:
+            b = open(p, "rb").read()
+            cols["image"].append(b)
+            cols["filename"].append(rel)
+            cols["source"].append(rel.split("/", 1)[0])
+            cols["size"].append(len(b))
+        table = pa.Table.from_pydict(cols, schema=schema)
+        local = os.path.join(shard_dir, name)
+        pq.write_table(table, local)
+        total_bytes += sum(len(b) for b in cols["image"])
+        del cols, table
+        api.upload_file(path_or_fileobj=local, path_in_repo=os.path.join(data_rel, name),
+                        repo_id=repo_id, repo_type="dataset",
+                        commit_message=f"shard {name}")
+        print(f"[image-push] uploaded {name} ({len(chunk)} rows)")
+
+    # dataset_info.json so the Hub viewer/server can validate + serve the dataset
+    info = {
+        "builder_name": "parquet",
+        "config_name": "default",
+        "dataset_name": "vision-adapter-images",
+        "features": {
+            "image": {"_type": "Binary"},
+            "filename": {"dtype": "string", "_type": "Value"},
+            "source": {"dtype": "string", "_type": "Value"},
+            "size": {"dtype": "int64", "_type": "Value"},
+        },
+        "splits": {
+            "train": {
+                "name": "train",
+                "num_examples": total,
+                "num_bytes": total_bytes,
+                "dataset_name": "vision-adapter-images",
+            }
+        },
+    }
+    if "dataset_info.json" not in remote:
+        with open("/tmp/dataset_info.json", "w") as f:
+            json.dump(info, f, indent=2, sort_keys=True)
+        api.upload_file(path_or_fileobj="/tmp/dataset_info.json", path_in_repo="dataset_info.json",
+                        repo_id=repo_id, repo_type="dataset")
 
     # dataset card for the image corpus
     card = f"""---
@@ -260,15 +322,16 @@ ds = load_dataset("{repo_ns}/vision-adapter-images")
 print(ds)
 ```
 """
-    tmp_card = "/tmp/vision-adapter-images-README.md"
-    with open(tmp_card, "w") as f:
-        f.write(card)
-    api.upload_file(path_or_fileobj=tmp_card,
-                    path_in_repo="README.md",
-                    repo_id=f"{repo_ns}/vision-adapter-images",
-                    repo_type="dataset",
-                    commit_message="Dataset card for image corpus")
-    print(f"[image-push] success -> {repo_ns}/vision-adapter-images")
+    if "README.md" not in remote:
+        tmp_card = "/tmp/vision-adapter-images-README.md"
+        with open(tmp_card, "w") as f:
+            f.write(card)
+        api.upload_file(path_or_fileobj=tmp_card,
+                        path_in_repo="README.md",
+                        repo_id=f"{repo_ns}/vision-adapter-images",
+                        repo_type="dataset",
+                        commit_message="Dataset card for image corpus")
+    print(f"[image-push] success -> {repo_id}  ({total} rows, {skipped} shards already present)")
 
 @app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
               timeout=60 * 60 * 2, memory="8GB")
