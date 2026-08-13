@@ -367,6 +367,80 @@ print(ds)
                         commit_message="Dataset card for image corpus")
     print(f"[image-push] success -> {repo_id}  ({total} rows, {skipped} shards already present)")
 
+
+@app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              timeout=60 * 30, memory="32GB", ephemeral_disk=524288)
+def push_bench(repo_ns: str = "keypa", n_files: int = 8192):
+    """Measure the three per-shard phases of push_image_corpus_to_hf separately
+    so we know which one is actually slow: volume read, parquet write, HF upload.
+
+    Uses the exact same calls/precursors as the real shard path."""
+    import os, time
+    from concurrent.futures import ThreadPoolExecutor
+    vol.reload()
+
+    files = []
+    for grp in ("agentic", "cauldron"):
+        grpdir = os.path.join(VOLUME_DIR, "images", grp)
+        for fn in sorted(os.listdir(grpdir)):
+            files.append((f"{grp}/{fn}", os.path.join(grpdir, fn)))
+    files = files[:n_files]
+    print(f"[push-bench] sample {len(files)} files")
+
+    def _read(item):
+        rel, p = item
+        with open(p, "rb") as f:
+            return rel, f.read()
+
+    print("[push-bench] reading files in parallel (32 workers) ...", flush=True)
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=32) as ex:
+        rows = list(ex.map(_read, files))
+    t_read = time.time() - t0
+    byt = sum(len(b) for _, b in rows)
+    print(f"[push-bench] READ:  {len(files)} files, {byt / 1e6:.0f} MB in {t_read:.0f}s "
+          f"-> {byt / 1e6 / t_read:.1f} MB/s", flush=True)
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    schema = pa.schema([
+        pa.field("image", pa.binary()),
+        pa.field("filename", pa.string()),
+        pa.field("source", pa.string()),
+        pa.field("size", pa.int64()),
+    ])
+    cols = {"image": [], "filename": [], "source": [], "size": []}
+    for rel, b in rows:
+        cols["image"].append(b)
+        cols["filename"].append(rel)
+        cols["source"].append(rel.split("/", 1)[0])
+        cols["size"].append(len(b))
+    table = pa.Table.from_pydict(cols, schema=schema)
+    local = "/tmp/bench.parquet"
+
+    print("[push-bench] writing parquet ...", flush=True)
+    t0 = time.time()
+    pq.write_table(table, local)
+    t_write = time.time() - t0
+    print(f"[push-bench] WRITE: {byt / 1e6:.0f} MB in {t_write:.0f}s "
+          f"-> {byt / 1e6 / t_write:.1f} MB/s", flush=True)
+
+    from huggingface_hub import HfApi
+    api = HfApi()
+    repo_id = f"{repo_ns}/push-bench-scratch"
+    api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
+    print("[push-bench] uploading real shard file to HF (same call as shard path) ...", flush=True)
+    t0 = time.time()
+    api.upload_file(path_or_fileobj=local, path_in_repo=os.path.basename(local),
+                    repo_id=repo_id, repo_type="dataset", commit_message="shard bench")
+    t_up = time.time() - t0
+    mb = byt / 1e6
+    print(f"[push-bench] UPLOAD: {mb:.0f} MB in {t_up:.0f}s -> {mb / t_up:.1f} MB/s", flush=True)
+
+    print(f"[push-bench] per-shard estimate at these rates: read {t_read:.0f}s + "
+          f"write {t_write:.0f}s + upload {t_up:.0f}s = {t_read + t_write + t_up:.0f}s", flush=True)
+
+
 @app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
               timeout=60 * 60 * 2, memory="8GB")
 def push_mix_manifest_to_hf(repo_ns: str = "keypa"):
@@ -912,7 +986,7 @@ def _prefetch_packs(image_paths, batch, workers=8, ahead=1):
 
 @app.function(image=_vit_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
               gpu=GPU, timeout=60 * 60 * 12, memory="64GB")
-def precompute(batch: int = _Const.BATCH, workers: int = 8):
+def precompute(batch: int = _Const.BATCH, workers: int = 8, ahead: int = 2):
     """Frozen MoonViT-V2 over every image -> /data/embeddings/<sha1>.pt (BF16).
 
     `batch` is the micro-batch of images per forward; `workers` threads decode
@@ -939,19 +1013,23 @@ def precompute(batch: int = _Const.BATCH, workers: int = 8):
     img_paths = sorted(glob.glob(f"{IMG_DIR}/agentic/*") + glob.glob(f"{IMG_DIR}/cauldron/*"))
     img_paths = [p for p in img_paths if not _already_done(p)]
     print(f"[precompute] total={len(img_paths)} new/todo={len(img_paths)} "
-          f"batch={batch} workers={workers}")
+          f"batch={batch} workers={workers} ahead={ahead}")
     B = batch  # micro-batch of images per forward
     done = 0
-    with torch.no_grad():
-        for chunk, pv, gt in _prefetch_packs(img_paths, B, workers=workers):
-            merged = vit(pv.cuda(), gt.cuda())
-            for p, emb in zip(chunk, merged):
-                # emb: [n_merged, 4, 1024]; cache the 4096-flattened projector input
-                flat = emb.reshape(emb.shape[0], -1).to(torch.bfloat16).cpu()
-                torch.save(flat, _emb_path(p))
-            done += len(chunk)
-            if done % (B * 50) == 0 or done == len(img_paths):
-                print(f"[precompute] {done}/{len(img_paths)}"); vol.commit()
+    # saver pool: volume writes are network-backed (~ms each); do them off-loop so
+    # the next forward starts before all N emb saves drain.
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(16, max(4, workers))) as saver:
+        with torch.no_grad():
+            for chunk, pv, gt in _prefetch_packs(img_paths, B, workers=workers, ahead=ahead):
+                merged = vit(pv.cuda(), gt.cuda())
+                for p, emb in zip(chunk, merged):
+                    # emb: [n_merged, 4, 1024]; cache the 4096-flattened projector input
+                    flat = emb.reshape(emb.shape[0], -1).to(torch.bfloat16).cpu()
+                    saver.submit(torch.save, flat, _emb_path(p))
+                done += len(chunk)
+                if done % (B * 50) == 0 or done == len(img_paths):
+                    print(f"[precompute] {done}/{len(img_paths)}"); vol.commit()
     vol.commit()
     print(f"[precompute] DONE. wrote {done} embeddings to {EMB_DIR}")
 
@@ -959,15 +1037,17 @@ def precompute(batch: int = _Const.BATCH, workers: int = 8):
 @app.function(image=_vit_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
               gpu=GPU, timeout=60 * 60 * 2, memory="64GB")
 def precompute_bench(batch_sizes=(16, 32, 64, 128, 256, 512),
-                     n_images: int = 512, n_iter: int = 3):
+                     n_images: int = 512, n_iter: int = 3,
+                     workers: int = 8, ahead: int = 2):
     """Measure GPU memory % and GPU utilization % for a range of micro-batch sizes.
 
     Same data path as `precompute` (decode PNG -> collate -> MoonViT-V2 forward),
     but runs `n_iter` passes over a fixed `n_images` sample per batch size and
     reports per size: wall img/s, peak GPU mem (GiB + % of the 80 GB A100), and
-    GPU utilization % (sampled from nvidia-smi in a background thread). Use the
-    numbers to pick the biggest batch that (a) fits comfortably and (b) drives
-    util > 90% before spending A100-hours on the full 145k-image run.
+    GPU utilization % (sampled from nvidia-smi in a background thread). `workers`
+    = decode threads, `ahead` = batches prefetched while the GPU runs the current
+    one.  Use the numbers to pick the biggest batch that (a) fits comfortably and
+    (b) drives util > 90% before spending A100-hours on the full 145k-image run.
     """
     import os, sys, glob, json, time, threading, subprocess, torch
     from huggingface_hub import hf_hub_download
@@ -1028,7 +1108,8 @@ def precompute_bench(batch_sizes=(16, 32, 64, 128, 256, 512),
                 for _ in range(n_iter):
                     if pf:
                         # prefetch pipeline: decode batch k+1 while GPU runs batch k
-                        for chunk, pv, gt in _prefetch_packs(sample, B, workers=8):
+                        for chunk, pv, gt in _prefetch_packs(sample, B, workers=workers,
+                                                             ahead=ahead):
                             out = vit(pv.cuda(), gt.cuda())
                             for p, emb in zip(chunk, out):
                                 emb.reshape(emb.shape[0], -1).to(torch.bfloat16).cpu()
