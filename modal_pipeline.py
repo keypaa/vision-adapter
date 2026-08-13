@@ -71,9 +71,17 @@ _etl_image = (
     .pip_install("duckdb", "pyarrow", "pillow", "requests", "huggingface_hub", "datasets")
     .env(_hf_env)
 )
+# FlashAttention wheel must ABI-match the torch build.  Pin torch==2.6.0 and use
+# the matching Dao-AILab wheel (cp311 = py3.11) so moonvit.py's varlen path runs.
+# Without flash-attn the EncoderLayer falls back to a per-image Python loop over
+# F.scaled_dot_product_attention, which underutilizes the A100 badly.
+_FLASH_ATTN_WHEEL = ("https://github.com/Dao-AILab/flash-attention/releases/download/"
+                     "v2.7.4.post1/flash_attn-2.7.4.post1+cu12torch2.6cxx11abiFALSE-"
+                     "cp311-cp311-linux_x86_64.whl")
 _vit_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("torch", "safetensors", "pillow", "numpy", "huggingface_hub", "accelerate")
+    .pip_install("torch==2.6.0", "safetensors", "pillow", "numpy", "huggingface_hub", "accelerate")
+    .pip_install(_FLASH_ATTN_WHEEL)
     .env(_hf_env)
 )
 
