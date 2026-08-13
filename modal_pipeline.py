@@ -402,6 +402,122 @@ The image corpus is a **separate** HF dataset repo
     print(f"[push] DONE")
 
 
+@app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              timeout=60 * 60 * 8, memory="16GB",
+              ephemeral_disk=524288)  # 512 GiB, matches etl()
+def push_embeddings_to_hf(repo_ns: str = "keypa", shard_files: int = 10_000):
+    """Publish the precomputed projector-input embeddings to a HF dataset repo.
+
+    Every `.pt` cached by `precompute` under /data/embeddings/ is uploaded flat
+    under `embeddings/`, so each remote path (`embeddings/<sha1>.pt`) matches the
+    `emb:` field of train_manifest.jsonl exactly.  Uploads happen one commit per
+    ~10k-file chunk (not per file), and chunks that already exist on the Hub are
+    skipped, so an interrupted push resumes instead of restarting.
+    """
+    import os, glob, shutil
+    from huggingface_hub import HfApi
+
+    vol.reload()
+    repo_id = f"{repo_ns}/vision-adapter-embeddings"
+    api = HfApi()
+    api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
+
+    files = sorted(glob.glob(f"{EMB_DIR}/*.pt"))
+    total = len(files)
+    total_gb = sum(os.path.getsize(p) for p in files) / 1e9
+    print(f"[emb-push] embeddings: {total}  {total_gb:.2f} GB")
+
+    remote = set(api.list_repo_files(repo_id, repo_type="dataset"))
+    chunk_dir = "/tmp/emb_shards"
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    n_uploaded = 0
+    n_skipped = 0
+    for s in range(0, total, shard_files):
+        chunk = files[s:s + shard_files]
+        all_present = all(f"embeddings/{os.path.basename(p)}" in remote
+                          for p in chunk)
+        if all_present:
+            n_skipped += len(chunk)
+            print(f"[emb-push] chunk {s // shard_files}: all {len(chunk)} present — skipping")
+            continue
+        # stage only the missing files into a fresh dir, then one commit per chunk
+        stage = os.path.join(chunk_dir, f"chunk-{s // shard_files:03d}")
+        if os.path.isdir(stage):
+            shutil.rmtree(stage)
+        os.makedirs(stage)
+        pending = []
+        for p in chunk:
+            name = os.path.basename(p)
+            if f"embeddings/{name}" in remote:
+                continue
+            shutil.copy2(p, os.path.join(stage, name))
+            pending.append(name)
+        if not pending:
+            n_skipped += len(chunk)
+            continue
+        api.upload_folder(folder_path=stage, path_in_repo="embeddings",
+                          repo_id=repo_id, repo_type="dataset",
+                          commit_message=f"embeddings chunk {s // shard_files}")
+        n_uploaded += len(pending)
+        print(f"[emb-push] chunk {s // shard_files}: uploaded {len(pending)}")
+
+    # dataset card for the embedding repo
+    card = f"""---
+license: apache-2.0
+size_categories:
+- 100K<n<1M
+task_categories:
+- visual-question-answering
+- image-to-text
+pretty_name: Vision Adapter Precomputed Embeddings
+---
+
+# vision-adapter-embeddings
+
+Frozen MoonViT-V2 projector-input embeddings for the Vision-Adapter corpus,
+precomputed once in Phase-3 (`precompute`) and cached as BF16 `.pt` tensors.
+
+Each file is `torch.save` of a `[n_merged, 4096]` BF16 tensor — the flattened
+4×1024 projector-input rows for one image.  `n_merged` is the number of merged
+visual tokens (variable per image).
+
+## Layout
+
+* `embeddings/<sha1>.pt` — one file per image, flat, matching the `emb:` field
+  of `keypa/vision-adapter-manifests` (`train_manifest.jsonl`):
+  `emb: "embeddings/<sha1>.pt"` → `embeddings/<sha1>.pt` in this repo.
+* The SHA1 is derived from the *volume-relative logical path*
+  (`agentic/foo.png`, `cauldron/foo.png`), so this mirrors exactly what
+  `modal_train.EmbSFT` loads.
+
+## How to use
+
+```python
+import os, torch
+from huggingface_hub import hf_hub_download
+from datasets import load_dataset
+
+man = load_dataset("keypa/vision-adapter-manifests", split="train")
+row = man[0]
+emb_path = hf_hub_download(
+    "keypa/vision-adapter-embeddings", row["emb"], repo_type="dataset")
+emb = torch.load(emb_path, map_location="cpu")   # [n_merged, 4096] bf16
+print(emb.shape)
+```
+
+The image corpus lives separately at `keypa/vision-adapter-images`.
+"""
+    if "README.md" not in remote:
+        tmp_card = "/tmp/vision-adapter-embeddings-README.md"
+        with open(tmp_card, "w") as f:
+            f.write(card)
+        api.upload_file(path_or_fileobj=tmp_card, path_in_repo="README.md",
+                        repo_id=repo_id, repo_type="dataset",
+                        commit_message="Dataset card for embeddings")
+    print(f"[emb-push] success -> {repo_id}  ({n_uploaded} uploaded, {n_skipped} already present)")
+
+
 def bai_build_one(subset, bai):  # module-scope helper called from inside etl(); needs `os` at module top
     """Invoke the verified per-subset positional join and write into the Volume in parallel.
 
