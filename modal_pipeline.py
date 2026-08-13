@@ -978,6 +978,7 @@ def precompute_bench(batch_sizes=(16, 32, 64, 128, 256, 512),
         with open(p) as f: open(f"/root/{m}", "w").write(f.read())
     sys.path.insert(0, "/root")
     from moonvit import load_moonvit_from_safetensors
+    from preprocess import collate_images  # serial-baseline path uses it
 
     cfg = json.load(open(hf_hub_download(repo_id=MOONVIT_REPO, repo_type="model",
                                          filename="vision_config.json")))
