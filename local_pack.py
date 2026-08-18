@@ -1,4 +1,4 @@
-from typing import Iterator
+from typing import Iterator, Iterable
 
 import numpy as np
 import pyarrow as pa
@@ -53,14 +53,14 @@ def make_row(path: str, tensor: torch.Tensor) -> dict:
     }
 
 
-def iter_rows(local_paths):
+def iter_rows(local_paths: list[str]) -> Iterator[dict]:
     """torch.load each staged .pt, yield a row dict (key = embeddings/<basename>)."""
     for p in local_paths:
         t = torch.load(p, map_location="cpu", weights_only=True)
         yield make_row(f"embeddings/{os.path.basename(p)}", t)
 
 
-def pack_rows(rows, out_path, batch_size=64):
+def pack_rows(rows: Iterable[dict], out_path: str, batch_size: int = 64) -> None:
     """Stream rows to a parquet file in fixed-size batches (RAM-bounded)."""
     writer = pq.ParquetWriter(out_path, SCHEMA)
     batch = []
