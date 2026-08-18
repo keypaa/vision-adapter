@@ -57,9 +57,10 @@ vol.listdir("embeddings") → sorted names (same order as Modal's sorted(glob))
 ## Components
 
 ### 1. Shard enumeration
-- `vol.listdir("embeddings")` → list of `embeddings/<sha1>.pt` names, sorted
-  lexicographically (matches Modal `sorted(glob.glob(EMB_DIR/*.pt))` since all
-  share the `embeddings/` prefix).
+- `vol.listdir("embeddings")` → list of `FileEntry` objects; take
+  `entry.path` (`embeddings/<sha1>.pt`) and sort lexicographically (matches
+  Modal `sorted(glob.glob(EMB_DIR/*.pt))` since all share the `embeddings/`
+  prefix).
 - Slice by `shard_rows = 1360`, same as the Modal pack.
 - Shard filename: `emb_{i:04d}.parquet` (4-digit zero-padded).
 
@@ -90,7 +91,8 @@ vol.listdir("embeddings") → sorted names (same order as Modal's sorted(glob))
 - HF upload uses resumable multi-part upload (1.25+ SDK).
 
 ### 6. Resume checks
-- Volume check: `vol.listdir("shards")` → existing `emb_*.parquet`.
+- Volume check: `vol.listdir("shards")` → existing `emb_*.parquet`
+  (`FileEntry.path`).
 - HF check: `HfApi.list_repo_files("keypa/vision-adapter-embeddings")` → existing
   `data/emb_*.parquet`.
 - Ordering per shard: if both → skip; if volume-only → pull+push to HF; else full
