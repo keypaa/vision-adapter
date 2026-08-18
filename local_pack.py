@@ -72,3 +72,37 @@ def pack_rows(rows: Iterable[dict], out_path: str, batch_size: int = 64) -> None
     if batch:
         writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
     writer.close()
+
+
+def existing_volume_shards(vol):
+    out = set()
+    try:
+        for e in vol.listdir("shards"):
+            if e.path.endswith(".parquet"):
+                out.add(os.path.basename(e.path))
+    except Exception:
+        pass  # no shards dir yet
+    return out
+
+
+def existing_hf_shards(api, repo_id):
+    out = set()
+    try:
+        files = api.list_repo_files(repo_id, repo_type=REPO_TYPE)
+    except Exception:
+        return out
+    for n in files:
+        base = os.path.basename(n)
+        if base.startswith("emb_") and base.endswith(".parquet"):
+            out.add(base)
+    return out
+
+
+def resume_action(shard, vol_shards, hf_shards):
+    on_vol = shard in vol_shards
+    on_hf = shard in hf_shards
+    if on_vol and on_hf:
+        return "skip"
+    if on_vol and not on_hf:
+        return "push_from_vol"
+    return "pack"
