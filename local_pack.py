@@ -76,8 +76,11 @@ def iter_rows(local_paths: list[str]) -> Iterator[dict]:
 
 
 def pack_rows(rows: Iterable[dict], out_path: str, batch_size: int = 64) -> None:
-    """Stream rows to a parquet file in fixed-size batches (RAM-bounded)."""
-    writer = pq.ParquetWriter(out_path, SCHEMA)
+    """Stream rows to a parquet file in fixed-size batches (RAM-bounded).
+
+    compression=None: bf16 float payloads are incompressible — snappy only
+    burns CPU (measured 2.3x write time for ~0% size change)."""
+    writer = pq.ParquetWriter(out_path, SCHEMA, compression=None)
     batch = []
     for r in rows:
         batch.append(r)
@@ -205,6 +208,86 @@ def run_shard(vol, api, i, all_names, shard_rows, stage_dir, em_repo,
     return action
 
 
+def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
+                 workers=6, batch_size=64, retries=3, lo=0, hi=None,
+                 log=None):
+    """Pipelined variant of the run_shard loop.
+
+    Overlaps network directions across shards: while shard i's HF push is
+    uploading (fiber up), shard i+1's .pt download from the volume runs in a
+    background thread (fiber down). Resume state is fetched once up front and
+    updated incrementally instead of re-querying per shard. A failed shard
+    aborts the run; rerunning resumes where it left off."""
+    log = log or (lambda m: print(m, flush=True))
+    n_shards = (len(names) + shard_rows - 1) // shard_rows
+    hi = n_shards if hi is None else min(hi, n_shards)
+
+    vol_shards = existing_volume_shards(vol)
+    hf_shards = existing_hf_shards(api, em_repo)
+
+    def chunk(i):
+        return names[i * shard_rows:(i + 1) * shard_rows]
+
+    def stage_of(i):
+        # distinct from the parquet filename: this is a DIRECTORY holding the
+        # shard's downloaded .pt files (avoids emb_XXXX.parquet collision)
+        return os.path.join(stage_dir, _shard_name(i) + ".staged")
+
+    dl = ThreadPoolExecutor(max_workers=1)
+
+    def try_prefetch(i):
+        """Start background download for shard i iff it will need packing."""
+        if i >= hi or resume_action(_shard_name(i), vol_shards, hf_shards) != "pack":
+            return None
+        return dl.submit(download_shard, vol, chunk(i), stage_of(i), workers, retries)
+
+    actions = []
+    t0 = time.time()
+    rows_done = 0
+    os.makedirs(stage_dir, exist_ok=True)
+    pending = try_prefetch(lo)
+    for i in range(lo, hi):
+        shard = _shard_name(i)
+        action = resume_action(shard, vol_shards, hf_shards)
+        n = len(chunk(i))
+        assert n, f"shard {i} has no rows"
+        local_parquet = os.path.join(stage_dir, shard)
+
+        if action == "skip":
+            log(f"[local-pack] shard {i}: {shard} already on volume+HF — skipping")
+        else:
+            if action == "push_from_vol":
+                pull_volume_parquet(vol, shard, local_parquet, retries)
+            else:
+                staged = pending.result() if pending is not None else \
+                    download_shard(vol, chunk(i), stage_of(i), workers, retries)
+                pack_rows(iter_rows(staged), local_parquet, batch_size=batch_size)
+                upload_to_volume(vol, local_parquet, shard)
+                vol_shards.add(shard)
+                for p in staged:
+                    try:
+                        os.remove(p)
+                    except FileNotFoundError:
+                        pass
+
+            pending = try_prefetch(i + 1)  # overlap next down with this up
+            push_to_hf(api, local_parquet, em_repo, shard)
+            hf_shards.add(shard)
+            try:
+                os.remove(local_parquet)
+            except FileNotFoundError:
+                pass
+
+        actions.append(action)
+        rows_done += n
+        elapsed = time.time() - t0
+        rate = rows_done / max(1e-9, elapsed)
+        eta = (len(names) - rows_done) / max(1e-9, rate) / 60
+        log(f"[local-pack] done {rows_done}/{len(names)} ({100*rows_done/len(names):.0f}%)  "
+            f"{rate:.0f} rows/s  ETA {eta:.0f} min  shard {i}/{hi} ({n} rows) action={action}")
+    return actions
+
+
 def main(argv=None):
     import argparse
     ap = argparse.ArgumentParser()
@@ -237,22 +320,10 @@ def main(argv=None):
         lo = int(parts[0]) if parts[0] else 0
         hi = int(parts[1]) if len(parts) > 1 and parts[1] else len(slices)
 
-    t0 = time.time()
-    done = 0
-    for i in range(lo, hi):
-        action = run_shard(vol, api, i, names, args.shard_rows,
-                           args.stage_dir, args.em_repo,
-                           workers=args.workers, batch_size=args.batch_size,
-                           retries=args.retries)
-        done += 1
-        n = len(slices[i])
-        elapsed = time.time() - t0
-        rows_done = sum(len(s) for s in slices[lo : lo + done])
-        rate = rows_done / max(1e-9, elapsed)
-        eta = (len(names) - rows_done) / max(1e-9, rate) / 60
-        print(f"[local-pack] done {rows_done}/{len(names)} ({100*rows_done/len(names):.0f}%)  "
-              f"{rate:.0f} rows/s  ETA {eta:.0f} min  shard {i}/{hi} ({n} rows) action={action}  "
-              f"vol_commits={getattr(vol,'committed',0)}", flush=True)
+    run_pipeline(vol, api, names, args.shard_rows,
+                 args.stage_dir, args.em_repo,
+                 workers=args.workers, batch_size=args.batch_size,
+                 retries=args.retries, lo=lo, hi=hi)
 
 
 if __name__ == "__main__":

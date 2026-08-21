@@ -1,5 +1,7 @@
 # test_local_pack.py
 import io
+import threading
+import time
 import os
 
 import numpy as np
@@ -21,6 +23,7 @@ from local_pack import (
     push_to_hf,
     pull_volume_parquet,
     run_shard,
+    run_pipeline,
 )
 
 
@@ -57,6 +60,9 @@ def test_pack_rows_schema_roundtrip(tmp_path):
         .reshape(-1, 4096)
     )
     assert torch.equal(rt, t1)
+    # bf16 payload is incompressible: writer must not waste CPU on snappy (#1)
+    meta = pq.ParquetFile(str(out)).metadata
+    assert meta.row_group(0).column(1).compression == "UNCOMPRESSED"
 
 
 def test_iter_rows_roundtrip(tmp_path):
@@ -287,3 +293,84 @@ def test_run_shard_skips_when_done(tmp_path):
     action = run_shard(vol, ApiDone(), 0, names, shard_rows=2,
                        stage_dir=str(tmp_path / "stage"), em_repo="keypa/vision-adapter-embeddings", workers=1)
     assert action == "skip"
+
+
+class BlockingApi:
+    """upload_file blocks until released; records pushes."""
+
+    def __init__(self, files=()):
+        self._files = list(files)
+        self.release = threading.Event()
+        self.pushes = []
+        self.push_started = threading.Event()
+
+    def list_repo_files(self, repo_id, repo_type=None):
+        return self._files
+
+    def upload_file(self, path_or_fileobj, path_in_repo, repo_id, **kw):
+        self.push_started.set()
+        self.release.wait(timeout=30)
+        self.pushes.append(path_in_repo)
+
+
+class RecordingVol(FakeVol):
+    """FakeVol that records download starts."""
+
+    def __init__(self, files=None):
+        super().__init__(files)
+        self.download_starts = []
+
+    def read_file_into_fileobj(self, path, fileobj, progress_cb=None):
+        self.download_starts.append(path)
+        return super().read_file_into_fileobj(path, fileobj, progress_cb)
+
+
+def test_run_pipeline_overlaps_next_download_with_push(tmp_path):
+    import threading as _th
+    names = [f"embeddings/e{i:04d}.pt" for i in range(2)]
+    vol = RecordingVol()
+    for n in names:
+        buf = io.BytesIO(); _torch.save(_bf16(2), buf)
+        vol.files[n] = buf.getvalue()
+    api = BlockingApi()
+
+    done = {}
+
+    def run():
+        done["ok"] = run_pipeline(vol, api, names, shard_rows=1,
+                                  stage_dir=str(tmp_path), em_repo="r", workers=1)
+
+    th = _th.Thread(target=run)
+    th.start()
+    # wait until shard0's HF push has begun (upload direction busy)...
+    assert api.push_started.wait(timeout=30)
+    # ...then shard1's volume download must ALREADY be running (down direction)
+    deadline = time.time() + 30
+    while time.time() < deadline and len(vol.download_starts) < 2:
+        time.sleep(0.01)
+    assert len(vol.download_starts) >= 2, (
+        f"next-shard download did not overlap push; starts={vol.download_starts}")
+    api.release.set()
+    th.join(timeout=60)
+    assert done.get("ok") and api.pushes == ["data/emb_0000.parquet", "data/emb_0001.parquet"]
+
+
+def test_run_pipeline_skips_done_and_updates_state(tmp_path):
+    names = [f"embeddings/e{i:04d}.pt" for i in range(2)]
+    vol = RecordingVol()
+    for n in names:
+        buf = io.BytesIO(); _torch.save(_bf16(2), buf)
+        vol.files[n] = buf.getvalue()
+    vol.files["shards/emb_0000.parquet"] = b"x"
+
+    class ApiDone(BlockingApi):
+        def list_repo_files(self, repo_id, repo_type=None):
+            return ["data/emb_0000.parquet"]
+
+    api = ApiDone()
+    api.release.set()
+    actions = run_pipeline(vol, api, names, shard_rows=1,
+                           stage_dir=str(tmp_path), em_repo="r", workers=1)
+    assert actions == ["skip", "pack"]
+    assert "emb_0001.parquet" in vol.uploaded
+    assert api.pushes == ["data/emb_0001.parquet"]
