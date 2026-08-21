@@ -23,6 +23,7 @@ Run:    modal run modal_train.py::train_dryrun     # then
 """
 from __future__ import annotations
 import os, json, glob, time
+import torch  # module-level: EmbSFT(torch.utils.data.Dataset) below needs it at import
 import modal
 
 GPU = "A100-80GB"
@@ -66,6 +67,7 @@ train_image = (
     .pip_install(
         "torch==2.5.1", "safetensors", "accelerate", "transformers",
         "datasets", "pillow", "sentencepiece", "huggingface_hub",
+        "matplotlib",
     )
     .env({"HF_HOME": HF_CACHE})
 )
@@ -227,6 +229,144 @@ def inject_visual(inputs, proj, model):
     }
 
 
+# =============================== telemetry ==============================
+
+class TrainMonitor:
+    """DeepSeek-style run analytics over the live loss/grad-norm streams.
+
+    Keeps an EMA (fast-reacting) and a rolling median (robust baseline) of
+    both series. A SPIKE is declared only when BOTH loss and grad-norm burst
+    above k x their medians simultaneously (single-series jumps are routine),
+    with a cooldown so one blowup doesn't spam alerts. On alert, `on_alert`
+    receives a JSON-ready record — train() uses it to snapshot a pre-spike
+    checkpoint you can roll back to."""
+
+    def __init__(self, ema_beta: float = 0.98, median_window: int = 200,
+                 loss_k: float = 1.5, gnorm_k: float = 3.0,
+                 min_history: int = 10, cooldown: int = 50, on_alert=None):
+        from collections import deque
+        self.beta = ema_beta
+        self.win = deque(maxlen=median_window)
+        self.gwin = deque(maxlen=median_window)
+        self.loss_ema = None
+        self.gnorm_ema = None
+        self.loss_k, self.gnorm_k = loss_k, gnorm_k
+        self.min_history = min_history
+        self.cooldown = cooldown
+        self.last_alert_step = -(10 ** 9)
+        self.n_alerts = 0
+        self.on_alert = on_alert or (lambda rec: None)
+
+    def update_train(self, step: int, loss: float, grad_norm: float, **extra):
+        """Feed one train step; returns an alert record if this step spiked."""
+        self.loss_ema = loss if self.loss_ema is None else \
+            self.beta * self.loss_ema + (1 - self.beta) * loss
+        self.gnorm_ema = grad_norm if self.gnorm_ema is None else \
+            self.beta * self.gnorm_ema + (1 - self.beta) * grad_norm
+        self.win.append(loss)
+        self.gwin.append(grad_norm)
+
+        if len(self.win) < max(self.min_history, 2):
+            return None
+        lmed, gmed = self.loss_median(), self.gnorm_median()
+        if step - self.last_alert_step <= self.cooldown:
+            return None
+        if loss > self.loss_k * lmed and grad_norm > self.gnorm_k * gmed:
+            self.last_alert_step = step
+            self.n_alerts += 1
+            rec = {"type": "alert", "step": step, "loss": round(loss, 5),
+                   "loss_median": round(lmed, 5), "loss_ema": round(self.loss_ema, 5),
+                   "grad_norm": round(grad_norm, 4), "gnorm_median": round(gmed, 4),
+                   "gnorm_ema": round(self.gnorm_ema, 4), **extra}
+            self.on_alert(rec)
+            return rec
+        return None
+
+    def loss_median(self):
+        import statistics
+        return statistics.median(self.win)
+
+    def gnorm_median(self):
+        import statistics
+        return statistics.median(self.gwin)
+
+
+def render_curves(records, out_path: str, grok_lo: int = 0, grok_hi: int = 0):
+    """3-panel PNG (loss / grad-norm / lr+throughput) from JSONL records.
+
+    Written every CHART_EVERY steps + at run end, so a mid-run
+    `modal volume get vision-adapter-data logs/train_curves.png` always
+    shows the freshest curves."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    tr = [r for r in records if r.get("type") == "train"]
+    va = [r for r in records if r.get("type") == "val"]
+    al = [r for r in records if r.get("type") == "alert"]
+    if not tr:
+        return False
+    xs = [r["step"] for r in tr]
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
+
+    ax = axes[0]
+    ax.plot(xs, [r["loss"] for r in tr], lw=0.4, alpha=0.35, color="tab:blue")
+    ema = _ema_series([r["loss"] for r in tr], 0.98)
+    ax.plot(xs, ema, lw=1.8, color="tab:blue", label="train loss (EMA .98)")
+    if va:
+        ax.plot([r["step"] for r in va], [r["val_loss"] for r in va],
+                "o-", ms=4, lw=1.2, color="tab:red", label="val loss")
+    ax.set_yscale("log")
+    ax.set_ylabel("loss (log)")
+    ax.set_title("Vision-Adapter SFT — live curves")
+    ax.legend(loc="upper right", fontsize=8)
+    _shade_grok(ax, grok_lo, grok_hi)
+
+    ax = axes[1]
+    ax.plot(xs, [r["grad_norm"] for r in tr], lw=0.4, alpha=0.35, color="tab:green")
+    ax.plot(xs, _ema_series([r["grad_norm"] for r in tr], 0.98),
+            lw=1.8, color="tab:green", label="grad norm (EMA .98)")
+    ax.set_yscale("log")
+    ax.set_ylabel("||grad|| (log)")
+    ax.legend(loc="upper right", fontsize=8)
+    _shade_grok(ax, grok_lo, grok_hi)
+
+    ax = axes[2]
+    ax2 = ax.twinx()
+    ax.plot(xs, [r["lr"] for r in tr], lw=1.2, color="tab:purple", label="lr")
+    ax2.plot(xs, [r.get("tok_s", 0.0) for r in tr], lw=0.6, alpha=0.6,
+             color="tab:orange", label="tokens/s")
+    ax.set_ylabel("lr"); ax2.set_ylabel("tokens/s")
+    ax.set_xlabel("step")
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=8)
+
+    for a in al:
+        for ax_ in axes[:2]:
+            ax_.axvline(a["step"], color="red", ls="--", alpha=0.7)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=110)
+    plt.close(fig)
+    return True
+
+
+def _ema_series(vals, beta):
+    out, e = [], None
+    for v in vals:
+        e = v if e is None else beta * e + (1 - beta) * v
+        out.append(e)
+    return out
+
+
+def _shade_grok(ax, lo, hi):
+    if hi > lo:
+        ax.axvspan(lo, hi, color="gold", alpha=0.15)
+        ax.text((lo + hi) / 2, ax.get_ylim()[1], " grok window",
+                fontsize=7, color="darkgoldenrod", va="top")
+
+
 # =============================== train entry ==============
 
 def _shared_setup():
@@ -302,46 +442,107 @@ def train():
     torch.backends.cuda.matmul.allow_tf32 = True
     tok, model, proj, opt, loader, val_loader, logger = _shared_setup()
     n_params = sum(p.numel() for p in proj.parameters())
+    steps_total = EPOCHS * len(loader)
+    grok_lo = int(SAMPLES_PER_BASETEN_GROK / BATCH_SIZE * 0.8)
+    grok_hi = int(SAMPLES_PER_BASETEN_GROK / BATCH_SIZE * 1.25)
     print(f"[train] projector params={n_params/1e6:.2f}M | "
-          f"grok window ≈ step 7.2-11k @ bs{int(BATCH_SIZE)} "
+          f"grok window ≈ step {grok_lo}-{grok_hi} @ bs{int(BATCH_SIZE)} "
           f"(~{SAMPLES_PER_BASETEN_GROK} samples == Baseten's step-900 batch-64 recipe)")
+    _log(logger, {"type": "run_start", "ts": round(time.time(), 1),
+                  "config": {
+                      "lr": LR, "batch_size": BATCH_SIZE, "epochs": EPOCHS,
+                      "max_seq_len": MAX_SEQ_LEN, "steps_total": steps_total,
+                      "n_trainable_params": n_params,
+                      "backbone": DS_REPO, "projector_src": MOONVIT_REPO,
+                      "train_manifest": DATASET_MANIFEST_REL,
+                      "val_manifest": VAL_MANIFEST_REL,
+                      "grad_clip": 1.0, "opt": "adamw(0.9,0.95)",
+                      "gpu": GPU, "torch": torch.__version__,
+                      "grok_window_steps": [grok_lo, grok_hi],
+                  }})
+
+    def _on_alert(rec):
+        # snapshot the pre-spike weights so a blowup is recoverable without
+        # waiting for the next periodic checkpoint.
+        path = os.path.join(VOLUME_DIR, CKPT_DIR_REL, f"pre_spike_step{rec['step']}.pt")
+        torch.save({"proj": proj.state_dict(), "step": rec["step"],
+                    "loss": rec.get("loss"), "alert": rec}, path)
+        vol.commit()
+        print(f"[SPIKE-ALERT] step {rec['step']} loss={rec['loss']} "
+              f"(med={rec['loss_median']}) gnorm={rec['grad_norm']} "
+              f"(med={rec['gnorm_median']}) -> pre-spike ckpt saved: {os.path.basename(path)}",
+              flush=True)
+
+    monitor = TrainMonitor(on_alert=_on_alert)
     os.makedirs(os.path.join(VOLUME_DIR, CKPT_DIR_REL), exist_ok=True)
     step = 0
     t0 = time.time()
     samples_seen = 0
+    tokens_seen = 0
+    records = []
     for epoch in range(EPOCHS):
         for sig in loader:
             step += 1
             out = _one_step(sig, model, proj, opt, tok)
             samples_seen += int(BATCH_SIZE)
+            tokens_seen += out["tokens"]
+            alert = monitor.update_train(step=step, loss=out["loss"],
+                                         grad_norm=out["grad_norm"], lr=LR)
+            if alert:
+                _log(logger, alert)
+                records.append(alert)
+            elapsed = time.time() - t0
+            rec = {
+                "step": step, "epoch": epoch, "type": "train",
+                "loss": round(out["loss"], 5),
+                "loss_ema": round(monitor.loss_ema, 5),
+                "grad_norm": round(out["grad_norm"], 4),
+                "gnorm_ema": round(monitor.gnorm_ema, 4),
+                "samples_seen": samples_seen,
+                "tokens_seen": tokens_seen,
+                "tok_s": round(tokens_seen / max(1e-9, elapsed), 1),
+                "lr": float(opt.param_groups[0]["lr"]),
+                "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+                "it_s": round(step / max(1e-9, elapsed), 3),
+                "step_ms": out["step_ms"],
+                "eta_min": round((steps_total - step) * out["step_ms"] / 1000 / 60, 1),
+                "ts": round(time.time(), 1),
+            }
+            records.append(rec)
             if step % LOG_EVERY == 0:
-                _log(logger, {
-                    "step": step, "epoch": epoch, "type": "train",
-                    "loss": round(float(out["loss"]), 5),
-                    "samples_seen": samples_seen,
-                    "lr": float(opt.param_groups[0]["lr"]),
-                    "peak_gib": round(torch.cuda.max_memory_allocated() / 2**30, 2),
-                    "it_s": round(step / max(1e-9, time.time() - t0), 3),
-                    "ts": round(time.time(), 1),
-                })
+                _log(logger, rec)
             if step % 20 == 0:
-                rate = step / max(1e-9, time.time() - t0)
-                print(f"[train] e{epoch} step {step} loss={out['loss']:.4f} "
+                rate = step / max(1e-9, elapsed)
+                print(f"[train] e{epoch} step {step}/{steps_total} "
+                      f"loss={out['loss']:.4f} ema={monitor.loss_ema:.4f} "
+                      f"gnorm={out['grad_norm']:.2f} tok/s={rec['tok_s']:.0f} "
                       f"samples={samples_seen} peak={torch.cuda.max_memory_allocated()/2**30:.1f}GiB "
-                      f"{rate:.2f}it/s")
+                      f"{rate:.2f}it/s ETA={rec['eta_min']:.0f}m"
+                      + (" ALERTS=%d" % monitor.n_alerts if monitor.n_alerts else ""),
+                      flush=True)
                 torch.save({"proj": proj.state_dict(), "step": step, "loss": float(out["loss"])},
                            os.path.join(VOLUME_DIR, CKPT_DIR_REL, f"latest.pt"))
                 vol.commit()
             if val_loader and step % VAL_EVERY == 0:
                 # quick probe on the held-out split, thenPROJECTOR back to train mode
                 vloss, n = _val_probe(model, proj, val_loader, tok)
-                _log(logger, {"step": step, "epoch": epoch, "type": "val",
-                              "val_loss": round(vloss, 5), "n_rows": n,
-                              "samples_seen": samples_seen,
-                              "ts": round(time.time(), 1)})
-                print(f"[val]   e{epoch} step {step} val_loss={vloss:.4f} (n={n})")
-                vol.commit()
-            if step % 200 == 0:
+                vrec = {"step": step, "epoch": epoch, "type": "val",
+                        "val_loss": round(vloss, 5), "n_rows": n,
+                        "samples_seen": samples_seen,
+                        "ts": round(time.time(), 1)}
+                _log(logger, vrec)
+                records.append(vrec)
+                print(f"[val]   e{epoch} step {step} val_loss={vloss:.4f} (n={n})", flush=True)
+            if step % VAL_EVERY == 0 or step == steps_total:
+                # curves PNG on the volume — fetch mid-run with:
+                #   modal volume get vision-adapter-data logs/train_curves.png
+                try:
+                    render_curves(records, os.path.join(VOLUME_DIR, LOG_DIR_REL, "train_curves.png"),
+                                  grok_lo=grok_lo, grok_hi=grok_hi)
+                    vol.commit()
+                except Exception as e:   # charting must never kill training
+                    print(f"[train] chart render failed (ignored): {e}", flush=True)
+            if step % SAVE_EVERY == 0:
                 torch.save(proj.state_dict(),
                            os.path.join(VOLUME_DIR, CKPT_DIR_REL, f"projector_step{step}.safetensors"))
                 vol.commit()
@@ -349,19 +550,32 @@ def train():
                 print(f"[train] early stop: hit GROK_STOP_AFTER_STEPS={GROK_STOP_AFTER_STEPS}")
                 break
     torch.save(proj.state_dict(), os.path.join(VOLUME_DIR, CKPT_DIR_REL, "projector_final.safetensors"))
+    render_curves(records, os.path.join(VOLUME_DIR, LOG_DIR_REL, "train_curves.png"),
+                  grok_lo=grok_lo, grok_hi=grok_hi)
+    _log(logger, {"type": "run_end", "step": step, "samples_seen": samples_seen,
+                  "tokens_seen": tokens_seen, "n_alerts": monitor.n_alerts,
+                  "wall_min": round((time.time() - t0) / 60, 1), "ts": round(time.time(), 1)})
     vol.commit()
     logger.close()
-    print(f"[train] DONE after {step} steps")
+    print(f"[train] DONE after {step} steps | alerts={monitor.n_alerts} "
+          f"| wall={(time.time() - t0)/60:.0f}min")
 
 
 def _one_step(sig, model, proj, opt, tok):
     import torch
     import torch.nn as nn
+    t0 = time.time()
     full = inject_visual(sig, proj, model)
     out = model(**full)
     loss = out.loss
     opt.zero_grad(set_to_none=True)
     loss.backward()
-    nn.utils.clip_grad_norm_(proj.parameters(), 1.0)
+    # clip at 1.0 AND capture the PRE-clip total norm: grad-norm bursts are the
+    # earliest warning of a loss cliff (they move before the loss does).
+    gnorm = nn.utils.clip_grad_norm_(proj.parameters(), 1.0)
     opt.step()
-    return {"loss": float(loss.item())}
+    n_tokens = int(sig["attention_mask"].sum())
+    return {"loss": float(loss.item()),
+            "grad_norm": float(gnorm),
+            "tokens": n_tokens,
+            "step_ms": round((time.time() - t0) * 1000, 1)}
