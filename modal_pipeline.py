@@ -84,6 +84,13 @@ _vit_image = (
     .pip_install(_FLASH_ATTN_WHEEL)
     .env(_hf_env)
 )
+# Lightweight CPU image for packing embeddings -> parquet shards (Phase 2):
+# needs torch (torch.load the .pt) + pyarrow (write parquet). No GPU, no FA.
+_pack_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("torch==2.6.0", "numpy", "pyarrow", "huggingface_hub")
+    .env(_hf_env)
+)
 
 app = modal.App(APP_NAME)
 
@@ -439,6 +446,179 @@ def push_bench(repo_ns: str = "keypa", n_files: int = 8192):
 
     print(f"[push-bench] per-shard estimate at these rates: read {t_read:.0f}s + "
           f"write {t_write:.0f}s + upload {t_up:.0f}s = {t_read + t_write + t_up:.0f}s", flush=True)
+
+
+@app.function(image=_vit_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              timeout=60 * 30, memory="32GB", ephemeral_disk=524288)
+def emb_io_bench(n_files: int = 200, workers=(1, 8)):
+    """Phase-1 probe (docs/TRAINING_PLAN.md): measure the real per-file cost of
+    loading precomputed `.pt` embeddings from the Modal Volume, exactly as
+    modal_train.EmbSFT.__getitem__ does (torch.load, weights_only=True).
+
+    Reports avg/p95 per-file latency, achieved MB/s, and the projected I/O share
+    of a training step at BATCH_SIZE=8 / MAX_SEQ_LEN=4096 for serial (1) and
+    DataLoader (8) workers. `workers` arrives as a string when passed via CLI
+    (ANY-typed param) so coerce it like precompute_bench does."""
+    import os, random, time, statistics
+    import torch
+    if isinstance(workers, str):
+        workers = tuple(int(x) for x in workers.strip("()[] ").split(",") if x.strip())
+    vol.reload()
+    embs = sorted(os.listdir(EMB_DIR))
+    embs = [e for e in embs if e.endswith(".pt")]
+    if len(embs) > n_files:
+        rnd = random.Random(0)
+        embs = rnd.sample(embs, n_files)
+    paths = [os.path.join(EMB_DIR, e) for e in embs]
+    print(f"[emb-io-bench] sampling {len(paths)} .pt files from {EMB_DIR}", flush=True)
+
+    bytes_per_file = [os.path.getsize(p) for p in paths]
+    total_mb = sum(bytes_per_file) / 1e6
+    print(f"[emb-io-bench] total {total_mb:.0f} MB  "
+          f"avg {statistics.mean(bytes_per_file) / 1e3:.0f} KB/file", flush=True)
+
+    def _load(p):
+        t0 = time.perf_counter()
+        d = torch.load(p, map_location="cpu", weights_only=True)
+        return time.perf_counter() - t0, d.shape[0]
+
+    # serial pass = worst case (EmbSFT with num_workers=1)
+    print("[emb-io-bench] serial torch.load pass ...", flush=True)
+    lat = []
+    for i, p in enumerate(paths):
+        dt, _ = _load(p)
+        lat.append(dt)
+        if (i + 1) % 25 == 0:
+            print(f"[emb-io-bench] serial {i + 1}/{len(paths)}  "
+                  f"avg {statistics.mean(lat) * 1e3:.0f} ms", flush=True)
+    lat.sort()
+    avg_ms = statistics.mean(lat) * 1e3
+    p95_ms = lat[int(len(lat) * 0.95) - 1] * 1e3
+    mb_s = total_mb / sum(lat)
+    print(f"[emb-io-bench] SERIAL: avg {avg_ms:.0f} ms/file  p95 {p95_ms:.0f} ms  "
+          f"{mb_s:.1f} MB/s", flush=True)
+
+    # parallel pass = DataLoader-ish (num_workers workers, ~1 batch of 8 each)
+    for nw in workers:
+        if nw <= 1:
+            continue
+        from concurrent.futures import ThreadPoolExecutor
+        print(f"[emb-io-bench] parallel torch.load pass ({nw} workers) ...", flush=True)
+        lat_p = []
+        t0 = time.time()
+        with ThreadPoolExecutor(max_workers=nw) as ex:
+            for dt, _ in ex.map(_load, paths):
+                lat_p.append(dt)
+        wall = time.time() - t0
+        mb_s_p = total_mb / wall
+        print(f"[emb-io-bench] PARALLEL {nw}: wall {wall:.1f}s  {mb_s_p:.1f} MB/s "
+              f"(latency effectively hidden when workers >= load queue)", flush=True)
+
+    # project I/O share of a training step at bs=8, per worker pool
+    BATCH = 8
+    for nw in workers:
+        if nw == 1:
+            per_batch = BATCH * avg_ms / 1e3
+        else:
+            per_batch = BATCH * avg_ms / 1e3 / min(nw, BATCH)  # ~1 batch spread over workers
+        print(f"[emb-io-bench] STEP I/O @ bs={BATCH} workers={nw}: ~{per_batch:.2f} s/batch "
+              f"(vs ~10 s compute on A100 -> ~{per_batch / 10 * 100:.0f}% of step)", flush=True)
+
+    print("[emb-io-bench] DONE. verdict: >40% I/O share => parquet is a training-speed fix; "
+          "<15% => it's publish-quality only.", flush=True)
+
+
+@app.function(image=_pack_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              timeout=60 * 60 * 8, memory="64GB", ephemeral_disk=524288)
+def pack_embeddings_to_parquet(shard_rows: int = 1360, workers: int = 32, limit: int = 0):
+    """Phase-2 (docs/TRAINING_PLAN.md): convert the .pt embedding cache into
+    large parquet shards on the Volume, the single source of truth for both the
+    trainer (ParquetEmbSFT) and the HF publish.
+
+    Each shard row: {key: 'embeddings/<sha1>.pt' (matches the manifest `emb`
+    field byte-for-byte), n_vis: int, vis_bytes: raw BF16 tobytes()} — the
+    exact bytes of the original [n_merged, 4096] bf16 tensor, no torch.save
+    pickle, no compression (float data is incompressible).  Shards that already
+    exist are skipped, so an interrupted pack resumes instead of restarting.
+
+    shard_rows=1360 => ~10 GB/shard, ~100 shards for the 139k corpus.
+    `limit` > 0 restricts to the first N .pt files (smoke-testing only)."""
+    import os, time, glob
+    import torch
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    vol.reload()
+    shards_dir = f"{VOLUME_DIR}/shards"
+    os.makedirs(shards_dir, exist_ok=True)
+
+    files = sorted(glob.glob(f"{EMB_DIR}/*.pt"))
+    if limit and limit > 0:
+        files = files[:limit]
+    total = len(files)
+    n_shards = (total + shard_rows - 1) // shard_rows
+    print(f"[emb-pack] embeddings: {total}  shards: {n_shards}  "
+          f"shard_rows={shard_rows}", flush=True)
+
+    schema = pa.schema([
+        pa.field("key", pa.string()),
+        pa.field("n_vis", pa.int64()),
+        pa.field("vis_bytes", pa.binary()),
+    ])
+
+    def shard_path(i):
+        return os.path.join(shards_dir, f"emb_{i:04d}.parquet")
+
+    def load_rows(chunk):
+        """torch.load each .pt in parallel (volume reads are latency-bound
+        serially; 32 threads saturate it like push_bench showed)."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        def _load(path):
+            d = torch.load(path, map_location="cpu", weights_only=True)
+            assert isinstance(d, torch.Tensor) and d.dim() == 2 and d.shape[-1] == 4096, path
+            return os.path.basename(path), d
+        rows = []
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(_load, p) for p in chunk]
+            for i, f in enumerate(as_completed(futs)):
+                name, d = f.result()
+                rows.append({"key": f"embeddings/{name}",
+                             "n_vis": int(d.shape[0]),
+                             "vis_bytes": d.view(torch.uint8).numpy().tobytes()})
+                if (i + 1) % 250 == 0:
+                    print(f"[emb-pack] loaded {i + 1}/{len(chunk)} of this shard", flush=True)
+        return rows
+
+    n_packed = 0
+    n_skip = 0
+    t_start = time.time()
+    for i in range(n_shards):
+        sp = shard_path(i)
+        if os.path.exists(sp) and os.path.getsize(sp) > 0:
+            n_skip += shard_rows
+            print(f"[emb-pack] shard {i}/{n_shards} already packed — skipping", flush=True)
+            continue
+        chunk = files[i * shard_rows:(i + 1) * shard_rows]
+        t0 = time.time()
+        rows = load_rows(chunk)
+        t_load = time.time() - t0
+        t1 = time.time()
+        pq.write_table(pa.Table.from_pydict(
+            {c: [r[c] for r in rows] for c in ("key", "n_vis", "vis_bytes")},
+            schema=schema), sp)
+        t_write = time.time() - t1
+        n_packed += len(rows)
+        gb = sum(len(r["vis_bytes"]) for r in rows) / 1e9
+        rate = n_packed / max(1e-9, time.time() - t_start)
+        eta = (total - n_packed) / rate / 60 if rate > 0 else float("nan")
+        print(f"[emb-pack] shard {i}/{n_shards}: {len(rows)} rows {gb:.1f} GB "
+              f"(load {t_load:.0f}s write {t_write:.0f}s)  total {n_packed}/{total} "
+              f"ETA {eta:.0f} min", flush=True)
+        vol.commit()
+
+    total_gb = sum(os.path.getsize(f) for f in files) / 1e9
+    print(f"[emb-pack] DONE. {n_packed} packed, {n_skip} skipped, "
+          f"{total_gb:.0f} GB of source .pt -> /data/shards", flush=True)
 
 
 @app.function(image=_etl_image, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
@@ -956,23 +1136,63 @@ def _patches_from_size(w, h):
     return max(1, pw * ph)
 
 
+SIZE_CACHE_FILE = f"{META_DIR}/patch_sizes.json"
+
+
+def _load_size_cache():
+    """Load the {logical-key: patches} map persisted on the Volume (if any)."""
+    import os, json
+    if os.path.exists(SIZE_CACHE_FILE):
+        try:
+            with open(SIZE_CACHE_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def _save_size_cache(cache):
+    """Persist {logical-key: patches} back to the Volume so future runs skip
+    the ~10 min of network-backed header reads entirely."""
+    import os, json
+    os.makedirs(META_DIR, exist_ok=True)
+    with open(SIZE_CACHE_FILE, "w") as f:
+        json.dump(cache, f)
+    vol.commit()
+
+
 def pack_patched_batches(image_paths, patch_cap, cache=None, progress=None):
     """Greedy-pack images so total patches per forward <= `patch_cap` (memory is
     bounded by total patches for this variable-length model, not image count).
     `cache` is an optional {path: patches} dict reused across calls (bench).
-    Returns (batches, cache)."""
+    Header reads for the network-backed Volume run in parallel. Returns
+    (batches, cache)."""
     from PIL import Image
     if cache is None:
         cache = {}
-    batches, cur, cur_p = [], [], 0
     total = len(image_paths)
+    need = [p for p in image_paths if p not in cache]
+    if need:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        n = len(need)
+        done_reads = 0
+        def _read(p):
+            from PIL import Image
+            return p, Image.open(p).size
+        with ThreadPoolExecutor(max_workers=32) as ex:
+            futs = [ex.submit(_read, p) for p in need]
+            for f in as_completed(futs):
+                p, (w, h) = f.result()
+                cache[p] = _patches_from_size(w, h)
+                done_reads += 1
+                if done_reads % 5_000 == 0 and progress:
+                    progress(done_reads, n)
+        if progress and done_reads % 5_000 != 0:
+            progress(done_reads, n)
+    elif progress:
+        progress(total, total)
+    batches, cur, cur_p = [], [], 0
     for i, p in enumerate(image_paths):
-        if i % 20_000 == 0 and progress:
-            progress(i, total)
-        if p not in cache:
-            with Image.open(p) as im:
-                w, h = im.size
-            cache[p] = _patches_from_size(w, h)
         n = cache[p]
         if cur and cur_p + n > patch_cap:
             batches.append(cur); cur, cur_p = [p], n
@@ -1059,22 +1279,26 @@ def precompute(patch_cap: int = 262_144, workers: int = 8, ahead: int = 2):
     vit = load_moonvit_from_safetensors(st, cfg, device="cuda", dtype=torch.bfloat16)
     phase("model loaded")
 
-    phase("scanning corpus (globbing agentic + cauldron)")
+    phase("refreshing volume snapshot, then scanning corpus (globbing agentic + cauldron)")
+    vol.reload()
     raw = sorted(glob.glob(f"{IMG_DIR}/agentic/*") + glob.glob(f"{IMG_DIR}/cauldron/*"))
     phase(f"glob done: {len(raw)} candidate files — checking which are already cached")
-    img_paths, scanned = [], 0
-    for p in raw:
-        if not _already_done(p):
-            img_paths.append(p)
-        scanned += 1
-        if scanned % 20_000 == 0:
-            phase(f"checked {scanned}/{len(raw)} files, {len(img_paths)} to do/batches yet")
-    phase(f"cache check done: {len(img_paths)}/{len(raw)} to precompute")
+    # single glob of the embeddings dir builds the done-set in ONE volume listing,
+    # instead of 136k per-file stat() calls over the FUSE mount.
+    done_keys = {os.path.basename(p) for p in glob.glob(f"{EMB_DIR}/*")}
+    img_paths = [p for p in raw if _emb_key(p) not in done_keys]
+    phase(f"cache check done: {len(img_paths)}/{len(raw)} to precompute "
+          f"({len(done_keys)} already cached)")
 
-    phase("packing into patch-capped batches (reading per-image size headers)")
-    batches, _ = pack_patched_batches(
-        img_paths, patch_cap,
+    phase("packing into patch-capped batches (parallel header reads, cached sizes)")
+    size_cache = _load_size_cache()
+    path_cache = {p: size_cache[_emb_key(p)] for p in img_paths if _emb_key(p) in size_cache}
+    hit = len(path_cache)
+    phase(f"size cache: {hit}/{len(img_paths)} hits on disk")
+    batches, dc = pack_patched_batches(
+        img_paths, patch_cap, cache=path_cache,
         progress=lambda i, t: phase(f"packing headers {i}/{t}"))
+    _save_size_cache({_emb_key(p): n for p, n in dc.items()})
     phase(f"total={len(img_paths)} patch_cap={patch_cap} batches={len(batches)} "
           f"workers={workers} ahead={ahead}")
     done = 0
