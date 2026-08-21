@@ -124,6 +124,13 @@ def test_resume_action_skip_pack_push_from_vol():
     assert resume_action("emb_0002.parquet", set(), {"emb_0002.parquet"}) == "pack"
 
 
+def test_resume_action_hf_only_skips_pushed_shards():
+    # --hf-only mode: shard lives on HF alone -> DONE, never redo
+    assert resume_action("emb_0005.parquet", set(), {"emb_0005.parquet"}, hf_only=True) == "skip"
+    # default (both destinations): HF-only still needs its volume copy
+    assert resume_action("emb_0005.parquet", set(), {"emb_0005.parquet"}) == "pack"
+
+
 def _fakedisk():
     class FakeVol:
         def __init__(self, vol_paths):

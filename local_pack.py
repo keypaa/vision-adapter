@@ -126,13 +126,17 @@ def existing_hf_shards(api, repo_id):
     return out
 
 
-def resume_action(shard, vol_shards, hf_shards):
+def resume_action(shard, vol_shards, hf_shards, hf_only=False):
+    """hf_only=True: the volume copy never exists, so HF presence alone
+    means DONE — otherwise an --hf-only rerun would redo every shard."""
     on_vol = shard in vol_shards
     on_hf = shard in hf_shards
     if on_vol and on_hf:
         return "skip"
     if on_vol and not on_hf:
         return "push_from_vol"
+    if on_hf and hf_only:
+        return "skip"
     return "pack"
 
 
@@ -290,7 +294,7 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
 
     def try_prefetch(i):
         """Start background download for shard i iff it will need packing."""
-        if i >= hi or resume_action(_shard_name(i), vol_shards, hf_shards) != "pack":
+        if i >= hi or resume_action(_shard_name(i), vol_shards, hf_shards, hf_only) != "pack":
             return None
         n = len(chunk(i))
         log(f"[local-pack] shard {i}: staging {n} files in background ...")
@@ -312,7 +316,7 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
     pending = try_prefetch(lo)
     for i in range(lo, hi):
         shard = _shard_name(i)
-        action = resume_action(shard, vol_shards, hf_shards)
+        action = resume_action(shard, vol_shards, hf_shards, hf_only)
         n = len(chunk(i))
         assert n, f"shard {i} has no rows"
         local_parquet = os.path.join(stage_dir, shard)
