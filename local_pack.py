@@ -171,7 +171,7 @@ def download_shard(vol, shard_names: list[str], stage_dir: str, workers: int = 6
             out[name] = dst
             done_bytes[0] += nbytes
             now = time.time()
-            if progress and (i % 100 == 0 or i == len(shard_names)) and now - t_last[0] > 3:
+            if progress and (now - t_last[0] >= 3 or i == len(shard_names)):
                 t_last[0] = now
                 rate = done_bytes[0] / max(1e-9, now - t0) / 1e6
                 progress(i, len(shard_names), done_bytes[0] / 1e9, rate)
@@ -272,7 +272,15 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
         """Start background download for shard i iff it will need packing."""
         if i >= hi or resume_action(_shard_name(i), vol_shards, hf_shards) != "pack":
             return None
-        return dl.submit(download_shard, vol, chunk(i), stage_of(i), workers, retries)
+        n = len(chunk(i))
+        log(f"[local-pack] shard {i}: staging {n} files in background ...")
+
+        def _cb(done, total, gb, mbps):
+            log(f"[local-pack] shard {i} staging {done}/{total} files "
+                f"({gb:.1f} GB, {mbps:.0f} MB/s)")
+
+        return dl.submit(download_shard, vol, chunk(i), stage_of(i), workers,
+                         retries, _cb)
 
     actions = []
     t0 = time.time()
