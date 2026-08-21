@@ -440,14 +440,29 @@ def train_dryrun():
     import torch
     torch.backends.cuda.matmul.allow_tf32 = True
     tok, model, proj, opt, loader, _val_loader, _logger = _shared_setup()
-    sig = next(iter(loader))
+    it = iter(loader)
+    sig = next(it)
     step_out = _one_step(sig, model, proj, opt, tok)
     cur = torch.cuda.memory_allocated() / 2**30
     peak = torch.cuda.max_memory_allocated() / 2**30
+    # stable step-time baseline (excl. warmup) so Phase 5's B300 number has
+    # something to compare against — this is the whole point of recording it.
+    n_timed = min(4, max(1, len(loader) - 1))
+    for _ in range(n_timed - 1):
+        next(it)
+    if hasattr(torch.cuda, "synchronize"):
+        torch.cuda.synchronize()
+    t0 = time.time()
+    for _ in range(n_timed):
+        _one_step(next(it), model, proj, opt, tok)
+    if hasattr(torch.cuda, "synchronize"):
+        torch.cuda.synchronize()
+    step_s = (time.time() - t0) / n_timed
     line = (f"[dryrun] loss={step_out['loss']:.4f} n_trainable={sum(p.numel() for p in proj.parameters())/1e6:.1f}M "
             f"| mem_alloc={cur:.2f}GiB peak={peak:.2f}GiB budget={GPU_MEM_CAP_GIB:.0f}GiB -> "
-            f"{'PASS' if peak < GPU_MEM_CAP_GIB else 'FAIL'}")
-    print(line)
+            f"{'PASS' if peak < GPU_MEM_CAP_GIB else 'FAIL'} "
+            f"| step={step_s:.2f}s ({1/step_s:.3f}it/s @ bs{int(BATCH_SIZE)}, n={n_timed})")
+    print(line, flush=True)
     with open(os.path.join(VOLUME_DIR, "dryrun_report.txt"), "w") as f:
         f.write(line + "\n")
     vol.commit()

@@ -80,16 +80,18 @@ publish.
   the HF publish is complete and the volume is recoverable.
 
 ### Report — Phase 2
-- `[ ]` Status: TODO
-- Shard count / row-sum vs glob count:
-- Total GB on volume (`/data/shards`):
-- Round-trip equality check (pass/fail):
-- Pack wall-time (parallel reads):
-- Notes:
+- `[~]` Status: IN PROGRESS — smoke DONE on Modal (2 shards, `emb_0000/0001`, ~18 GB, round-trip verified); full corpus moved to **`local_pack.py --hf-only`** (Phase 7 implementation), running on the owner's laptop.
+- Shard count / row-sum vs glob count: 138,987 rows ⇒ **103 shards** @1360 (last = 267).
+- Total GB on volume (`/data/shards`): 18 GB (2 smoke shards only; full corpus goes to HF, not the volume — see Phase 6.2 update).
+- Round-trip equality check: **pass** (`frombuffer→view(bf16)→reshape(-1,4096)` pinned by tests).
+- Pack wall-time: Modal path volume-latency-bound (~508 s/shard cold) ⇒ superseded by local packer (network-bound, ~3.5 min/shard projected).
+- Notes: writer uses `compression=None` (bf16 incompressible; measured 2.3× faster writes) + pipelined next-shard download against HF push.
 
 ---
 
 ## Phase 3 — Trainer reads shards (`ParquetEmbSFT` replaces `EmbSFT`)
+
+> **SKIPPED BY MEASUREMENT (2026-08-21).** Re-bench of `.pt` reads: warm **16 ms/file** serial (499 MB/s), **1727 MB/s @ 8 workers**, I/O ≈ **0–1 % of a step** with `num_workers=8` (now applied). The parquet rework bought nothing for training speed; trainer stays on `EmbSFT` reading `/data/embeddings/*.pt`. Parquet is the *publish/reproduction* format only.
 
 **Goal:** remove per-file `torch.load` from the training hot loop.
 
@@ -112,18 +114,21 @@ publish.
 
 ## Phase 4 — A100 `train_dryrun` first
 
-**Goal:** validate the **new data path** in isolation on known hardware,
-before any GPU-stack churn. (Trainer has never run even once.)
+**Goal:** validate the **never-run training code** in isolation on known
+hardware + the known-good image (`torch==2.5.1`), before any GPU-stack churn.
+NOT a speed contest — but it records the step-time baseline that Phase 5's
+B300 dryrun is compared against (added to `train_dryrun` 2026-08-21: 4 timed
+steps after warmup, printed + written to `dryrun_report.txt`).
 
 **Details:**
-- Run `modal run modal_train.py::train_dryrun` on A100-80GB with `ParquetEmbSFT`.
+- Run `modal run modal_train.py::train_dryrun` on **A100-80GB**, dataset = current **`EmbSFT`** (.pt path — see Phase 3 skip).
 - Keep `BATCH_SIZE=8`, `MAX_SEQ_LEN=4096`, `GPU_MEM_CAP_GIB=70`, grad checkpointing ON.
-- Gate: memory-box PASS + recorded step-time baseline.
+- Gate: memory-box PASS **+ recorded `step=Xs (Y it/s)` baseline** in `dryrun_report.txt`.
 
 ### Report — Phase 4
 - `[ ]` Status: TODO
 - Dry-run verdict (PASS/FAIL, peak GiB):
-- Step time baseline (it/s) on A100 with parquet path:
+- Step time baseline (it/s) on A100 with `.pt` path:
 - Notes:
 
 ---
@@ -173,34 +178,27 @@ recovery, and stop the un-finished pushes.
    AND the HF parquet copy is verified (the Volume is the trainer's read source).
 
 ### Report — Phase 6
-- `[ ]` Status: TODO
-- Images: shards present after run (target 17/17):
-- Embeddings: shards uploaded (target ~100/100):
-- HF repo sizes (images / embeddings):
-- Verification: `load_dataset` round-trip OK (Y/N):
-- Notes:
+- `[x]` 6.1 Images: **DONE — 17/17 shards** (138,987 rows) live on `keypa/vision-adapter-images`.
+- `[~]` 6.2 Embeddings: **superseded by `local_pack.py --hf-only`** (runs on the owner's laptop, pushes `data/emb_XXXX.parquet` straight to HF; target **103/103**). Volume copy `/data/shards` no longer part of the plan (trainer reads `.pt`; hydrate-from-HF possible later if ever needed).
+- HF repo sizes (images / embeddings): TBD after tonight's pack.
+- Verification: `load_dataset` round-trip OK: pending post-pack spot-check.
+- Notes: dataset cards for all three repos + a linking HF space = future polish.
 
 ---
 
-## Phase 7 — Local push variant (existing todo, post-parquet)
+## Phase 7 — Local push variant
 
-**Goal:** allow pushing shards from home fiber (1 Gb/s) overnight instead of
-Modal cloud hours, byte-identical to the Modal path.
-
-**Details:**
-- Local CLI that downloads a shard's *inputs* from the Volume in chunks
-  (`modal volume get` a ~10 GB slice), packs the same parquet schema as
-  Phase 2, pushes to HF, then deletes the local slice.
-- Deterministic `key`/schema/row-size ⇒ indistinguishable from the Modal path.
-- Sized for ~30-50 GB local disk (one chunk at a time).
-- Design decision deferred to implementation: stream shards directly vs
-  download-then-pack.
+> **DONE (implemented as `local_pack.py`, 2026-08-21).** Standalone resumable CLI:
+> streams each shard's `.pt` from the volume, packs the identical
+> `key`/`n_vis`/`vis_bytes` schema (`compression=None`, 64-row batches),
+> pushes to HF; `--hf-only` skips the volume copy; `--only i[:j]` ranges;
+> pipelined download↔push; progress JSONL+PNG. Byte-compatibility pinned by tests.
 
 ### Report — Phase 7
-- `[ ]` Status: TODO
-- Upload speed achieved (MB/s, vs 1 Gb/s fiber):
-- Shards pushed locally (target ~100/100):
-- Byte-equality vs Modal-packed shards (spot-check):
+- `[~]` Status: code DONE + smoke pending on home fiber (shard 2 first, then full rip).
+- Upload speed achieved (MB/s, vs 1 Gb/s fiber): TBD tonight.
+- Shards pushed locally (target 103/103): TBD.
+- Byte-equality vs Modal-packed shards: schema/order identical by construction (same sorted enumeration); round-trip equality covered by test suite.
 - Notes:
 
 ---
