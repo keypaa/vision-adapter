@@ -138,13 +138,18 @@ steps after warmup, printed + written to `dryrun_report.txt`).
 **Goal:** move training to B300 with the correct (and minimal) stack changes.
 
 **Details:**
-- `train_image`: `torch==2.5.1` → **torch ≥ 2.7 (cu128)**; keep transformers /
-  accelerate / datasets recent; ensure `pyarrow` present.
+- `train_image`: `torch==2.5.1` → **`torch==2.13.0` (PyPI default = CUDA 13.0 stable)**.
+  Verified on the web (2026-08-21): B300 = SM103 needs **CUDA ≥12.9/13.0** — cu128
+  wheels are broken on B300 (NVRTC cannot compile SM10.3; confirmed by
+  pytorch#175842 + NVIDIA/cuEquivariance#255, working reference: torch≥2.9.1+cu130).
+  The cc print in `train_dryrun_b300` validates SM103 support at runtime.
 - Drop `device_map="auto"` CPU-offload on B300 (quantized model ~155-167 GiB
   fits in 288 GB).
-- **Keep gradient checkpointing ON until the B300 dryrun passes** — do not
-  trust the "54 GB activations / 67 GB free" estimate; verify with a real
-  dryrun before disabling.
+- **Keep gradient checkpointing ON until the B300 dryrun passes** — and the B300
+  dryrun now MEASURES both modes back-to-back (`ckpt=ON step=… / ckpt=OFF step=… peak=…`
+  appended to `dryrun_report.txt`): the ON/OFF decision is made on recorded numbers,
+  not estimates. Skipping backward recompute through the frozen backbone is the
+  single biggest available speed lever (~-25..40% step time if VRAM allows).
 - Do NOT touch `attn_implementation` (eager-only model).
 - Gate: B300 `train_dryrun` PASS under a new memory gate (e.g. ~250 GiB),
   plus recorded step time.

@@ -415,7 +415,8 @@ def _shared_setup():
     collate = make_collate(tok, tok.pad_token_id)
     loader = torch.utils.data.DataLoader(
         ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
-        collate_fn=collate, num_workers=8, persistent_workers=True)
+        collate_fn=collate, num_workers=8, persistent_workers=True,
+        pin_memory=True)
 
     # held-out val set (~2% of rows). Not shuffled; only used for the
     # periodic loss probe so "is it grokking?" isn't judged on train batches.
@@ -455,7 +456,7 @@ def _val_probe(model, proj, val_loader, tok):
     return sum(losses) / max(1, len(losses)), n
 
 
-def _dryrun_impl(mem_cap: float, offload: bool):
+def _dryrun_impl(mem_cap: float, offload: bool, compare_checkpointing: bool = False):
     import torch
     torch.backends.cuda.matmul.allow_tf32 = True
     _props = torch.cuda.get_device_properties(0)
@@ -489,6 +490,30 @@ def _dryrun_impl(mem_cap: float, offload: bool):
     with open(os.path.join(VOLUME_DIR, "dryrun_report.txt"), "w") as f:
         f.write(line + "\n")
     vol.commit()
+
+    if compare_checkpointing:
+        # B300 has headroom: measure what turning grad-checkpointing OFF buys
+        # (skips the 304B-forward recompute in backward — often -25..40%% step
+        # time) and whether peak VRAM stays under the gate. Decision is made on
+        # THESE numbers, not on estimates.
+        model.gradient_checkpointing_disable()
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+        if hasattr(torch.cuda, "synchronize"):
+            torch.cuda.synchronize()
+        t1 = time.time()
+        for _ in range(n_timed):
+            _one_step(next(it), model, proj, opt, tok)
+        if hasattr(torch.cuda, "synchronize"):
+            torch.cuda.synchronize()
+        step_off = (time.time() - t1) / n_timed
+        peak_off = torch.cuda.max_memory_allocated() / 2**30
+        line2 = (f"[dryrun] ckpt=OFF step={step_off:.2f}s ({1/step_off:.3f}it/s) "
+                 f"peak={peak_off:.2f}GiB -> {'KEEP OFF' if peak_off < mem_cap else 'TOO HOT, keep ON'}")
+        print(line2, flush=True)
+        with open(os.path.join(VOLUME_DIR, "dryrun_report.txt"), "a") as f:
+            f.write(line2 + "\n")
+        model.gradient_checkpointing_enable()
     assert peak < mem_cap, "MEMORY GATE FAIL — do not run full train"
 
 
@@ -503,8 +528,9 @@ def train_dryrun():
               timeout=3600, memory=f"{SYS_RAM_CAP_GIB}GB")
 def train_dryrun_b300():
     """Phase 5 gate: SM103/cu130 stack check, all-in-VRAM load, B300 step time
-    vs the A100 baseline recorded by train_dryrun."""
-    _dryrun_impl(B300_GPU_MEM_CAP_GIB, offload=False)
+    vs the A100 baseline recorded by train_dryrun, plus a measured
+    grad-checkpointing ON/OFF verdict."""
+    _dryrun_impl(B300_GPU_MEM_CAP_GIB, offload=False, compare_checkpointing=True)
 
 
 def _train_impl(offload: bool):
