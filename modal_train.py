@@ -82,10 +82,13 @@ def build_model():
     import torch.nn as nn
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
+    print(f"[train] +{time.time() - _T0:6.1f}s  tokenizer: {DS_REPO}", flush=True)
     tok = AutoTokenizer.from_pretrained(DS_REPO, trust_remote_code=True)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
+    print(f"[train] +{time.time() - _T0:6.1f}s  loading backbone (~155 GiB) — "
+          f"this is the long part, minutes on a cold container ...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(
         DS_REPO,
         trust_remote_code=True,
@@ -373,9 +376,20 @@ def _shade_grok(ax, lo, hi):
 
 # =============================== train entry ==============
 
+_T0 = time.time()
+
+
+def _phase(msg):
+    """Timed startup heartbeat (precompute contract): the backbone pull can
+    take 15-30 min on a cold container — without these lines it looks hung."""
+    print(f"[train] +{time.time() - _T0:6.1f}s  {msg}", flush=True)
+
+
 def _shared_setup():
     import torch
+    _phase("loading tokenizer ...")
     tok, model, proj = build_model()
+    _phase(f"backbone+projector ready (trainable={sum(p.numel() for p in proj.parameters())/1e6:.1f}M)")
     ds = EmbSFT()
     collate = make_collate(tok, tok.pad_token_id)
     loader = torch.utils.data.DataLoader(
@@ -390,6 +404,7 @@ def _shared_setup():
         val_loader = torch.utils.data.DataLoader(
             val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False,
             collate_fn=collate, num_workers=0)
+    _phase(f"datasets ready (train={len(ds)} rows, val={len(val_ds)} rows)")
 
     import torch.optim as optim
     opt = optim.AdamW(proj.parameters(), lr=LR, betas=(0.9, 0.95), weight_decay=0.0)

@@ -8,6 +8,7 @@ import torch
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import json
 import os
 
 SHARD_ROWS = 1360
@@ -249,6 +250,8 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
     t0 = time.time()
     rows_done = 0
     os.makedirs(stage_dir, exist_ok=True)
+    progress_path = os.path.join(stage_dir, "pack_progress.jsonl")
+    progress = open(progress_path, "a", buffering=1)
     pending = try_prefetch(lo)
     for i in range(lo, hi):
         shard = _shard_name(i)
@@ -288,9 +291,53 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
         elapsed = time.time() - t0
         rate = rows_done / max(1e-9, elapsed)
         eta = (len(names) - rows_done) / max(1e-9, rate) / 60
+        progress.write(json.dumps({
+            "ts": round(time.time(), 1), "shard": i, "action": action,
+            "rows_done": rows_done, "rows_total": len(names),
+            "rows_s": round(rate, 1), "eta_min": round(eta, 1)}) + "\n")
+        if (i - lo + 1) % 10 == 0 or i + 1 == hi:
+            try:
+                _render_pack_progress(progress_path)
+            except Exception:
+                pass  # charting must never kill packing
         log(f"[local-pack] done {rows_done}/{len(names)} ({100*rows_done/len(names):.0f}%)  "
             f"{rate:.0f} rows/s  ETA {eta:.0f} min  shard {i}/{hi} ({n} rows) action={action}")
+    progress.close()
     return actions
+
+
+def _render_pack_progress(progress_path: str):
+    """Cumulative pack-progress PNG next to the JSONL (visual parity with the
+    trainer's train_curves.png). Rows/s per shard + cumulative % done."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    recs = []
+    with open(progress_path) as f:
+        for line in f:
+            try:
+                recs.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    if len(recs) < 2:
+        return False
+    fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
+    shards = [r["shard"] for r in recs]
+    axes[0].plot(shards, [r["rows_s"] for r in recs], lw=1.4, color="tab:blue")
+    axes[0].set_ylabel("rows/s")
+    axes[0].set_title("local_pack — live progress")
+    pct = [100 * r["rows_done"] / r["rows_total"] for r in recs]
+    axes[1].plot(shards, pct, lw=1.8, color="tab:green")
+    axes[1].set_ylabel("% corpus packed")
+    axes[1].set_xlabel("shard")
+    axes[0].text(0.99, 0.95, f"ETA {recs[-1]['eta_min']:.0f} min",
+                 transform=axes[0].transAxes, ha="right", va="top", fontsize=9)
+    fig.tight_layout()
+    out = progress_path.replace(".jsonl", ".png")
+    fig.savefig(out, dpi=110)
+    plt.close(fig)
+    return True
 
 
 def main(argv=None):
