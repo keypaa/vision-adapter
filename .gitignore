@@ -3,3 +3,5 @@ __pycache__/
 .cache/
 *.pyc
 session-ses_*.md
+.superpowers/
+.pytest_cache/

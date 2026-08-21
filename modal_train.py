@@ -168,7 +168,9 @@ def make_collate(tok, pad_id, max_len=MAX_SEQ_LEN):
         parts = []
         for u, a, nv in zip(u_ids, a_ids, n_vis):
             budget_text = max_len - nv - 2
-            a = a[: max(1, budget_text - len(u))]      # keep answer; trim user if overflowing
+            # answer has PRIORITY on the text budget (it is the loss target);
+            # the user prompt absorbs whatever room is left.
+            a = a[: max(1, budget_text)]
             u = u[: max(1, budget_text - len(a))]
             parts.append((nv, u, a))
             seq_lens.append(1 + nv + len(u) + len(a) + 1)
@@ -209,10 +211,12 @@ def inject_visual(inputs, proj, model):
     """Project cached ViT embeddings -> LLM dim, embed tokens, and splice the
     visual block at positions [1 : 1+n_vis], producing inputs_embeds for the LLM."""
     import torch
+    embed = model.get_input_embeddings()
+    dev = next(embed.parameters()).device   # not hardcoded cuda: works sharded/cpu too
     with torch.no_grad():
-        ids = inputs["input_ids"].clamp_min(0).to("cuda")
-        text_emb = model.get_input_embeddings()(ids)      # [B,L,4096]
-    vis = proj(inputs["vis"].to("cuda", torch.bfloat16))  # [B,maxv,4096]
+        ids = inputs["input_ids"].clamp_min(0).to(dev)
+        text_emb = embed(ids)             # [B,L,4096]
+    vis = proj(inputs["vis"].to(dev, torch.bfloat16))  # [B,maxv,4096]
     merged = text_emb.clone()
     attn = inputs["attention_mask"].clone()
     labels = inputs["labels"].clone()
@@ -224,8 +228,8 @@ def inject_visual(inputs, proj, model):
         labels[i, 1: 1 + nv] = -100
     return {
         "inputs_embeds": merged,
-        "attention_mask": attn.to("cuda"),
-        "labels": labels.to("cuda"),
+        "attention_mask": attn.to(dev),
+        "labels": labels.to(dev),
     }
 
 
