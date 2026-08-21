@@ -28,6 +28,11 @@ import modal
 
 GPU = "A100-80GB"
 GPU_MEM_CAP_GIB = 70.0
+
+# ---- B300 stack (Phase 5) — 288 GiB VRAM: whole quantized backbone in VRAM ----
+B300_GPU = "B300"
+B300_GPU_MEM_CAP_GIB = 250.0          # dryrun gate; activations headroom verified, not assumed
+TORCH_B300_PIN = "torch==2.13.0"      # cu130 build; SM103 support validated by the cc print in the b300 dryrun
 SYS_RAM_CAP_GIB = 200
 BATCH_SIZE = 8
 LR = 5e-4
@@ -72,12 +77,22 @@ train_image = (
     .env({"HF_HOME": HF_CACHE})
 )
 
+train_image_b300 = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install(
+        TORCH_B300_PIN, "safetensors", "accelerate", "transformers",
+        "datasets", "pillow", "sentencepiece", "huggingface_hub",
+        "matplotlib",
+    )
+    .env({"HF_HOME": HF_CACHE})
+)
+
 app = modal.App("vision-adapter-train")
 
 
 # ============================ model assembly (shared) =========================
 
-def build_model():
+def build_model(offload: bool = True):
     import torch
     import torch.nn as nn
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -89,14 +104,20 @@ def build_model():
 
     print(f"[train] +{time.time() - _T0:6.1f}s  loading backbone (~155 GiB) — "
           f"this is the long part, minutes on a cold container ...", flush=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        DS_REPO,
+    load_kwargs = dict(
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
-        device_map="auto",
-        max_memory={0: f"{int(GPU_MEM_CAP_GIB)}GiB", "cpu": f"{int(SYS_RAM_CAP_GIB)}GiB"},
     )
+    if offload:
+        # A100 path: quantized backbone split across GPU cap + CPU RAM (PCIe hops in the loop).
+        load_kwargs.update(device_map="auto",
+                           max_memory={0: f"{int(GPU_MEM_CAP_GIB)}GiB",
+                                       "cpu": f"{int(SYS_RAM_CAP_GIB)}GiB"})
+    else:
+        # B300 path: 288 GiB VRAM holds the whole model — no offload, no PCIe bottleneck.
+        load_kwargs.update(device_map={"": 0})
+    model = AutoModelForCausalLM.from_pretrained(DS_REPO, **load_kwargs)
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     for p in model.parameters():
@@ -434,12 +455,14 @@ def _val_probe(model, proj, val_loader, tok):
     return sum(losses) / max(1, len(losses)), n
 
 
-@app.function(image=train_image, gpu=GPU, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
-              timeout=3600, memory=f"{SYS_RAM_CAP_GIB}GB")
-def train_dryrun():
+def _dryrun_impl(mem_cap: float, offload: bool):
     import torch
     torch.backends.cuda.matmul.allow_tf32 = True
-    tok, model, proj, opt, loader, _val_loader, _logger = _shared_setup()
+    _props = torch.cuda.get_device_properties(0)
+    print(f"[dryrun] gpu={_props.name} cc={_props.major}.{_props.minor} "
+          f"vram={_props.total_memory / 2**30:.0f}GiB offload={'on' if offload else 'OFF (all-in-VRAM)'}",
+          flush=True)
+    tok, model, proj, opt, loader, _val_loader, _logger = _shared_setup(offload=offload)
     it = iter(loader)
     sig = next(it)
     step_out = _one_step(sig, model, proj, opt, tok)
@@ -459,22 +482,35 @@ def train_dryrun():
         torch.cuda.synchronize()
     step_s = (time.time() - t0) / n_timed
     line = (f"[dryrun] loss={step_out['loss']:.4f} n_trainable={sum(p.numel() for p in proj.parameters())/1e6:.1f}M "
-            f"| mem_alloc={cur:.2f}GiB peak={peak:.2f}GiB budget={GPU_MEM_CAP_GIB:.0f}GiB -> "
-            f"{'PASS' if peak < GPU_MEM_CAP_GIB else 'FAIL'} "
+            f"| mem_alloc={cur:.2f}GiB peak={peak:.2f}GiB budget={mem_cap:.0f}GiB -> "
+            f"{'PASS' if peak < mem_cap else 'FAIL'} "
             f"| step={step_s:.2f}s ({1/step_s:.3f}it/s @ bs{int(BATCH_SIZE)}, n={n_timed})")
     print(line, flush=True)
     with open(os.path.join(VOLUME_DIR, "dryrun_report.txt"), "w") as f:
         f.write(line + "\n")
     vol.commit()
-    assert peak < GPU_MEM_CAP_GIB, "MEMORY GATE FAIL — do not run full train"
+    assert peak < mem_cap, "MEMORY GATE FAIL — do not run full train"
 
 
 @app.function(image=train_image, gpu=GPU, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
-              timeout=86400, memory=f"{SYS_RAM_CAP_GIB}GB")
-def train():
+              timeout=3600, memory=f"{SYS_RAM_CAP_GIB}GB")
+def train_dryrun():
+    """Phase 4 gate on the known-good stack: code correctness + A100 baseline."""
+    _dryrun_impl(GPU_MEM_CAP_GIB, offload=True)
+
+
+@app.function(image=train_image_b300, gpu=B300_GPU, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              timeout=3600, memory=f"{SYS_RAM_CAP_GIB}GB")
+def train_dryrun_b300():
+    """Phase 5 gate: SM103/cu130 stack check, all-in-VRAM load, B300 step time
+    vs the A100 baseline recorded by train_dryrun."""
+    _dryrun_impl(B300_GPU_MEM_CAP_GIB, offload=False)
+
+
+def _train_impl(offload: bool):
     import torch
     torch.backends.cuda.matmul.allow_tf32 = True
-    tok, model, proj, opt, loader, val_loader, logger = _shared_setup()
+    tok, model, proj, opt, loader, val_loader, logger = _shared_setup(offload=offload)
     n_params = sum(p.numel() for p in proj.parameters())
     steps_total = EPOCHS * len(loader)
     grok_lo = int(SAMPLES_PER_BASETEN_GROK / BATCH_SIZE * 0.8)
@@ -593,6 +629,20 @@ def train():
     logger.close()
     print(f"[train] DONE after {step} steps | alerts={monitor.n_alerts} "
           f"| wall={(time.time() - t0)/60:.0f}min")
+
+
+@app.function(image=train_image, gpu=GPU, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              timeout=86400, memory=f"{SYS_RAM_CAP_GIB}GB")
+def train():
+    """Phase 4/5 fallback trainer on the known-good A100 stack."""
+    _train_impl(offload=True)
+
+
+@app.function(image=train_image_b300, gpu=B300_GPU, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
+              timeout=86400, memory=f"{SYS_RAM_CAP_GIB}GB")
+def train_b300():
+    """Phase 5 target: full SFT all-in-VRAM on B300 (run only after train_dryrun_b300 PASS)."""
+    _train_impl(offload=False)
 
 
 def _one_step(sig, model, proj, opt, tok):
