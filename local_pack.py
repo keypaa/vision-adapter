@@ -76,20 +76,29 @@ def iter_rows(local_paths: list[str]) -> Iterator[dict]:
         yield make_row(f"embeddings/{os.path.basename(p)}", t)
 
 
-def pack_rows(rows: Iterable[dict], out_path: str, batch_size: int = 64) -> None:
+def pack_rows(rows: Iterable[dict], out_path: str, batch_size: int = 64,
+              progress=None) -> None:
     """Stream rows to a parquet file in fixed-size batches (RAM-bounded).
 
     compression=None: bf16 float payloads are incompressible — snappy only
-    burns CPU (measured 2.3x write time for ~0% size change)."""
+    burns CPU (measured 2.3x write time for ~0% size change).
+    `progress(rows_done)` fires once per written batch."""
     writer = pq.ParquetWriter(out_path, SCHEMA, compression=None)
     batch = []
+    done = 0
     for r in rows:
         batch.append(r)
         if len(batch) >= batch_size:
             writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
+            done += len(batch)
             batch.clear()
+            if progress:
+                progress(done)
     if batch:
         writer.write_table(pa.Table.from_pylist(batch, schema=SCHEMA))
+        done += len(batch)
+        if progress:
+            progress(done)
     writer.close()
 
 
@@ -140,15 +149,34 @@ def _vol_read_retry(vol, name, dst, retries, delay=0.5):
     raise last
 
 
-def download_shard(vol, shard_names: list[str], stage_dir: str, workers: int = 6, retries: int = 3) -> list[str]:
+def download_shard(vol, shard_names: list[str], stage_dir: str, workers: int = 6,
+                   retries: int = 3, progress=None) -> list[str]:
+    """Stage the shard's .pt files locally. `progress(done, total, gb)` is called
+    as downloads complete (throttled) so the user sees life within seconds."""
+    from concurrent.futures import as_completed
     os.makedirs(stage_dir, exist_ok=True)
+    t_last, t0 = [0.0], time.time()
 
     def _one(name):
         dst = os.path.join(stage_dir, os.path.basename(name))
-        return _vol_read_retry(vol, name, dst, retries)
+        _vol_read_retry(vol, name, dst, retries)
+        return name, dst, os.path.getsize(dst)
 
+    out = {}
+    done_bytes = [0]
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        return list(ex.map(_one, shard_names))
+        futs = {ex.submit(_one, nm): nm for nm in shard_names}
+        for i, fut in enumerate(as_completed(futs), 1):
+            name, dst, nbytes = fut.result()
+            out[name] = dst
+            done_bytes[0] += nbytes
+            now = time.time()
+            if progress and (i % 100 == 0 or i == len(shard_names)) and now - t_last[0] > 3:
+                t_last[0] = now
+                rate = done_bytes[0] / max(1e-9, now - t0) / 1e6
+                progress(i, len(shard_names), done_bytes[0] / 1e9, rate)
+    # restore the caller's deterministic (sorted) order — row order == shard contract
+    return [out[nm] for nm in shard_names]
 
 
 def upload_to_volume(vol, local_path: str, shard: str) -> None:
@@ -266,9 +294,18 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
             if action == "push_from_vol":
                 pull_volume_parquet(vol, shard, local_parquet, retries)
             else:
-                staged = pending.result() if pending is not None else \
-                    download_shard(vol, chunk(i), stage_of(i), workers, retries)
-                pack_rows(iter_rows(staged), local_parquet, batch_size=batch_size)
+                def _stage_cb(done, total, gb, mbps):
+                    log(f"[local-pack] shard {i} staging {done}/{total} files "
+                        f"({gb:.1f} GB, {mbps:.0f} MB/s)")
+                if pending is not None:
+                    staged = pending.result()      # prefetched during previous push
+                else:
+                    staged = download_shard(vol, chunk(i), stage_of(i), workers,
+                                            retries, progress=_stage_cb)
+                def _pack_cb(rows_done):
+                    log(f"[local-pack] shard {i} packed {rows_done}/{len(chunk(i))} rows")
+                pack_rows(iter_rows(staged), local_parquet, batch_size=batch_size,
+                          progress=_pack_cb)
                 if not hf_only:
                     upload_to_volume(vol, local_parquet, shard)
                     vol_shards.add(shard)
