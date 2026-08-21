@@ -1,5 +1,6 @@
 # test_local_pack.py
 import io
+import pytest
 import threading
 import time
 import os
@@ -390,3 +391,50 @@ def test_run_pipeline_skips_done_and_updates_state(tmp_path):
     assert actions == ["skip", "pack"]
     assert "emb_0001.parquet" in vol.uploaded
     assert api.pushes == ["data/emb_0001.parquet"]
+
+
+class FlakyVol(FakeVol):
+    """First read of 'embeddings/bad.pt' delivers a SHORT read (no exception),
+    like a cleanly-closed-but-truncated stream. Second attempt is complete."""
+
+    def __init__(self, files):
+        super().__init__(files)
+        self.bad_attempts = {}
+
+    def read_file_into_fileobj(self, path, fileobj, progress_cb=None):
+        data = self.files[path]
+        if path.endswith("bad.pt"):
+            n = self.bad_attempts.get(path, 0)
+            self.bad_attempts[path] = n + 1
+            if n == 0:
+                fileobj.write(data[: len(data) // 2])
+                return len(data) // 2
+        fileobj.write(data)
+        return len(data)
+
+
+def test_download_shard_rejects_short_reads(tmp_path):
+    import pytest
+    from local_pack import download_shard
+    buf = io.BytesIO(); _torch.save(_bf16(2), buf)
+    data = buf.getvalue()
+    vol = FlakyVol({"embeddings/bad.pt": data})
+    out = download_shard(vol, ["embeddings/bad.pt"], str(tmp_path / "st"),
+                         workers=1, retries=3,
+                         sizes={"embeddings/bad.pt": len(data)})
+    assert open(out[0], "rb").read() == data          # retried until complete
+
+
+def test_download_shard_short_read_exhausts_retries(tmp_path):
+    from local_pack import download_shard
+
+    class AlwaysShort(FakeVol):
+        def read_file_into_fileobj(self, path, fileobj, progress_cb=None):
+            data = self.files[path]
+            fileobj.write(data[:5])
+            return 5
+
+    vol = AlwaysShort({"embeddings/x.pt": b"0123456789"})
+    with pytest.raises(IOError):
+        download_shard(vol, ["embeddings/x.pt"], str(tmp_path / "st"),
+                       workers=1, retries=2, sizes={"embeddings/x.pt": 10})

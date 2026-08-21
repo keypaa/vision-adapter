@@ -150,17 +150,37 @@ def _vol_read_retry(vol, name, dst, retries, delay=0.5):
 
 
 def download_shard(vol, shard_names: list[str], stage_dir: str, workers: int = 6,
-                   retries: int = 3, progress=None) -> list[str]:
+                   retries: int = 3, progress=None, sizes: dict | None = None) -> list[str]:
     """Stage the shard's .pt files locally. `progress(done, total, gb)` is called
-    as downloads complete (throttled) so the user sees life within seconds."""
+    as downloads complete (throttled) so the user sees life within seconds.
+
+    `sizes` maps remote path -> expected byte size (from the volume listing):
+    a stream can close cleanly but SHORT — that truncated file would only
+    explode later in torch.load, so verify size and let the retry loop redo it."""
     from concurrent.futures import as_completed
     os.makedirs(stage_dir, exist_ok=True)
     t_last, t0 = [0.0], time.time()
+    sizes = sizes or {}
 
     def _one(name):
         dst = os.path.join(stage_dir, os.path.basename(name))
-        _vol_read_retry(vol, name, dst, retries)
-        return name, dst, os.path.getsize(dst)
+        expected = sizes.get(name)
+
+        def _get():
+            with open(dst, "wb") as f:
+                vol.read_file_into_fileobj(name, f)
+            if expected is not None and os.path.getsize(dst) != expected:
+                raise IOError(f"short read {name}: "
+                              f"{os.path.getsize(dst)} != {expected} bytes")
+        last = RuntimeError(f"no attempts for {name}")
+        for attempt in range(retries):
+            try:
+                _get()
+                return name, dst, os.path.getsize(dst)
+            except Exception as e:
+                last = e
+                time.sleep(0.5 * (2 ** attempt))
+        raise last
 
     out = {}
     done_bytes = [0]
@@ -239,7 +259,7 @@ def run_shard(vol, api, i, all_names, shard_rows, stage_dir, em_repo,
 
 def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
                  workers=6, batch_size=64, retries=3, lo=0, hi=None,
-                 log=None, hf_only=False):
+                 log=None, hf_only=False, sizes: dict | None = None):
     """Pipelined variant of the run_shard loop.
 
     Overlaps network directions across shards: while shard i's HF push is
@@ -280,7 +300,7 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
                 f"({gb:.1f} GB, {mbps:.0f} MB/s, {elapsed:.0f}s)")
 
         return dl.submit(download_shard, vol, chunk(i), stage_of(i), workers,
-                         retries, _cb)
+                         retries, _cb, sizes)
 
     actions = []
     t0 = time.time()
@@ -313,7 +333,7 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
                     staged = pending.result()      # prefetched during previous push
                 else:
                     staged = download_shard(vol, chunk(i), stage_of(i), workers,
-                                            retries, progress=_stage_cb)
+                                            retries, progress=_stage_cb, sizes=sizes)
                 t_stage = time.time() - t_stage
 
                 def _pack_cb(rows_done):
@@ -423,6 +443,7 @@ def main(argv=None):
 
     entries = vol.listdir("embeddings")
     names = sorted_embedding_names(entries)
+    sizes = {e.path: e.size for e in entries}   # integrity reference for downloads
     if not names:
         print("[local-pack] no embeddings found under embeddings/ on the volume — aborting", flush=True)
         return
@@ -439,7 +460,8 @@ def main(argv=None):
     run_pipeline(vol, api, names, args.shard_rows,
                  args.stage_dir, args.em_repo,
                  workers=args.workers, batch_size=args.batch_size,
-                 retries=args.retries, lo=lo, hi=hi, hf_only=args.hf_only)
+                 retries=args.retries, lo=lo, hi=hi, hf_only=args.hf_only,
+                 sizes=sizes)
 
 
 if __name__ == "__main__":
