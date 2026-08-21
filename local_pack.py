@@ -5,6 +5,9 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
 
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import os
 
 SHARD_ROWS = 1360
@@ -106,3 +109,47 @@ def resume_action(shard, vol_shards, hf_shards):
     if on_vol and not on_hf:
         return "push_from_vol"
     return "pack"
+
+
+def _vol_read_retry(vol, name, dst, retries, delay=0.5):
+    last = None
+    for attempt in range(retries):
+        try:
+            with open(dst, "wb") as f:
+                vol.read_file_into_fileobj(name, f)
+            return dst
+        except Exception as e:
+            last = e
+            time.sleep(delay * (2 ** attempt))
+    raise last
+
+
+def download_shard(vol, shard_names: list[str], stage_dir: str, workers: int = 6, retries: int = 3) -> list[str]:
+    os.makedirs(stage_dir, exist_ok=True)
+
+    def _one(name):
+        dst = os.path.join(stage_dir, os.path.basename(name))
+        return _vol_read_retry(vol, name, dst, retries)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(_one, shard_names))
+
+
+def upload_to_volume(vol, local_path: str, shard: str) -> None:
+    with vol.batch_upload(force=True) as batch:
+        batch.put_file(local_path, f"shards/{shard}")
+    vol.commit()
+
+
+def pull_volume_parquet(vol, shard: str, dst: str, retries: int = 3) -> None:
+    _vol_read_retry(vol, f"shards/{shard}", dst, retries=3)
+
+
+def push_to_hf(api, local_path: str, repo_id: str, shard: str) -> None:
+    api.upload_file(
+        path_or_fileobj=local_path,
+        path_in_repo=f"data/{shard}",
+        repo_id=repo_id,
+        repo_type=REPO_TYPE,
+        commit_message=f"Add {shard}",
+    )
