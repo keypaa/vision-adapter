@@ -174,7 +174,7 @@ def download_shard(vol, shard_names: list[str], stage_dir: str, workers: int = 6
             if progress and (now - t_last[0] >= 3 or i == len(shard_names)):
                 t_last[0] = now
                 rate = done_bytes[0] / max(1e-9, now - t0) / 1e6
-                progress(i, len(shard_names), done_bytes[0] / 1e9, rate)
+                progress(i, len(shard_names), done_bytes[0] / 1e9, rate, now - t0)
     # restore the caller's deterministic (sorted) order — row order == shard contract
     return [out[nm] for nm in shard_names]
 
@@ -275,9 +275,9 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
         n = len(chunk(i))
         log(f"[local-pack] shard {i}: staging {n} files in background ...")
 
-        def _cb(done, total, gb, mbps):
+        def _cb(done, total, gb, mbps, elapsed):
             log(f"[local-pack] shard {i} staging {done}/{total} files "
-                f"({gb:.1f} GB, {mbps:.0f} MB/s)")
+                f"({gb:.1f} GB, {mbps:.0f} MB/s, {elapsed:.0f}s)")
 
         return dl.submit(download_shard, vol, chunk(i), stage_of(i), workers,
                          retries, _cb)
@@ -285,6 +285,7 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
     actions = []
     t0 = time.time()
     rows_done = 0
+    t_stage = t_pack = t_push = 0.0
     os.makedirs(stage_dir, exist_ok=True)
     progress_path = os.path.join(stage_dir, "pack_progress.jsonl")
     progress = open(progress_path, "a", buffering=1)
@@ -295,6 +296,7 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
         n = len(chunk(i))
         assert n, f"shard {i} has no rows"
         local_parquet = os.path.join(stage_dir, shard)
+        t_shard_start = time.time()
 
         if action == "skip":
             log(f"[local-pack] shard {i}: {shard} already on volume+HF — skipping")
@@ -302,18 +304,24 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
             if action == "push_from_vol":
                 pull_volume_parquet(vol, shard, local_parquet, retries)
             else:
-                def _stage_cb(done, total, gb, mbps):
+                t_stage = time.time()
+
+                def _stage_cb(done, total, gb, mbps, elapsed):
                     log(f"[local-pack] shard {i} staging {done}/{total} files "
-                        f"({gb:.1f} GB, {mbps:.0f} MB/s)")
+                        f"({gb:.1f} GB, {mbps:.0f} MB/s, {elapsed:.0f}s)")
                 if pending is not None:
                     staged = pending.result()      # prefetched during previous push
                 else:
                     staged = download_shard(vol, chunk(i), stage_of(i), workers,
                                             retries, progress=_stage_cb)
+                t_stage = time.time() - t_stage
+
                 def _pack_cb(rows_done):
                     log(f"[local-pack] shard {i} packed {rows_done}/{len(chunk(i))} rows")
+                t_pack = time.time()
                 pack_rows(iter_rows(staged), local_parquet, batch_size=batch_size,
                           progress=_pack_cb)
+                t_pack = time.time() - t_pack
                 if not hf_only:
                     upload_to_volume(vol, local_parquet, shard)
                     vol_shards.add(shard)
@@ -324,7 +332,9 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
                         pass
 
             pending = try_prefetch(i + 1)  # overlap next down with this up
+            t_push = time.time()
             push_to_hf(api, local_parquet, em_repo, shard)
+            t_push = time.time() - t_push
             hf_shards.add(shard)
             try:
                 os.remove(local_parquet)
@@ -332,6 +342,7 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
                 pass
 
         actions.append(action)
+        shard_wall = time.time() - t_shard_start
         rows_done += n
         elapsed = time.time() - t0
         rate = rows_done / max(1e-9, elapsed)
@@ -346,7 +357,8 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
             except Exception:
                 pass  # charting must never kill packing
         log(f"[local-pack] done {rows_done}/{len(names)} ({100*rows_done/len(names):.0f}%)  "
-            f"{rate:.0f} rows/s  ETA {eta:.0f} min  shard {i}/{hi} ({n} rows) action={action}")
+            f"{rate:.0f} rows/s  ETA {eta:.0f} min  shard {i}/{hi} ({n} rows) action={action} "
+            f"| wall {shard_wall:.0f}s (stage {t_stage:.0f}s pack {t_pack:.0f}s push {t_push:.0f}s)")
     progress.close()
     return actions
 
