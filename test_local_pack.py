@@ -213,3 +213,25 @@ def test_pull_volume_parquet_writes_local(tmp_path):
     dst = tmp_path / "pulled.parquet"
     pull_volume_parquet(vol, "emb_0099.parquet", str(dst))
     assert dst.read_bytes() == b"parquet-bytes"
+
+
+def test_pull_volume_parquet_forwards_retries(tmp_path, monkeypatch):
+    monkeypatch.setattr("local_pack.time.sleep", lambda s: None)
+
+    class AlwaysFailsVol:
+        def __init__(self):
+            self.attempts = 0
+
+        def read_file_into_fileobj(self, path, fileobj):
+            self.attempts += 1
+            raise OSError("boom")
+
+    vol = AlwaysFailsVol()
+    dst = tmp_path / "pulled.parquet"
+    try:
+        pull_volume_parquet(vol, "emb_0007.parquet", str(dst), retries=5)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("expected OSError after exhausting retries")
+    assert vol.attempts == 5

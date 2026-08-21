@@ -112,7 +112,7 @@ def resume_action(shard, vol_shards, hf_shards):
 
 
 def _vol_read_retry(vol, name, dst, retries, delay=0.5):
-    last = None
+    last = RuntimeError(f"no attempts made for {name}")
     for attempt in range(retries):
         try:
             with open(dst, "wb") as f:
@@ -142,7 +142,7 @@ def upload_to_volume(vol, local_path: str, shard: str) -> None:
 
 
 def pull_volume_parquet(vol, shard: str, dst: str, retries: int = 3) -> None:
-    _vol_read_retry(vol, f"shards/{shard}", dst, retries=3)
+    _vol_read_retry(vol, f"shards/{shard}", dst, retries)
 
 
 def push_to_hf(api, local_path: str, repo_id: str, shard: str) -> None:
