@@ -210,14 +210,18 @@ def run_shard(vol, api, i, all_names, shard_rows, stage_dir, em_repo,
 
 def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
                  workers=6, batch_size=64, retries=3, lo=0, hi=None,
-                 log=None):
+                 log=None, hf_only=False):
     """Pipelined variant of the run_shard loop.
 
     Overlaps network directions across shards: while shard i's HF push is
     uploading (fiber up), shard i+1's .pt download from the volume runs in a
     background thread (fiber down). Resume state is fetched once up front and
     updated incrementally instead of re-querying per shard. A failed shard
-    aborts the run; rerunning resumes where it left off."""
+    aborts the run; rerunning resumes where it left off.
+
+    hf_only=True skips the /data/shards volume copy — packed shards go to HF
+    only. Halves upload traffic; the trainer reads .pt directly, so the volume
+    copy is optional insurance (rehydratable from HF if ever needed)."""
     log = log or (lambda m: print(m, flush=True))
     n_shards = (len(names) + shard_rows - 1) // shard_rows
     hi = n_shards if hi is None else min(hi, n_shards)
@@ -262,8 +266,9 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
                 staged = pending.result() if pending is not None else \
                     download_shard(vol, chunk(i), stage_of(i), workers, retries)
                 pack_rows(iter_rows(staged), local_parquet, batch_size=batch_size)
-                upload_to_volume(vol, local_parquet, shard)
-                vol_shards.add(shard)
+                if not hf_only:
+                    upload_to_volume(vol, local_parquet, shard)
+                    vol_shards.add(shard)
                 for p in staged:
                     try:
                         os.remove(p)
@@ -298,6 +303,8 @@ def main(argv=None):
     ap.add_argument("--em-repo", default=EMB_REPO)
     ap.add_argument("--only", default="", help="i[:j] shard range, e.g. 0 or 2:5")
     ap.add_argument("--retries", type=int, default=3)
+    ap.add_argument("--hf-only", action="store_true",
+                    help="push packed shards to HF only; skip the /data/shards volume copy")
     args = ap.parse_args(argv)
 
     import modal
@@ -323,7 +330,7 @@ def main(argv=None):
     run_pipeline(vol, api, names, args.shard_rows,
                  args.stage_dir, args.em_repo,
                  workers=args.workers, batch_size=args.batch_size,
-                 retries=args.retries, lo=lo, hi=hi)
+                 retries=args.retries, lo=lo, hi=hi, hf_only=args.hf_only)
 
 
 if __name__ == "__main__":

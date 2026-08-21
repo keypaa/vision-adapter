@@ -355,6 +355,22 @@ def test_run_pipeline_overlaps_next_download_with_push(tmp_path):
     assert done.get("ok") and api.pushes == ["data/emb_0000.parquet", "data/emb_0001.parquet"]
 
 
+def test_run_pipeline_hf_only_skips_volume_upload(tmp_path):
+    names = [f"embeddings/e{i:04d}.pt" for i in range(2)]
+    vol = RecordingVol()
+    for n in names:
+        buf = io.BytesIO(); _torch.save(_bf16(2), buf)
+        vol.files[n] = buf.getvalue()
+    api = BlockingApi()
+    api.release.set()
+    actions = run_pipeline(vol, api, names, shard_rows=1,
+                           stage_dir=str(tmp_path), em_repo="r", workers=1,
+                           hf_only=True)
+    assert actions == ["pack", "pack"]
+    assert vol.uploaded == {}        # volume copy skipped entirely
+    assert api.pushes == ["data/emb_0000.parquet", "data/emb_0001.parquet"]
+
+
 def test_run_pipeline_skips_done_and_updates_state(tmp_path):
     names = [f"embeddings/e{i:04d}.pt" for i in range(2)]
     vol = RecordingVol()

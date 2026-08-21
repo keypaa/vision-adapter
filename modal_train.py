@@ -376,7 +376,7 @@ def _shared_setup():
     collate = make_collate(tok, tok.pad_token_id)
     loader = torch.utils.data.DataLoader(
         ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=True,
-        collate_fn=collate, num_workers=2, persistent_workers=True)
+        collate_fn=collate, num_workers=8, persistent_workers=True)
 
     # held-out val set (~2% of rows). Not shuffled; only used for the
     # periodic loss probe so "is it grokking?" isn't judged on train batches.
