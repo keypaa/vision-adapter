@@ -330,6 +330,10 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
                         os.remove(p)
                     except FileNotFoundError:
                         pass
+                try:
+                    os.rmdir(stage_of(i))          # drop the empty per-shard dir
+                except OSError:
+                    pass
 
             pending = try_prefetch(i + 1)  # overlap next down with this up
             t_push = time.time()
@@ -403,7 +407,8 @@ def main(argv=None):
     ap.add_argument("--shard-rows", type=int, default=SHARD_ROWS)
     ap.add_argument("--workers", type=int, default=6)
     ap.add_argument("--batch-size", type=int, default=64)
-    ap.add_argument("--stage-dir", default="/tmp/emb_stage")
+    ap.add_argument("--stage-dir", default="/var/tmp/emb_stage",
+                    help="disk-backed staging (~21 GB peak); NOT /tmp on tmpfs systems")
     ap.add_argument("--em-repo", default=EMB_REPO)
     ap.add_argument("--only", default="", help="i[:j] shard range, e.g. 0 or 2:5")
     ap.add_argument("--retries", type=int, default=3)
