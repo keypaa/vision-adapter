@@ -26,8 +26,20 @@ class FileEntryLike:
 
 
 def sorted_embedding_names(entries):
-    """Return sorted `embeddings/<sha1>.pt` paths (matches Modal's sorted(glob))."""
-    return sorted(e.path for e in entries if e.path.startswith("embeddings/"))
+    """Return sorted `embeddings/<sha1>.pt` paths (matches Modal's sorted(glob)).
+
+    Tolerates both FileEntry.path forms: volume-root-relative
+    (`embeddings/<name>.pt`) and directory-relative (`<name>.pt`)."""
+    out = []
+    for e in entries:
+        p = e.path
+        if p.startswith("embeddings/"):
+            out.append(p)
+        elif "/" in p:
+            continue  # entry from another directory — not an embedding
+        else:
+            out.append(f"embeddings/{p}")
+    return sorted(out)
 
 
 def shard_slices(names, shard_rows):

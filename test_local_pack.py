@@ -88,6 +88,18 @@ def test_sorted_embedding_names_is_sorted_and_strips_prefix():
     ]
 
 
+def test_sorted_embedding_names_tolerates_bare_basenames():
+    entries = [
+        FileEntryLike(path="zzz.pt"),
+        FileEntryLike(path="aaa.pt"),
+        FileEntryLike(path="sub/other.pt"),
+    ]
+    assert sorted_embedding_names(entries) == [
+        "embeddings/aaa.pt",
+        "embeddings/zzz.pt",
+    ]
+
+
 def test_shard_slices_boundaries():
     names = [f"embeddings/{i:04d}.pt" for i in range(7)]
     s = shard_slices(names, 3)
