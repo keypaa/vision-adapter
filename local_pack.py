@@ -153,3 +153,95 @@ def push_to_hf(api, local_path: str, repo_id: str, shard: str) -> None:
         repo_type=REPO_TYPE,
         commit_message=f"Add {shard}",
     )
+
+
+def _shard_name(i: int) -> str:
+    return f"emb_{i:04d}.parquet"
+
+
+def run_shard(vol, api, i, all_names, shard_rows, stage_dir, em_repo,
+              workers=6, batch_size=64, retries=3):
+    shard = _shard_name(i)
+    chunk = all_names[i * shard_rows : (i + 1) * shard_rows]
+    assert chunk, f"shard {i} has no rows"
+
+    action = resume_action(shard, existing_volume_shards(vol), existing_hf_shards(api, em_repo))
+    local_parquet = os.path.join(stage_dir, shard)
+    os.makedirs(stage_dir, exist_ok=True)
+
+    if action == "skip":
+        print(f"[local-pack] shard {i}: {shard} already on volume+HF — skipping", flush=True)
+        return action
+
+    if action == "push_from_vol":
+        pull_volume_parquet(vol, shard, local_parquet, retries)
+    else:
+        staged = download_shard(vol, chunk, stage_dir, workers=workers, retries=retries)
+        pack_rows(iter_rows(staged), local_parquet, batch_size=batch_size)
+        upload_to_volume(vol, local_parquet, shard)
+        for p in staged:
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
+
+    push_to_hf(api, local_parquet, em_repo, shard)
+    try:
+        os.remove(local_parquet)
+    except FileNotFoundError:
+        pass
+    return action
+
+
+def main(argv=None):
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--shard-rows", type=int, default=SHARD_ROWS)
+    ap.add_argument("--workers", type=int, default=6)
+    ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--stage-dir", default="/tmp/emb_stage")
+    ap.add_argument("--em-repo", default=EMB_REPO)
+    ap.add_argument("--only", default="", help="i[:j] shard range, e.g. 0 or 2:5")
+    ap.add_argument("--retries", type=int, default=3)
+    args = ap.parse_args(argv)
+
+    import modal
+    from huggingface_hub import HfApi
+    vol = modal.Volume.from_name(VOL_NAME)
+    api = HfApi()
+
+    entries = vol.listdir("embeddings")
+    names = sorted_embedding_names(entries)
+    if not names:
+        print("[local-pack] no embeddings found under embeddings/ on the volume — aborting", flush=True)
+        return
+    slices = shard_slices(names, args.shard_rows)
+    print(f"[local-pack] embeddings: {len(names)}  shards: {len(slices)}  "
+          f"shard_rows={args.shard_rows}  workers={args.workers}", flush=True)
+
+    lo, hi = 0, len(slices)
+    if args.only:
+        parts = args.only.split(":")
+        lo = int(parts[0]) if parts[0] else 0
+        hi = int(parts[1]) if len(parts) > 1 and parts[1] else len(slices)
+
+    t0 = time.time()
+    done = 0
+    for i in range(lo, hi):
+        action = run_shard(vol, api, i, names, args.shard_rows,
+                           args.stage_dir, args.em_repo,
+                           workers=args.workers, batch_size=args.batch_size,
+                           retries=args.retries)
+        done += 1
+        n = len(slices[i])
+        elapsed = time.time() - t0
+        rows_done = sum(len(s) for s in slices[lo : lo + done])
+        rate = rows_done / max(1e-9, elapsed)
+        eta = (len(names) - rows_done) / max(1e-9, rate) / 60
+        print(f"[local-pack] done {rows_done}/{len(names)} ({100*rows_done/len(names):.0f}%)  "
+              f"{rate:.0f} rows/s  ETA {eta:.0f} min  shard {i}/{hi} ({n} rows) action={action}  "
+              f"vol_commits={getattr(vol,'committed',0)}", flush=True)
+
+
+if __name__ == "__main__":
+    main()

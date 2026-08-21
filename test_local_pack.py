@@ -20,6 +20,7 @@ from local_pack import (
     upload_to_volume,
     push_to_hf,
     pull_volume_parquet,
+    run_shard,
 )
 
 
@@ -235,3 +236,42 @@ def test_pull_volume_parquet_forwards_retries(tmp_path, monkeypatch):
     else:
         raise AssertionError("expected OSError after exhausting retries")
     assert vol.attempts == 5
+
+
+def _seed_vol(files: dict, tensors: "dict[str, _torch.Tensor]"):
+    vol = FakeVol()
+    for name, t in tensors.items():
+        buf = io.BytesIO(); _torch.save(t, buf)
+        vol.files[f"embeddings/{name}"] = buf.getvalue()
+    return vol
+
+
+def test_run_shard_pack_uploads_and_pushes(tmp_path):
+    names = [f"embeddings/e{i:04d}.pt" for i in range(4)]
+    tensors = {os.path.basename(n): _bf16(3) for n in names}
+    vol = _seed_vol({}, tensors)
+    api = FakeApi()
+
+    # shard 0 -> indices 0,1 ; shard_rows=2
+    action = run_shard(vol, api, 0, names, shard_rows=2,
+                       stage_dir=str(tmp_path / "stage"), em_repo="keypa/vision-adapter-embeddings", workers=1)
+    assert action in ("pack", "push_from_vol")
+    # volume got the parquet
+    assert "emb_0000.parquet" in vol.uploaded
+    # HF got pushed
+    assert any(p == "data/emb_0000.parquet" for _, p, _ in api.calls)
+
+
+def test_run_shard_skips_when_done(tmp_path):
+    names = [f"embeddings/e{i:04d}.pt" for i in range(4)]
+    vol = FakeVol()
+    vol.files["shards/emb_0000.parquet"] = b"x"
+    api = FakeApi()
+
+    class ApiDone(FakeApi):
+        def list_repo_files(self, repo_id, repo_type=None):
+            return ["data/emb_0000.parquet"]
+
+    action = run_shard(vol, ApiDone(), 0, names, shard_rows=2,
+                       stage_dir=str(tmp_path / "stage"), em_repo="keypa/vision-adapter-embeddings", workers=1)
+    assert action == "skip"
