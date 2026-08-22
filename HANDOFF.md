@@ -2,25 +2,31 @@
 
 > Read this plus `docs/TRAINING_PLAN.md` (authoritative phase record).
 > Repo: `keypa/vision-adapter` (public, branch `master`, remote `origin`).
-> Working tree is **clean** as of this handoff. Tests: **36 passed**.
+> Working tree is **clean** as of this handoff. Tests: **41 passed**.
 
 ## TL;DR
 
-We just finished the full embedding-pack overnight run on the owner's laptop,
-published the third HF dataset, and staged every remaining training
-prerequisite. **Next physical action is an A100 dryrun** — one command, gated
-before anything touches a B300.
+Embedding pack is done and published (103/103 shards on HF). The training
+gate moved to the **B300 dryrun** — the A100 gate was **abandoned by owner
+decision**: A100 (cc 8.0) has no FP8 GEMM, so transformers force-dequantizes
+the checkpoint to bf16 (~310 GiB), which contradicts the owner's requirement
+to keep weights in native FP8/FP4. On B300 (sm103) the backbone loads native
+FP8 (~155 GiB, all-in-VRAM, fits with ~110 GiB headroom). Three B300-gate
+fixes landed after the handoff below was written — read "V4 gotchas" before
+touching `modal_train.py`.
 
 ```
 [✅] images repo 17/17 ── [✅] manifests ── [✅] embeddings 103/103 on HF
         │
         ▼
-[▸ NEXT] modal run --detach modal_train.py::train_dryrun   (A100)
-               │
-               ▼
-        [train_dryrun_b300]  (Phase 5 gate, cu130, all-in-VRAM)
-               │
-               ▼
+[▸ NEXT] modal run --detach modal_train.py::train_dryrun_b300  (Phase 5 gate)
+                │   fixes so far: kernels pkg, embed-hook injection,
+                │                 chunked eager attention (commits abe4f51,
+                │                 4df3137, 1065af3)
+                ▼
+        MEMORY GATE PASS + ckpt ON/OFF verdict in dryrun_report.txt
+                │
+                ▼
         [train_b300]  (~30k steps, watched via train_curves.png)
 ```
 
@@ -95,6 +101,29 @@ The B300 path is **fully staged** and decoupled from the pack work:
 - `train_image_b300`: `torch==2.13.0` (PyPI default = **cu130**, SM103 verified — cu128 broken on B300 per pytorch#175842) + `device_map={"": 0}` all-in-VRAM, `B300_GPU_MEM_CAP_GIB=250`
 
 ## Locked decisions / gotchas for the next harness
+
+### DeepSeek-V4 trainer gotchas (learned 2026-08-22, B300 gate runs)
+
+- **Vision injection must use the `visual_inject` embed_tokens hook** (commit
+  `4df3137`). V4's hash-MoE gates route experts via a frozen
+  `tid2eid[input_ids]` lookup and the core model *raises* if `input_ids` and
+  `inputs_embeds` are both passed — plain inputs_embeds injection is
+  structurally impossible. The hook splices projector output into embedding
+  OUTPUT rows; ids stay the model input.
+- **V4 attention is eager-only**: `_supports_sdpa = False`; FA2/vLLM-FA3
+  documented incompatible (sparse attn + mHC streams). Eager materializes
+  `[B, heads, L, L+1]` logits in **fp32** ≈ 46 GiB at bs=8 → OOM beside the
+  FP8 backbone. `_patch_chunked_eager_attention()` (commit `1065af3`) chunks
+  query rows — mathematically identical (verified vs reference in
+  `test_train_collate.py`), drops attn_weights (output_attentions=False).
+- **transformers' finegrained-fp8 needs `kernels>=0.16,<0.17`** in the image
+  (`abe4f51`) — it fetches the GEMM kernel from the hub at runtime.
+- **Native FP8 residency works on B300 only**: cc<8.9 (A100) makes
+  transformers dequantize to bf16 (~310 GiB) — that is why the A100 gate was
+  abandoned. If an A100 fallback is ever needed, it requires a custom
+  FP8-resident JIT-dequant loader (owner has not asked for this).
+- Each dryrun costs ~$0.30 — verify locally (AST + pytest + equivalence
+  tests) before every launch; the suite caught two real bugs pre-launch.
 
 - Parquet is the **publish/reproduction format only**; trainer stays on `EmbSFT` reading `.pt` (Phase 3 SKIPPED — warm reads 16 ms/file = 0–1% of a step, `num_workers=8` now applied; `pin_memory=True`).
 - `--hf-only` = HF is the destination; `/data/shards` copy is optional insurance. Fixed resume bug: `resume_action(..., hf_only=True)` skips HF-present shards (previously redid every shard on reruns).
