@@ -138,7 +138,11 @@ def build_model(offload: bool = True):
     model.config.use_cache = False
     for p in model.parameters():
         p.requires_grad_(False)
-    model.eval()
+    # train(), NOT eval(): GradientCheckpointingLayer gates on `self.training`
+    # (modeling_layers.py L80) — eval() silently disables checkpointing and all
+    # 43 layers' activations are retained => OOM. Safe: attention_dropout=0.0
+    # and the arch has no other stochastic layers, so numerics are identical.
+    model.train()
 
     class HourglassProjector(nn.Module):
         def __init__(s, d=4096, h=8192):
