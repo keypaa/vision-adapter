@@ -214,3 +214,37 @@ def test_chunked_eager_matches_full_eager():
     out_nomask, _ = chunked(mod, q, k, v, None, scaling=0.125)
     ref_nomask, _ = _reference_eager(mod, q, k, v, None, scaling=0.125)
     assert torch.allclose(out_nomask.float(), ref_nomask.float(), atol=1e-5)
+
+
+# ---- _fp8_linear_train: differentiable blockwise-dequant linear ----
+
+def test_fp8_linear_train_matches_dequant_reference():
+    from modal_train import _fp8_linear_train
+    torch.manual_seed(5)
+    fp8 = torch.float8_e4m3fn
+
+    def _ref(x, w_fp8, scales, bn, bk):
+        O, I = w_fp8.shape
+        wd = (w_fp8.to(torch.float32)
+              .view(O // bn, bn, I // bk, bk)
+              .mul(scales.to(torch.float32)[:, None, :, None])
+              .view(O, I)).to(torch.bfloat16)
+        return torch.nn.functional.linear(x, wd)
+
+    for (O, I, bn, bk) in [(64, 32, 16, 16), (128, 128, 128, 128), (50, 33, 16, 16)]:
+        w = (torch.randn(O, I) * 0.1).clamp(-448, 448).to(fp8)
+        scales = torch.rand(-(-O // bn), -(-I // bk)) * 0.01 + 0.005
+        x = torch.randn(4, I, dtype=torch.bfloat16)
+
+        out = _fp8_linear_train(x, w, scales, (bn, bk))
+        if O % bn == 0 and I % bk == 0:
+            ref = _ref(x, w, scales, bn, bk)       # exact-comparable only when no padding
+            assert torch.allclose(out, ref, atol=1e-2)
+
+    # autograd must reach the INPUT (the whole point: grads flow to projector)
+    x = torch.randn(4, 32, dtype=torch.bfloat16, requires_grad=True)
+    w = (torch.randn(64, 32) * 0.1).to(fp8)
+    scales = torch.rand(4, 2) * 0.01 + 0.005
+    out = _fp8_linear_train(x, w, scales, (16, 16))
+    out.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()

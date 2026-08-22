@@ -134,6 +134,7 @@ def build_model(offload: bool = True):
         load_kwargs.update(device_map={"": 0})
     model = AutoModelForCausalLM.from_pretrained(DS_REPO, **load_kwargs)
     _patch_chunked_eager_attention()   # eager attn OOMs at bs=8 next to the FP8 backbone
+    _patch_fp8_train_forward()         # hub FP8 GEMM has no backward; dequant per GEMM instead
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     for p in model.parameters():
@@ -298,6 +299,50 @@ class visual_inject:
             self._handle.remove()
             self._handle = None
         return False
+
+
+def _fp8_linear_train(input, weight, weight_scale_inv, block_size, bias=None):
+    """Differentiable stand-in for transformers' finegrained-fp8 linear.
+
+    The hub FP8 GEMM kernel is inference-only (no autograd formula), but this
+    trainer must backprop THROUGH the frozen backbone to reach the projector.
+    We keep weights FP8-resident and dequantize per GEMM: blockwise scales are
+    applied as plain tensor ops, so autograd flows through to `input`. The
+    bf16 weight copy is transient (~one layer at a time under grad ckpt)."""
+    import torch.nn.functional as _F
+    if block_size is None:
+        w = weight.to(input.dtype) * weight_scale_inv.to(torch.float32)
+        return _F.linear(input, w, bias)
+    bn, bk = block_size
+    out_f, in_f = weight.shape
+    oh = -(-out_f // bn) * bn
+    ih = -(-in_f // bk) * bk
+    if oh != out_f or ih != in_f:
+        wp = _F.pad(weight, (0, ih - in_f, 0, oh - out_f))
+    else:
+        wp = weight
+    scales = weight_scale_inv.to(torch.float32)
+    wd = (wp.to(torch.float32)
+          .view(oh // bn, bn, ih // bk, bk)
+          .mul(scales[:, None, :, None])
+          .view(oh, ih)[:out_f, :in_f]).to(input.dtype)
+    return _F.linear(input, wd, bias)
+
+
+def _patch_fp8_train_forward():
+    """Route FP8Linear.forward through the differentiable dequant path.
+    Idempotent; no-op unless transformers' finegrained_fp8 is imported."""
+    import sys
+    mod = sys.modules.get("transformers.integrations.finegrained_fp8")
+    if mod is None or getattr(mod, "_train_fwd_patched", False):
+        return
+
+    def forward(self, input):
+        return _fp8_linear_train(input, self.weight, self.weight_scale_inv,
+                                 self.block_size, getattr(self, "bias", None))
+
+    mod.FP8Linear.forward = forward
+    mod._train_fwd_patched = True
 
 
 def _make_chunked_eager(budget_elems: int = 2 ** 26):
