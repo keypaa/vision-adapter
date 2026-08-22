@@ -29,11 +29,18 @@ import modal
 GPU = "A100-80GB"
 GPU_MEM_CAP_GIB = 70.0
 
+# A100 (cc 8.0) cannot run FP8 kernels: transformers dequantizes the FP8
+# checkpoint (~155 GiB on disk) to bf16 at load => ~310 GiB of weights. The
+# offload budget (GPU cap + this CPU tier) must cover that, and the A100
+# functions' Modal `memory=` must exceed this hint (hint is GiB, memory= is GB).
+SYS_RAM_CAP_GIB = 280
+A100_CONTAINER_RAM_GB = 340
+
 # ---- B300 stack (Phase 5) — 288 GiB VRAM: whole quantized backbone in VRAM ----
 B300_GPU = "B300"
 B300_GPU_MEM_CAP_GIB = 250.0          # dryrun gate; activations headroom verified, not assumed
 TORCH_B300_PIN = "torch==2.13.0"      # cu130 build; SM103 support validated by the cc print in the b300 dryrun
-SYS_RAM_CAP_GIB = 200
+B300_CONTAINER_RAM_GB = 200           # all-in-VRAM path: RAM only feeds the shard-by-shard loader
 BATCH_SIZE = 8
 LR = 5e-4
 MAX_SEQ_LEN = 4096
@@ -518,14 +525,14 @@ def _dryrun_impl(mem_cap: float, offload: bool, compare_checkpointing: bool = Fa
 
 
 @app.function(image=train_image, gpu=GPU, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
-              timeout=3600, memory=f"{SYS_RAM_CAP_GIB}GB")
+              timeout=3600, memory=f"{A100_CONTAINER_RAM_GB}GB")
 def train_dryrun():
     """Phase 4 gate on the known-good stack: code correctness + A100 baseline."""
     _dryrun_impl(GPU_MEM_CAP_GIB, offload=True)
 
 
 @app.function(image=train_image_b300, gpu=B300_GPU, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
-              timeout=3600, memory=f"{SYS_RAM_CAP_GIB}GB")
+              timeout=3600, memory=f"{B300_CONTAINER_RAM_GB}GB")
 def train_dryrun_b300():
     """Phase 5 gate: SM103/cu130 stack check, all-in-VRAM load, B300 step time
     vs the A100 baseline recorded by train_dryrun, plus a measured
@@ -658,14 +665,14 @@ def _train_impl(offload: bool):
 
 
 @app.function(image=train_image, gpu=GPU, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
-              timeout=86400, memory=f"{SYS_RAM_CAP_GIB}GB")
+              timeout=86400, memory=f"{A100_CONTAINER_RAM_GB}GB")
 def train():
     """Phase 4/5 fallback trainer on the known-good A100 stack."""
     _train_impl(offload=True)
 
 
 @app.function(image=train_image_b300, gpu=B300_GPU, volumes={VOLUME_DIR: vol, HF_CACHE: hf_vol},
-              timeout=86400, memory=f"{SYS_RAM_CAP_GIB}GB")
+              timeout=86400, memory=f"{B300_CONTAINER_RAM_GB}GB")
 def train_b300():
     """Phase 5 target: full SFT all-in-VRAM on B300 (run only after train_dryrun_b300 PASS)."""
     _train_impl(offload=False)
