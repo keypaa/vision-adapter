@@ -90,6 +90,9 @@ train_image_b300 = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         TORCH_B300_PIN, "safetensors", "accelerate", "transformers",
+        # finegrained-fp8: keeps DeepSeek-V4 FP8 blocks resident (no bf16
+        # dequant); transformers loads its GEMM kernel through this at runtime.
+        "kernels>=0.16.0,<0.17",
         "datasets", "pillow", "sentencepiece", "huggingface_hub",
         "matplotlib",
     )
