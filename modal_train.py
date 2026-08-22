@@ -406,10 +406,10 @@ def _phase(msg):
     print(f"[train] +{time.time() - _T0:6.1f}s  {msg}", flush=True)
 
 
-def _shared_setup():
+def _shared_setup(offload: bool = True):
     import torch
     _phase("loading tokenizer ...")
-    tok, model, proj = build_model()
+    tok, model, proj = build_model(offload=offload)
     _phase(f"backbone+projector ready (trainable={sum(p.numel() for p in proj.parameters())/1e6:.1f}M)")
     ds = EmbSFT()
     collate = make_collate(tok, tok.pad_token_id)
