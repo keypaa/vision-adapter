@@ -248,3 +248,43 @@ def test_fp8_linear_train_matches_dequant_reference():
     out = _fp8_linear_train(x, w, scales, (16, 16))
     out.sum().backward()
     assert x.grad is not None and torch.isfinite(x.grad).all()
+
+
+def test_dequant_expert_slice_fp4_and_scales():
+    from modal_train import _dequant_expert_slice, _FP4_E2M1_LUT
+    torch.manual_seed(7)
+
+    # --- fp4 path: 2 bytes -> 4 values, low nibble first, row-scales gran 32 ---
+    E, O, K = 3, 64, 128                      # K = packed cols * 2
+    packed = torch.randint(-128, 128, (E, O, K // 2), dtype=torch.int8)
+    scales = torch.rand(E, O, K // 32) * 0.05 + 0.001   # sf_gran_n=1 (per row), sf_gran_k=32
+
+    out = _dequant_expert_slice(packed, scales)
+    assert out.shape == (E, O, K)
+
+    # explicit loop ground truth for one expert/row block
+    u8 = packed[0].view(torch.uint8)
+    for r in (0, 33):
+        vals = []
+        for c in range(K // 2):
+            lo, hi = int(u8[r, c]) & 0xF, int(u8[r, c]) >> 4
+            g = c * 2 // 32                               # value index -> k-group
+            vals.append(_FP4_E2M1_LUT[lo] * float(scales[0, r, g]))
+            vals.append(_FP4_E2M1_LUT[hi] * float(scales[0, r, g]))
+        ref = torch.tensor(vals)
+        assert torch.allclose(out[0, r].cpu(), ref, atol=1e-6)
+
+    # --- uint8-stored e8m0 exponents: scale == 2**(byte-127) ---
+    packed1 = torch.randint(-128, 128, (1, 32, 16), dtype=torch.int8)   # K=32
+    exp_bytes = torch.full((1, 32, 1), 130, dtype=torch.uint8)          # 2**(130-127) = 8.0
+    out_e8 = _dequant_expert_slice(packed1, exp_bytes)
+    u8 = packed1[0].view(torch.uint8)
+    lo, hi = int(u8[0, 0]) & 0xF, int(u8[0, 0]) >> 4
+    assert float(out_e8[0, 0, 0]) == _FP4_E2M1_LUT[lo] * 8.0
+    assert float(out_e8[0, 0, 1]) == _FP4_E2M1_LUT[hi] * 8.0
+
+    # grads must not be required through weights (frozen backbone) but op is autograd-safe
+    x = torch.randn(5, K, dtype=torch.bfloat16, requires_grad=True)
+    y = torch.nn.functional.linear(x, _dequant_expert_slice(packed, scales)[0].to(x.dtype))
+    y.sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()

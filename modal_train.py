@@ -329,6 +329,48 @@ def _fp8_linear_train(input, weight, weight_scale_inv, block_size, bias=None):
     return _F.linear(input, wd, bias)
 
 
+_FP4_E2M1_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+                 -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+
+
+def _dequant_expert_slice(weight, scales):
+    """Dequantize one expert's packed weight slice to a floating tensor.
+
+    Mirrors transformers' FineGrainedFP8 quantizer semantics (_unpack_fp4 +
+    _dequantize_one): FP4 = two e2m1 nibbles per byte (low nibble first), MXFP4
+    row-scales every 32 along K, E8M0 scales may arrive as uint8 exponents
+    (value = 2**(byte-127)). Plain tensor ops only -> autograd-transparent."""
+    import torch as _torch
+    fp4_x2 = getattr(_torch, "float4_e2m1fn_x2", None)
+    if weight.dtype == _torch.int8 or (fp4_x2 is not None and weight.dtype == fp4_x2):
+        lut = _torch.tensor(_FP4_E2M1_LUT, dtype=_torch.float32, device=weight.device)
+        u8 = weight.contiguous().view(_torch.uint8)
+        low = (u8 & 0xF).long()
+        high = ((u8 >> 4) & 0xF).long()
+        q = _torch.stack([lut[low], lut[high]], dim=-1).reshape(*weight.shape[:-1], 2 * weight.shape[-1])
+    else:
+        q = weight.to(_torch.float32)
+
+    rows, cols = q.shape[-2:]
+    orig_shape = tuple(q.shape)
+    try:
+        sr, sc = scales.shape[-2:]
+    except Exception:
+        sr, sc = 1, 1
+    bm, bn = rows // sr, cols // sc
+    assert rows % sr == 0 and cols % sc == 0, \
+        f"expert weight ({rows},{cols}) not divisible by scale grid ({sr},{sc})"
+    if scales.dtype == _torch.uint8:
+        s = (_torch.as_tensor(scales).to(_torch.float32) - 127.0).exp2()
+    elif scales.dtype == getattr(_torch, "float8_e8m0fnu", None):
+        s = scales.to(_torch.float32)
+    else:
+        s = scales.to(_torch.float32)
+    out = (q.reshape(-1, sr, bm, sc, bn)
+           * s.reshape(-1, sr, sc)[:, :, None, :, None]).reshape(orig_shape)
+    return out
+
+
 def _patch_fp8_train_forward():
     """Route FP8Linear.forward through the differentiable dequant path.
     Idempotent; no-op unless transformers' finegrained_fp8 is imported."""
@@ -342,6 +384,17 @@ def _patch_fp8_train_forward():
                                  self.block_size, getattr(self, "bias", None))
 
     mod.FP8Linear.forward = forward
+
+    if hasattr(mod, "FP8Experts"):
+        def experts_linear(self, input, weight, weight_scale_inv, activation_scale=None):
+            if weight.element_size() > 1:
+                import torch.nn.functional as _F
+                return _F.linear(input, weight, None)
+            wd = _dequant_expert_slice(weight, weight_scale_inv)
+            import torch.nn.functional as _F
+            return _F.linear(input, wd.to(input.dtype), None)
+
+        mod.FP8Experts.linear = experts_linear
     mod._train_fwd_patched = True
 
 
