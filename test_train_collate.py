@@ -203,17 +203,14 @@ def test_chunked_eager_matches_full_eager():
 
     ref_out, ref_w = _reference_eager(mod, q, k, v, mask, scaling=0.125)
 
-    for budget in (10 ** 9, 64, 37):               # single-shot / tiny chunks / ragged tail
-        chunked = _make_chunked_eager(_reference_eager, budget_elems=budget)
+    for budget in (10 ** 9, 64, 37):               # single-chunk / tiny chunks / ragged tail
+        chunked = _make_chunked_eager(budget_elems=budget)
         out, w = chunked(mod, q, k, v, mask, scaling=0.125)
         assert out.shape == ref_out.shape
         assert torch.allclose(out.float(), ref_out.float(), atol=1e-5)
-        if budget >= B * H * SQ * SKV:             # passthrough keeps orig contract
-            assert w is not None
-        else:                                      # engaged chunks drop weights
-            assert w is None
+        assert w is None                           # weights intentionally dropped
     # no-mask path too
-    chunked = _make_chunked_eager(_reference_eager, budget_elems=50)
+    chunked = _make_chunked_eager(budget_elems=50)
     out_nomask, _ = chunked(mod, q, k, v, None, scaling=0.125)
     ref_nomask, _ = _reference_eager(mod, q, k, v, None, scaling=0.125)
     assert torch.allclose(out_nomask.float(), ref_nomask.float(), atol=1e-5)

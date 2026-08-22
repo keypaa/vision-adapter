@@ -296,35 +296,55 @@ class visual_inject:
         return False
 
 
-def _make_chunked_eager(orig, budget_elems: int = 2 ** 26):
-    """Wrap V4's eager_attention_forward to evaluate attention in query chunks.
+def _make_chunked_eager(budget_elems: int = 2 ** 26):
+    """Chunked replacement for V4's eager_attention_forward.
 
     The eager path materializes [.., S_q, S_kv+1] logits in fp32 (~46 GiB at
     bs=8 next to the 155 GiB FP8 backbone => OOM). Softmax is independent per
-    query row, so chunking queries is mathematically identical with peak
-    transient ~budget_elems. Returns (output, None): attn_weights are dropped
-    because output_attentions is always False in this trainer."""
+    query row, so evaluating query chunks is mathematically identical with
+    peak transient ~budget_elems. The KV repeat_kv expansion is HOISTED out
+    of the chunk loop (calling orig per chunk would re-materialize the
+    expanded KV — multiple GiB — once per chunk). Returns (output, None):
+    attn_weights are dropped because output_attentions is always False in
+    this trainer."""
     import torch as _torch
+    import torch.nn.functional as _F
+
+    def _repeat_kv(x, n_rep):
+        if n_rep == 1:
+            return x
+        b, h, s, d = x.shape
+        return x[:, :, None, :, :].expand(b, h, n_rep, s, d).reshape(b, h * n_rep, s, d)
 
     def chunked(module, query, key, value, attention_mask=None, scaling=None,
                 dropout: float = 0.0, **kwargs):
+        k = _repeat_kv(key, module.num_key_value_groups)
+        v = _repeat_kv(value, module.num_key_value_groups)
+        sinks = module.sinks.reshape(1, -1, 1, 1)
+
         s_q = query.shape[-2]
-        kv_len = key.shape[-2]
+        kv_len = k.shape[-2]
         leading = 1
         for d in query.shape[:-2]:
             leading *= d
         rows = max(1, min(s_q, budget_elems // max(1, leading * kv_len)))
-        if rows >= s_q:
-            return orig(module, query, key, value, attention_mask,
-                        scaling=scaling, dropout=dropout, **kwargs)
+
         outs = []
         for s in range(0, s_q, rows):
             e = min(s + rows, s_q)
-            m = attention_mask[..., s:e, :] if attention_mask is not None else None
-            outs.append(orig(module, query[..., s:e, :], key, value, m,
-                             scaling=scaling, dropout=dropout, **kwargs))
-        # orig returns [B, S_q, heads, D] (transposed): concat chunks on the S axis
-        out = _torch.cat([o[0] for o in outs], dim=1)
+            qc = query[..., s:e, :]
+            w = _torch.matmul(qc, k.transpose(2, 3)) * scaling
+            if attention_mask is not None:
+                m = attention_mask[..., s:e, :]
+                w = w + m                              # fp32 mask promotes, like orig
+            comb = _torch.cat([w, sinks.expand(query.shape[0], -1, w.shape[-2], -1)], dim=-1)
+            comb = comb - comb.max(dim=-1, keepdim=True).values   # overflow clamp, like orig
+            probs = _F.softmax(comb, dim=-1, dtype=comb.dtype)
+            scores = probs[..., :-1]                   # drop the sink column
+            scores = _F.dropout(scores, p=dropout, training=module.training)
+            outs.append(_torch.matmul(scores.to(v.dtype), v))   # [B, H, rows, D]
+        # cat chunks on the S axis, then orig's final transpose -> [B, S_q, H, D]
+        out = _torch.cat(outs, dim=2).transpose(1, 2).contiguous()
         return out, None
 
     return chunked
@@ -337,7 +357,7 @@ def _patch_chunked_eager_attention():
     mod = sys.modules.get("transformers.models.deepseek_v4.modeling_deepseek_v4")
     if mod is None or getattr(mod, "_v4_chunk_patched", False):
         return
-    mod.eager_attention_forward = _make_chunked_eager(mod.eager_attention_forward)
+    mod.eager_attention_forward = _make_chunked_eager()
     mod._v4_chunk_patched = True
 
 
