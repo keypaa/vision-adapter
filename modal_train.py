@@ -134,7 +134,7 @@ def build_model(offload: bool = True):
         load_kwargs.update(device_map={"": 0})
     model = AutoModelForCausalLM.from_pretrained(DS_REPO, **load_kwargs)
     _patch_chunked_eager_attention()   # eager attn OOMs at bs=8 next to the FP8 backbone
-    _patch_fp8_train_forward()         # hub FP8 GEMM has no backward; dequant per GEMM instead
+    _patch_fp8_train_forward(model)    # hub FP8 GEMM has no backward; dequant per GEMM instead
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     for p in model.parameters():
@@ -371,30 +371,68 @@ def _dequant_expert_slice(weight, scales):
     return out
 
 
-def _patch_fp8_train_forward():
-    """Route FP8Linear.forward through the differentiable dequant path.
-    Idempotent; no-op unless transformers' finegrained_fp8 is imported."""
-    import sys
+def _fp8_experts_reference_forward(self, hidden_states, top_k_index, top_k_weights):
+    """Reference MoE forward, verbatim from FP8Experts.forward, but routed
+    through self.linear (our dequant path) instead of the swapped-in grouped
+    kernel (which has no autograd formula). Only ACTIVE experts are visited."""
+    import torch as _torch
+    final = _torch.zeros_like(hidden_states, dtype=_torch.float32)
+    with _torch.no_grad():
+        expert_mask = _torch.nn.functional.one_hot(top_k_index, num_classes=self.num_experts + 1)
+        expert_mask = expert_mask.permute(2, 1, 0)
+        expert_hit = _torch.greater(expert_mask.sum(dim=(-1, -2)), 0).nonzero(as_tuple=False).view(-1)
+    for expert_idx in expert_hit:
+        if expert_idx == self.num_experts:
+            continue
+        top_k_pos, token_idx = _torch.where(expert_mask[expert_idx])
+        current_state = hidden_states[token_idx]
+        proj_out = self.linear(current_state,
+                               self.gate_up_proj[expert_idx],
+                               self.gate_up_proj_scale_inv[expert_idx], None)
+        proj_out = self._apply_gate(proj_out)
+        proj_out = self.linear(proj_out,
+                               self.down_proj[expert_idx],
+                               self.down_proj_scale_inv[expert_idx], None)
+        routing_weights = top_k_weights[token_idx, top_k_pos, None]
+        final.index_add_(0, token_idx,
+                         (proj_out * routing_weights.to(proj_out.dtype)).to(final.dtype))
+    return final.to(hidden_states.dtype)
+
+
+def _patch_fp8_train_forward(model=None):
+    """Route FP8 quantized paths through differentiable dequant.
+    - FP8Linear (dense): class-level patch.
+    - FP8Experts (MoE): the quantizer swaps in a DYNAMIC subclass whose
+      forward calls the grouped kernel directly, bypassing self.linear — so
+      patch each live instance after load. Idempotent."""
+    import sys, types
     mod = sys.modules.get("transformers.integrations.finegrained_fp8")
     if mod is None or getattr(mod, "_train_fwd_patched", False):
         return
 
-    def forward(self, input):
+    def dense_forward(self, input):
         return _fp8_linear_train(input, self.weight, self.weight_scale_inv,
                                  self.block_size, getattr(self, "bias", None))
 
-    mod.FP8Linear.forward = forward
+    mod.FP8Linear.forward = dense_forward
 
     if hasattr(mod, "FP8Experts"):
         def experts_linear(self, input, weight, weight_scale_inv, activation_scale=None):
+            import torch.nn.functional as _F
             if weight.element_size() > 1:
-                import torch.nn.functional as _F
                 return _F.linear(input, weight, None)
             wd = _dequant_expert_slice(weight, weight_scale_inv)
-            import torch.nn.functional as _F
             return _F.linear(input, wd.to(input.dtype), None)
 
         mod.FP8Experts.linear = experts_linear
+
+        if model is not None:
+            n = 0
+            for m in model.modules():
+                if isinstance(m, mod.FP8Experts):
+                    m.forward = types.MethodType(_fp8_experts_reference_forward, m)
+                    n += 1
+            print(f"[train] routed {n} FP8Experts modules through dequant forward", flush=True)
     mod._train_fwd_patched = True
 
 
