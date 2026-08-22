@@ -133,6 +133,7 @@ def build_model(offload: bool = True):
         # B300 path: 288 GiB VRAM holds the whole model — no offload, no PCIe bottleneck.
         load_kwargs.update(device_map={"": 0})
     model = AutoModelForCausalLM.from_pretrained(DS_REPO, **load_kwargs)
+    _patch_chunked_eager_attention()   # eager attn OOMs at bs=8 next to the FP8 backbone
     model.gradient_checkpointing_enable()
     model.config.use_cache = False
     for p in model.parameters():
@@ -293,6 +294,51 @@ class visual_inject:
             self._handle.remove()
             self._handle = None
         return False
+
+
+def _make_chunked_eager(orig, budget_elems: int = 2 ** 26):
+    """Wrap V4's eager_attention_forward to evaluate attention in query chunks.
+
+    The eager path materializes [.., S_q, S_kv+1] logits in fp32 (~46 GiB at
+    bs=8 next to the 155 GiB FP8 backbone => OOM). Softmax is independent per
+    query row, so chunking queries is mathematically identical with peak
+    transient ~budget_elems. Returns (output, None): attn_weights are dropped
+    because output_attentions is always False in this trainer."""
+    import torch as _torch
+
+    def chunked(module, query, key, value, attention_mask=None, scaling=None,
+                dropout: float = 0.0, **kwargs):
+        s_q = query.shape[-2]
+        kv_len = key.shape[-2]
+        leading = 1
+        for d in query.shape[:-2]:
+            leading *= d
+        rows = max(1, min(s_q, budget_elems // max(1, leading * kv_len)))
+        if rows >= s_q:
+            return orig(module, query, key, value, attention_mask,
+                        scaling=scaling, dropout=dropout, **kwargs)
+        outs = []
+        for s in range(0, s_q, rows):
+            e = min(s + rows, s_q)
+            m = attention_mask[..., s:e, :] if attention_mask is not None else None
+            outs.append(orig(module, query[..., s:e, :], key, value, m,
+                             scaling=scaling, dropout=dropout, **kwargs))
+        # orig returns [B, S_q, heads, D] (transposed): concat chunks on the S axis
+        out = _torch.cat([o[0] for o in outs], dim=1)
+        return out, None
+
+    return chunked
+
+
+def _patch_chunked_eager_attention():
+    """Swap in the chunked eager attention for transformers' DeepSeek-V4 module.
+    Idempotent; no-op if the module isn't imported yet."""
+    import sys
+    mod = sys.modules.get("transformers.models.deepseek_v4.modeling_deepseek_v4")
+    if mod is None or getattr(mod, "_v4_chunk_patched", False):
+        return
+    mod.eager_attention_forward = _make_chunked_eager(mod.eager_attention_forward)
+    mod._v4_chunk_patched = True
 
 
 # =============================== telemetry ==============================

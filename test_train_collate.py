@@ -152,3 +152,68 @@ def test_visual_inject_grads_reach_projector():
     loss.backward()
     assert proj.lin.weight.grad is not None
     assert proj.lin.weight.grad.abs().sum() > 0
+
+
+# ---- chunked eager attention: must be numerically identical to full eager ----
+
+def _repeat_kv(hidden_states, n_rep):
+    # faithful copy of transformers' repeat_kv (4-D [B, kv_heads, S, D])
+    batch, kv_heads, slen, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(
+        batch, kv_heads, n_rep, slen, head_dim)
+    return hidden_states.reshape(batch, kv_heads * n_rep, slen, head_dim)
+
+
+def _reference_eager(module, query, key, value, attention_mask,
+                     scaling, dropout=0.0, **kwargs):
+    """Faithful copy of transformers v5.15.1 deepseek_v4.eager_attention_forward."""
+    key_states = _repeat_kv(key, module.num_key_value_groups)
+    value_states = _repeat_kv(value, module.num_key_value_groups)
+    attn_weights = torch.matmul(query, key_states.transpose(2, 3)) * scaling
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+    sinks = module.sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
+    combined_logits = torch.cat([attn_weights, sinks], dim=-1)
+    combined_logits = combined_logits - combined_logits.max(dim=-1, keepdim=True).values
+    probs = torch.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
+    scores = probs[..., :-1]
+    attn_weights = torch.nn.functional.dropout(scores, p=dropout, training=module.training)
+    attn_output = torch.matmul(attn_weights.to(value_states.dtype), value_states)
+    return attn_output.transpose(1, 2).contiguous(), attn_weights
+
+
+def test_chunked_eager_matches_full_eager():
+    from modal_train import _make_chunked_eager
+    torch.manual_seed(3)
+    B, H, KVH, SQ, SKV, D = 2, 6, 2, 13, 17, 8   # rectangular: SQ != SKV
+
+    class AttnMod(torch.nn.Module):
+        num_key_value_groups = H // KVH
+        training = True
+        sinks = torch.randn(H)
+
+    mod = AttnMod()
+    q = torch.randn(B, H, SQ, D)
+    k = torch.randn(B, KVH, SKV, D)
+    v = torch.randn(B, KVH, SKV, D)
+    mask = torch.randn(B, 1, SQ, SKV)              # additive bias, fp32 like the real path
+    mask[..., -3:] = -1e9                          # some heavily-masked slots
+
+    ref_out, ref_w = _reference_eager(mod, q, k, v, mask, scaling=0.125)
+
+    for budget in (10 ** 9, 64, 37):               # single-shot / tiny chunks / ragged tail
+        chunked = _make_chunked_eager(_reference_eager, budget_elems=budget)
+        out, w = chunked(mod, q, k, v, mask, scaling=0.125)
+        assert out.shape == ref_out.shape
+        assert torch.allclose(out.float(), ref_out.float(), atol=1e-5)
+        if budget >= B * H * SQ * SKV:             # passthrough keeps orig contract
+            assert w is not None
+        else:                                      # engaged chunks drop weights
+            assert w is None
+    # no-mask path too
+    chunked = _make_chunked_eager(_reference_eager, budget_elems=50)
+    out_nomask, _ = chunked(mod, q, k, v, None, scaling=0.125)
+    ref_nomask, _ = _reference_eager(mod, q, k, v, None, scaling=0.125)
+    assert torch.allclose(out_nomask.float(), ref_nomask.float(), atol=1e-5)
