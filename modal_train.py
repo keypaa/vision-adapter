@@ -10,8 +10,10 @@ never runs in the training hot loop. Only the 67.1M projector is trainable.
 
 Contract: sequence layout per example
     [BOS] [img_emb × n_vis] [user text tokens] [answer tokens] [EOS]
-  - the n_vis vision embeddings are INSERTED via inputs_embeds at positions
-    [1 : 1+n_vis]; attention_mask covers them with 1s;
+  - the n_vis vision embeddings are spliced into embed_tokens' OUTPUT at
+    positions [1 : 1+n_vis] via a forward hook (input_ids stay the model
+    input: V4's hash-MoE gate routes by tid2eid[input_ids] and forbids
+    inputs_embeds); attention_mask covers them with 1s;
   - labels: -100 everywhere EXCEPT the answer + EOS token positions.
 
 Stages:
@@ -244,30 +246,53 @@ def make_collate(tok, pad_id, max_len=MAX_SEQ_LEN):
     return collate
 
 
-def inject_visual(inputs, proj, model):
-    """Project cached ViT embeddings -> LLM dim, embed tokens, and splice the
-    visual block at positions [1 : 1+n_vis], producing inputs_embeds for the LLM."""
-    import torch
-    embed = model.get_input_embeddings()
-    dev = next(embed.parameters()).device   # not hardcoded cuda: works sharded/cpu too
-    with torch.no_grad():
-        ids = inputs["input_ids"].clamp_min(0).to(dev)
-        text_emb = embed(ids)             # [B,L,4096]
-    vis = proj(inputs["vis"].to(dev, torch.bfloat16))  # [B,maxv,4096]
-    merged = text_emb.clone()
-    attn = inputs["attention_mask"].clone()
-    labels = inputs["labels"].clone()
-    n_vis = inputs["n_vis"].tolist()
-    for i in range(ids.shape[0]):
-        nv = int(n_vis[i])
-        merged[i, 1: 1 + nv] = vis[i, :nv]
-        # positions [1:1+nv] are image: exclude from labels (defensive; already -100)
-        labels[i, 1: 1 + nv] = -100
-    return {
-        "inputs_embeds": merged,
-        "attention_mask": attn.to(dev),
-        "labels": labels.to(dev),
-    }
+class visual_inject:
+    """Project cached ViT embeddings -> LLM dim and splice them at positions
+    [1 : 1+n_vis] of the sequence.
+
+    DeepSeek-V4's hash-MoE gates pick experts via tid2eid[input_ids] and the
+    core model raises if input_ids AND inputs_embeds are both given, so plain
+    inputs_embeds injection cannot work. Instead we keep input_ids as the
+    model-facing input and hook embed_tokens, overwriting its OUTPUT rows at
+    the visual positions. Gradients reach the projector through the spliced
+    rows; text rows stay ordinary frozen-embedding lookups. Usage:
+
+        with visual_inject(sig, proj, model) as full:
+            out = model(**full)
+    """
+
+    def __init__(self, inputs, proj, model):
+        import torch
+        embed = model.get_input_embeddings()
+        self._embed = embed
+        self._dev = next(embed.parameters()).device  # not hardcoded cuda: works sharded/cpu too
+        self._vis = proj(inputs["vis"].to(self._dev, torch.bfloat16))  # [B,maxv,4096]
+        self._n_vis = [int(n) for n in inputs["n_vis"].tolist()]
+        self.model_inputs = {
+            "input_ids": inputs["input_ids"].to(self._dev),
+            "attention_mask": inputs["attention_mask"].to(self._dev),
+            "labels": inputs["labels"].to(self._dev),
+        }
+        self._handle = None
+
+    def __enter__(self):
+        vis, n_vis = self._vis, self._n_vis
+
+        def _splice(module, args, output):
+            merged = output.clone()          # [B,L,H]; keep autograd link to vis
+            for i, nv in enumerate(n_vis):
+                merged[i, 1: 1 + nv] = vis[i, :nv]
+                # visual slots are excluded from loss upstream (labels -100)
+            return merged
+
+        self._handle = self._embed.register_forward_hook(_splice)
+        return self.model_inputs
+
+    def __exit__(self, *exc):
+        if self._handle is not None:
+            self._handle.remove()
+            self._handle = None
+        return False
 
 
 # =============================== telemetry ==============================
@@ -462,8 +487,8 @@ def _val_probe(model, proj, val_loader, tok):
     proj.eval()
     losses, n = [], 0
     for sig in val_loader:
-        full = inject_visual(sig, proj, model)
-        losses.append(float(model(**full).loss.item()))
+        with visual_inject(sig, proj, model) as full:
+            losses.append(float(model(**full).loss.item()))
         n += sig["input_ids"].shape[0]
     proj.train()
     return sum(losses) / max(1, len(losses)), n
@@ -688,15 +713,15 @@ def _one_step(sig, model, proj, opt, tok):
     import torch
     import torch.nn as nn
     t0 = time.time()
-    full = inject_visual(sig, proj, model)
-    out = model(**full)
-    loss = out.loss
-    opt.zero_grad(set_to_none=True)
-    loss.backward()
-    # clip at 1.0 AND capture the PRE-clip total norm: grad-norm bursts are the
-    # earliest warning of a loss cliff (they move before the loss does).
-    gnorm = nn.utils.clip_grad_norm_(proj.parameters(), 1.0)
-    opt.step()
+    with visual_inject(sig, proj, model) as full:
+        out = model(**full)
+        loss = out.loss
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        # clip at 1.0 AND capture the PRE-clip total norm: grad-norm bursts are the
+        # earliest warning of a loss cliff (they move before the loss does).
+        gnorm = nn.utils.clip_grad_norm_(proj.parameters(), 1.0)
+        opt.step()
     n_tokens = int(sig["attention_mask"].sum())
     return {"loss": float(loss.item()),
             "grad_norm": float(gnorm),

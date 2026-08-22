@@ -1,4 +1,4 @@
-"""Training data-contract tests: make_collate sequence layout + inject_visual splicing.
+"""Training data-contract tests: make_collate sequence layout + visual_inject splicing.
 
 These pin the exact [BOS][img][user][answer][EOS] contract documented in
 modal_train.py's docstring — the thing every downstream training behavior
@@ -7,7 +7,7 @@ depends on. Hermetic: stub tokenizer + tiny embedding, no HF downloads. Run:
 """
 import torch
 
-from modal_train import make_collate, inject_visual
+from modal_train import make_collate, visual_inject
 
 
 class StubTok:
@@ -86,12 +86,7 @@ def test_collate_trims_user_keeps_answer_when_over_budget():
     assert eos_pos + 1 <= 64                      # whole sequence fits max_len
 
 
-def test_inject_visual_splices_image_block():
-    torch.manual_seed(0)
-    d = 16
-    emb = torch.nn.Embedding(1024, d)   # StubTok ids reach ~909
-    model = type("M", (), {"get_input_embeddings": lambda s: emb})()
-
+def _proj(d):
     class Proj(torch.nn.Module):
         def __init__(self):
             super().__init__()
@@ -100,21 +95,60 @@ def test_inject_visual_splices_image_block():
         def forward(self, x):
             return self.lin(x)
 
-    proj = Proj().eval()
+    return Proj().eval()
+
+
+def test_visual_inject_splices_image_block():
+    torch.manual_seed(0)
+    d = 16
+    emb = torch.nn.Embedding(1024, d)   # StubTok ids reach ~909
+    model = type("M", (), {"get_input_embeddings": lambda s: emb})()
+    proj = _proj(d)
     tok = StubTok()
     collate = make_collate(tok, tok.pad_token_id, max_len=32)
     inputs = collate([_item(n_vis=3, user="abc", assistant="xyz")])
 
+    # reference embeddings MUST be captured before entering the window: while
+    # the hook is live it splices EVERY embed_tokens call, including probes.
     with torch.no_grad():
-        out = inject_visual(inputs, proj, model)
-    merged = out["inputs_embeds"]
-    assert merged.shape == inputs["input_ids"].shape + (d,)
-    # BOS position untouched
-    assert torch.equal(merged[0, 0], emb(torch.tensor([tok.bos_token_id]))[0])
-    # image span equals proj(vis); text span equals raw embeddings
-    vis_raw = proj(inputs["vis"][:, :3, :].to(torch.bfloat16)).float()
-    assert torch.allclose(merged[0, 1:4], vis_raw[0], atol=1e-2)
-    u_ids = inputs["input_ids"][0, 4:7]
-    assert torch.equal(merged[0, 4:7], emb(u_ids))
-    # image span excluded from labels defensively
-    assert (out["labels"][0, 1:4] == -100).all()
+        bos_ref = emb(torch.tensor([tok.bos_token_id]))[0]
+        text_ref = emb(inputs["input_ids"][0, 4:7])
+        vis_raw = proj(inputs["vis"][:, :3, :].to(torch.bfloat16)).float()
+
+    with visual_inject(inputs, proj, model) as full:
+        # ids stay the model-facing input (V4 hash-MoE gate needs them);
+        # no inputs_embeds may escape to the model call
+        assert "input_ids" in full and "inputs_embeds" not in full
+        with torch.no_grad():
+            merged = emb(full["input_ids"])           # hook fires here
+        assert merged.shape == full["input_ids"].shape + (d,)
+        # BOS position untouched
+        assert torch.equal(merged[0, 0], bos_ref)
+        # image span equals proj(vis); text span equals raw embeddings
+        assert torch.allclose(merged[0, 1:4], vis_raw[0], atol=1e-2)
+        assert torch.equal(merged[0, 4:7], text_ref)
+        # image span stays excluded from loss (labels -100 from collate)
+        assert (full["labels"][0, 1:4] == -100).all()
+
+    # hook removed on exit: embedding output is plain again
+    with torch.no_grad():
+        plain = emb(full["input_ids"])
+        assert torch.equal(plain[0, 1:4], emb(full["input_ids"][0, 1:4]))
+
+
+def test_visual_inject_grads_reach_projector():
+    torch.manual_seed(0)
+    d = 8
+    emb = torch.nn.Embedding(1024, d)
+    model = type("M", (), {"get_input_embeddings": lambda s: emb})()
+    proj = _proj(d)
+    tok = StubTok()
+    collate = make_collate(tok, tok.pad_token_id, max_len=32)
+    inputs = collate([_item(n_vis=2, user="ab", assistant="cd")])
+
+    with visual_inject(inputs, proj, model) as full:
+        merged = emb(full["input_ids"])               # autograd through the splice
+        loss = merged[0, 1:3].sum()                   # only the visual rows matter
+    loss.backward()
+    assert proj.lin.weight.grad is not None
+    assert proj.lin.weight.grad.abs().sum() > 0
