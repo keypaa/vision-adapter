@@ -30,11 +30,13 @@ GPU = "A100-80GB"
 GPU_MEM_CAP_GIB = 70.0
 
 # A100 (cc 8.0) cannot run FP8 kernels: transformers dequantizes the FP8
-# checkpoint (~155 GiB on disk) to bf16 at load => ~310 GiB of weights. The
-# offload budget (GPU cap + this CPU tier) must cover that, and the A100
-# functions' Modal `memory=` must exceed this hint (hint is GiB, memory= is GB).
-SYS_RAM_CAP_GIB = 280
-A100_CONTAINER_RAM_GB = 340
+# checkpoint (~155 GiB on disk) to bf16 at load. Measured twice (ap-7aS2E…,
+# ap-shpUl…): a 70+280 GiB budget still trips accelerate's disk tier, so the
+# real accounting is well above 350 GiB once per-layer placement granularity,
+# scales, and loader slack are counted. Give it 70+400 and a container well
+# above the hint; offload_folder absorbs any marginal spill instead of crashing.
+SYS_RAM_CAP_GIB = 400
+A100_CONTAINER_RAM_GB = 480
 
 # ---- B300 stack (Phase 5) — 288 GiB VRAM: whole quantized backbone in VRAM ----
 B300_GPU = "B300"
@@ -120,7 +122,8 @@ def build_model(offload: bool = True):
         # A100 path: quantized backbone split across GPU cap + CPU RAM (PCIe hops in the loop).
         load_kwargs.update(device_map="auto",
                            max_memory={0: f"{int(GPU_MEM_CAP_GIB)}GiB",
-                                       "cpu": f"{int(SYS_RAM_CAP_GIB)}GiB"})
+                                       "cpu": f"{int(SYS_RAM_CAP_GIB)}GiB"},
+                           offload_folder="/root/offload")
     else:
         # B300 path: 288 GiB VRAM holds the whole model — no offload, no PCIe bottleneck.
         load_kwargs.update(device_map={"": 0})
