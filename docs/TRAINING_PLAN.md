@@ -208,6 +208,63 @@ recovery, and stop the un-finished pushes.
 
 ---
 
+## Phase 8 — Qwen3.5-2B grok probe on Modal (new)
+
+**Goal:** same frozen-backbone adapter (frozen ViT → trainable projector), same
+production data plane, on a small text-only LLM (Qwen3.5-2B), to validate the
+recipe and timestamp the grok window cheaply before the B300 DeepSeek run.
+Conceptually a clone of `modal_train.py`, not a modification of it — DeepSeek
+carries FP8/MoE hacks the probe must not touch.
+
+### Constraints decided
+
+- **Files:** `modal_probe.py` (new) reuses `modal_train.EmbSFT` by explicit
+  local mount (`image.add_local_file("modal_train.py", "/root/modal_train.py")`);
+  `modal_train.py` is never modified — its DeepSeek patches stay isolated.
+- **Model loading gate:** `device_map={"": 0}` (all-in-VRAM), `torch.bfloat16`,
+  `gradient_checkpointing_enable(use_reentrant=False)`, `train()` not `eval()`
+  — copied from `modal_train.build_model` after validating both load paths.
+  Note: Qwen3.5 has 3.2 layers in tests but 24 in production — `limit_layers`
+  is only for local smoke tests.
+- **Collate guard:** `tok.bos_token_id` may be `None` on Qwen3.5 (vs DeepSeek
+  where it is always set). `make_collate` skips `input_ids[0]=BOS` when None,
+  and `check_collate_invariants` is not ported — the probe borrows the same
+  labels-only-on-answer+EOS contract.
+- **Vision injection:** `inputs_embeds`-only splice at positions `[1:1+n_vis]`
+  — Qwen forbids `input_ids` + `inputs_embeds` together; unlike DeepSeek
+  (which needs `input_ids` for its FP8 trick), Qwen is fine with embeds-only.
+- **Selective lm_head loss:** CE computed only at supervised positions
+  (`shift_labels != -100`, ~tens of tokens), applied as `lm_head(text_hidden)`
+  → logits `[N,V]` — full-sequence 248k-vocab logits would be ~80 GiB at
+  batch 16. This matches the validated Colab probe (`grok_probe_qwen.py`).
+
+### Known traps / gotchas
+
+- **Modal Mount naming:** `modal.Mount` is deprecated — use
+  `image.add_local_file(..., remote_path=...)`. Attempting
+  `modal.Mount.from_local_file` raises `AttributeError: module 'modal' has no
+  attribute 'Mount'` (observed at gate launch).
+- **Mixed-dtype LayerNorm bug (repeat):** `EmbSFT` returns vis tokens in
+  `float32`, the projector is `bf16` — `LayerNorm(FP32)` raises
+  `RuntimeError: expected scalar type Float but found BFloat16`. Fix: cast
+  `vis.to(proj_dtype)` before calling `proj()` (same fix the Colab path hit
+  on CPU under fp16). Seen on `modal_probe.py` dryrun #1.
+- **Tracer shenanigans:** Modal sometimes fails silently with
+  `ModuleNotFoundError: No module named 'modal_train'` at the import line
+  even when `add_local_file("modal_train.py", ...)` succeeded — the file
+  lands under `/to_local_mount/...` rather than `/root`. Check the container
+  path carefully if the import fails again.
+
+### Report — Phase 8
+
+- `[x]` dryrun on **L4 (cc 8.9, 22 GiB)** — 2026-08-25 — **MEMORY GATE PASS**.
+  `Qwen/Qwen3.5-2B` (2,274,067,232 bf16 params), 117,600 train rows (full
+  production manifest via `EmbSFT`), `bs=16` at `MAX_SEQ_LEN=4096`,
+  `HourglassProjector 25,180,160 params | bf16`
+  → `loss=5.6099 peak=12.32 GiB step_ms=26138.8` → headroom **~9.7 GiB**.
+- `[ ]` PHASE9: full ~30k-step SFT on the grok-probe (`modal_probe.py::train`)
+  to timestamp the cliff — not run yet.
+
 ## Cross-cutting decisions (locked)
 
 - **Parquet shards = single source of truth** for both training reads and the

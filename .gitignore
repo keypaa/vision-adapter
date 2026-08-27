@@ -5,3 +5,11 @@ __pycache__/
 session-ses_*.md
 .superpowers/
 .pytest_cache/
+.jspace/
+emb_cache/
+GROK_PROBE.md
+pack.log
+*.log
+probe_log.jsonl
+probe_log*.jsonl
+session-export-*.jsonl
