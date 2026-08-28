@@ -182,7 +182,9 @@ HourglassProjector = _CoreHourglass
 
 
 def fetch_manifest(cache_dir: str | None = None) -> list[dict]:
-    """Download + parse train_manifest.jsonl ({emb, user, assistant, g})."""
+    """Download + parse train_manifest.jsonl ({emb, user, assistant, g}).
+
+    Tolerates a leading manifest_header row (vision_adapter/manifest.py) — skipped."""
     from huggingface_hub import hf_hub_download
     kw = dict(local_dir=cache_dir) if cache_dir else {}
     local = hf_hub_download(MANIFEST_REPO, MANIFEST_FILE, repo_type="dataset", **kw)
@@ -191,7 +193,10 @@ def fetch_manifest(cache_dir: str | None = None) -> list[dict]:
         for line in f:
             line = line.strip()
             if line:
-                rows.append(json.loads(line))
+                obj = json.loads(line)
+                if obj.get("type") == "manifest_header":
+                    continue
+                rows.append(obj)
     return rows
 
 

@@ -181,6 +181,8 @@ class EmbSFT(torch.utils.data.Dataset):
         with open(manifest_path) as f:
             for line in f:
                 r = json.loads(line)
+                if r.get("type") == "manifest_header":
+                    continue  # provenance row added by vision_adapter/manifest.py
                 r["emb_abs"] = os.path.join(vol_dir, r["emb"])
                 self.rows.append(r)
 
