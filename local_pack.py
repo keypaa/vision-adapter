@@ -76,6 +76,21 @@ def iter_rows(local_paths: list[str]) -> Iterator[dict]:
         yield make_row(f"embeddings/{os.path.basename(p)}", t)
 
 
+def _file_sha256(path: str) -> str | None:
+    """SHA-256 of a file on disk; None if absent (best-effort helper)."""
+    import hashlib
+    if not os.path.exists(path):
+        return None
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
 def pack_rows(rows: Iterable[dict], out_path: str, batch_size: int = 64,
               progress=None) -> None:
     """Stream rows to a parquet file in fixed-size batches (RAM-bounded).
@@ -363,6 +378,15 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
             t_push = time.time()
             push_to_hf(api, local_parquet, em_repo, shard)
             t_push = time.time() - t_push
+            # per-shard sha256 for Volume↔HF parity (best-effort: HF download not on this path)
+            try:
+                local_sha = _file_sha256(local_parquet) if os.path.exists(local_parquet) else None
+                if local_sha:
+                    progress.write(json.dumps({"ts": round(time.time(), 1), "shard": i,
+                                               "event": "parquet_sha256", "sha256": local_sha,
+                                               "file": shard}) + "\n")
+            except Exception:
+                pass
             hf_shards.add(shard)
             try:
                 os.remove(local_parquet)
@@ -375,6 +399,7 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
         elapsed = time.time() - t0
         rate = rows_done / max(1e-9, elapsed)
         eta = (len(names) - rows_done) / max(1e-9, rate) / 60
+        # sha256 best-effort: parquet already removed at this point, so omit here
         progress.write(json.dumps({
             "ts": round(time.time(), 1), "shard": i, "action": action,
             "rows_done": rows_done, "rows_total": len(names),

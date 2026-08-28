@@ -511,19 +511,34 @@ def train(batch_size: int = DEFAULT_BS,
 
     logger = open(os.path.join(log_dir, LOG_FILE),
                   "a" if start_step else "w", buffering=1)
+    probe_run_id = None
     if not start_step:
         try:
             hdr = _config_header(_CFG_PROBE, manifest_path=None,
                                  extra={"type": "config_header", "run": "modal_probe",
+                                        "seed": 17, "device": "cuda", "dtype": "bfloat16",
                                         "args": {"batch_size": bs, "max_steps": max_steps,
                                                  "sample_size": sample_size, "epochs": epochs,
                                                  "limit_layers": limit_layers, "gpu": want_gpu,
                                                  "grad_ckpt": not _as_bool(no_grad_ckpt),
                                                  "bucketing": _as_bool(bucketing),
                                                  "attn": str(attn), "compile": _as_bool(compile)}})
+            probe_run_id = hdr.get("run_id")
             logger.write(json.dumps(hdr) + "\n")
         except Exception as e:
             print(f"[probe] WARNING: could not write config header ({e})", flush=True)
+    else:
+        try:
+            with open(os.path.join(log_dir, LOG_FILE)) as _lf:
+                for _line in _lf:
+                    try:
+                        _obj = json.loads(_line)
+                        if _obj.get("type") == "config_header" and _obj.get("run_id"):
+                            probe_run_id = _obj["run_id"]
+                    except Exception:
+                        pass
+        except Exception:
+            pass
     t0 = time.time()
     step, samples_seen, tokens_total = start_step, start_step * bs, 0
     consecutive_bad = 0
@@ -607,7 +622,10 @@ def train(batch_size: int = DEFAULT_BS,
     render_curves(records, os.path.join(log_dir, CURVES_PNG))
     final_loss = records[-1]["loss"] if records else float("nan")
     logger.write(json.dumps({
-        "type": "run_end", "step": step, "samples_seen": samples_seen,
+        "type": "run_end", "run_id": probe_run_id,
+        "args": {"batch_size": bs, "max_steps": max_steps, "sample_size": sample_size,
+                 "epochs": epochs, "gpu": want_gpu},
+        "step": step, "samples_seen": samples_seen,
         "final_loss": final_loss, "final_ema": monitor.ema,
         "collapse_step": monitor.collapse_step,
         "collapse_samples_seen": (monitor.collapse_step or 0) * bs,

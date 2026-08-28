@@ -89,6 +89,29 @@ def _manifest_row_count(path: str | Path | None) -> int | None:
         return None
 
 
+def file_sha256(path: str | Path) -> str | None:
+    """SHA-256 of any file on disk (parquet shard, manifest, etc.). None on miss."""
+    p = Path(path)
+    if not p.is_file():
+        return None
+    h = hashlib.sha256()
+    try:
+        with p.open("rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _new_run_id() -> str:
+    """Short run identifier: UTC timestamp + 6 hex chars of randomness."""
+    import uuid
+
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    return f"{ts}-{uuid.uuid4().hex[:6]}"
+
+
 # ---------------------------------------------------------------------------
 # config dataclass
 # ---------------------------------------------------------------------------
@@ -194,19 +217,22 @@ def config_header(
     cfg: TrainConfig,
     *,
     manifest_path: str | Path | None = None,
+    run_id: str | None = None,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the provenance header dict for the JSONL log.
 
     Every field of cfg is emitted verbatim so a run is comparable from its log
     alone (no code re-read). Includes git SHA, manifest hash/rows, timestamp,
-    python/platform, and any caller-supplied extra (e.g. run_id, seed, device).
+    python/platform, and any caller-supplied extra (e.g. seed, device).
     """
     sha = get_git_sha()
     mhash = manifest_sha256(manifest_path)
     mrows = _manifest_row_count(manifest_path)
+    rid = run_id or _new_run_id()
     header: dict[str, Any] = {
         "type": "config_header",
+        "run_id": rid,
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "git_sha": sha,
         "manifest_path": str(manifest_path) if manifest_path else None,
@@ -228,5 +254,6 @@ __all__ = [
     "colab_probe_config",
     "get_git_sha",
     "manifest_sha256",
+    "file_sha256",
     "config_header",
 ]
