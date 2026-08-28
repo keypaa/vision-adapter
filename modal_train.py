@@ -150,18 +150,8 @@ def build_model(offload: bool = True):
     # and the arch has no other stochastic layers, so numerics are identical.
     model.train()
 
-    class HourglassProjector(nn.Module):
-        def __init__(s, d=4096, h=8192):
-            super().__init__()
-            s.ln = nn.LayerNorm(d)
-            s.up = nn.Linear(d, h)
-            s.act = nn.GELU()
-            s.dn = nn.Linear(h, d)
-
-        def forward(s, x):
-            return s.dn(s.act(s.up(s.ln(x))))
-
-    proj = HourglassProjector()
+    from vision_adapter.core import HourglassProjector as _CoreHourglass
+    proj = _CoreHourglass(vision_dim=4096, llm_dim=4096)
     import torch as _t
     proj = proj.to(device=torch.device("cuda"), dtype=torch.bfloat16)
     for p in proj.parameters():
@@ -204,106 +194,22 @@ class EmbSFT(torch.utils.data.Dataset):
         return {"vis": vis, "user": r["user"], "assistant": r["assistant"], "g": r.get("g", "?")}
 
 
+# Canonical implementations in vision_adapter/core.py
+from vision_adapter.core import (
+    make_collate as _core_make_collate,
+    visual_inject as _core_visual_inject,
+    TrainMonitor as _CoreTrainMonitor,
+    render_train_curves as _core_render_train_curves,
+)
+
 def make_collate(tok, pad_id, max_len=MAX_SEQ_LEN):
-    def collate(batch):
-        import torch
-        B = len(batch)
-        n_vis = [int(b["vis"].shape[0]) for b in batch]
-        max_v = max(n_vis)
-        # user/answer token ids (image is injected separately, not vocab tokens)
-        u_ids = [tok(b["user"], add_special_tokens=False)["input_ids"] for b in batch]
-        a_ids = [tok(b["assistant"], add_special_tokens=False)["input_ids"] for b in batch]
-        # text budget: reserve [1 BOS] + [n_vis img] + [1 EOS]
-        seq_lens = []
-        parts = []
-        for u, a, nv in zip(u_ids, a_ids, n_vis):
-            budget_text = max_len - nv - 2
-            # answer has PRIORITY on the text budget (it is the loss target);
-            # the user prompt absorbs whatever room is left.
-            a = a[: max(1, budget_text)]
-            u = u[: max(1, budget_text - len(a))]
-            parts.append((nv, u, a))
-            seq_lens.append(1 + nv + len(u) + len(a) + 1)
-        L = max(max_v, max(seq_lens))
-        input_ids = torch.full((B, L), pad_id, dtype=torch.long)
-        labels = torch.full((B, L), -100, dtype=torch.long)
-        attn = torch.zeros((B, L), dtype=torch.long)
-        device_flag = dict()
-        for i, (nv, u, a) in enumerate(parts):
-            input_ids[i, 0] = tok.bos_token_id
-            # positions [1 : 1+nv] are IMAGE EMBEDDINGS (injected); their id value unused
-            pos = 1 + nv
-            input_ids[i, pos: pos + len(u)] = torch.tensor(u)
-            ans_start = pos + len(u)
-            input_ids[i, ans_start: ans_start + len(a)] = torch.tensor(a)
-            input_ids[i, ans_start + len(a)] = tok.eos_token_id
-            # attention: 1 for bos..eos (incl. the img span); 0 in right-pad
-            attn[i, : ans_start + len(a) + 1] = 1
-            # labels: only the answer + EOS contribute to loss
-            labels[i, ans_start: ans_start + len(a) + 1] = input_ids[i, ans_start: ans_start + len(a) + 1]
-            device_flag[i] = nv
-        # vis tokens padded to max_v
-        vis_pad = torch.zeros(B, max_v, 4096, dtype=torch.float32)
-        for i, b in enumerate(batch):
-            vis_pad[i, : n_vis[i]] = b["vis"]
-        return {
-            "input_ids": input_ids,
-            "attention_mask": attn,
-            "labels": labels,
-            "vis": vis_pad,
-            "n_vis": torch.tensor(n_vis, dtype=torch.long),
-            "g": [b["g"] for b in batch],
-        }
-    return collate
+    # DeepSeek path: BOS always present (no Qwen guard), but core handles both
+    return _core_make_collate(tok, pad_id, max_len=max_len, vision_dim=4096)
 
-
-class visual_inject:
-    """Project cached ViT embeddings -> LLM dim and splice them at positions
-    [1 : 1+n_vis] of the sequence.
-
-    DeepSeek-V4's hash-MoE gates pick experts via tid2eid[input_ids] and the
-    core model raises if input_ids AND inputs_embeds are both given, so plain
-    inputs_embeds injection cannot work. Instead we keep input_ids as the
-    model-facing input and hook embed_tokens, overwriting its OUTPUT rows at
-    the visual positions. Gradients reach the projector through the spliced
-    rows; text rows stay ordinary frozen-embedding lookups. Usage:
-
-        with visual_inject(sig, proj, model) as full:
-            out = model(**full)
-    """
-
-    def __init__(self, inputs, proj, model):
-        import torch
-        embed = model.get_input_embeddings()
-        self._embed = embed
-        self._dev = next(embed.parameters()).device  # not hardcoded cuda: works sharded/cpu too
-        self._vis = proj(inputs["vis"].to(self._dev, torch.bfloat16))  # [B,maxv,4096]
-        self._n_vis = [int(n) for n in inputs["n_vis"].tolist()]
-        self.model_inputs = {
-            "input_ids": inputs["input_ids"].to(self._dev),
-            "attention_mask": inputs["attention_mask"].to(self._dev),
-            "labels": inputs["labels"].to(self._dev),
-        }
-        self._handle = None
-
-    def __enter__(self):
-        vis, n_vis = self._vis, self._n_vis
-
-        def _splice(module, args, output):
-            merged = output.clone()          # [B,L,H]; keep autograd link to vis
-            for i, nv in enumerate(n_vis):
-                merged[i, 1: 1 + nv] = vis[i, :nv]
-                # visual slots are excluded from loss upstream (labels -100)
-            return merged
-
-        self._handle = self._embed.register_forward_hook(_splice)
-        return self.model_inputs
-
-    def __exit__(self, *exc):
-        if self._handle is not None:
-            self._handle.remove()
-            self._handle = None
-        return False
+# Re-export canonical visual_inject + TrainMonitor so test_train_collate keeps importing from modal_train
+visual_inject = _core_visual_inject
+TrainMonitor = _CoreTrainMonitor
+render_curves = _core_render_train_curves
 
 
 def _fp8_linear_train(input, weight, weight_scale_inv, block_size, bias=None):
@@ -507,141 +413,10 @@ def _patch_chunked_eager_attention():
 
 
 # =============================== telemetry ==============================
-
-class TrainMonitor:
-    """DeepSeek-style run analytics over the live loss/grad-norm streams.
-
-    Keeps an EMA (fast-reacting) and a rolling median (robust baseline) of
-    both series. A SPIKE is declared only when BOTH loss and grad-norm burst
-    above k x their medians simultaneously (single-series jumps are routine),
-    with a cooldown so one blowup doesn't spam alerts. On alert, `on_alert`
-    receives a JSON-ready record — train() uses it to snapshot a pre-spike
-    checkpoint you can roll back to."""
-
-    def __init__(self, ema_beta: float = 0.98, median_window: int = 200,
-                 loss_k: float = 1.5, gnorm_k: float = 3.0,
-                 min_history: int = 10, cooldown: int = 50, on_alert=None):
-        from collections import deque
-        self.beta = ema_beta
-        self.win = deque(maxlen=median_window)
-        self.gwin = deque(maxlen=median_window)
-        self.loss_ema = None
-        self.gnorm_ema = None
-        self.loss_k, self.gnorm_k = loss_k, gnorm_k
-        self.min_history = min_history
-        self.cooldown = cooldown
-        self.last_alert_step = -(10 ** 9)
-        self.n_alerts = 0
-        self.on_alert = on_alert or (lambda rec: None)
-
-    def update_train(self, step: int, loss: float, grad_norm: float, **extra):
-        """Feed one train step; returns an alert record if this step spiked."""
-        self.loss_ema = loss if self.loss_ema is None else \
-            self.beta * self.loss_ema + (1 - self.beta) * loss
-        self.gnorm_ema = grad_norm if self.gnorm_ema is None else \
-            self.beta * self.gnorm_ema + (1 - self.beta) * grad_norm
-        self.win.append(loss)
-        self.gwin.append(grad_norm)
-
-        if len(self.win) < max(self.min_history, 2):
-            return None
-        lmed, gmed = self.loss_median(), self.gnorm_median()
-        if step - self.last_alert_step <= self.cooldown:
-            return None
-        if loss > self.loss_k * lmed and grad_norm > self.gnorm_k * gmed:
-            self.last_alert_step = step
-            self.n_alerts += 1
-            rec = {"type": "alert", "step": step, "loss": round(loss, 5),
-                   "loss_median": round(lmed, 5), "loss_ema": round(self.loss_ema, 5),
-                   "grad_norm": round(grad_norm, 4), "gnorm_median": round(gmed, 4),
-                   "gnorm_ema": round(self.gnorm_ema, 4), **extra}
-            self.on_alert(rec)
-            return rec
-        return None
-
-    def loss_median(self):
-        import statistics
-        return statistics.median(self.win)
-
-    def gnorm_median(self):
-        import statistics
-        return statistics.median(self.gwin)
-
-
-def render_curves(records, out_path: str, grok_lo: int = 0, grok_hi: int = 0):
-    """3-panel PNG (loss / grad-norm / lr+throughput) from JSONL records.
-
-    Written every CHART_EVERY steps + at run end, so a mid-run
-    `modal volume get vision-adapter-data logs/train_curves.png` always
-    shows the freshest curves."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    tr = [r for r in records if r.get("type") == "train"]
-    va = [r for r in records if r.get("type") == "val"]
-    al = [r for r in records if r.get("type") == "alert"]
-    if not tr:
-        return False
-    xs = [r["step"] for r in tr]
-
-    fig, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
-
-    ax = axes[0]
-    ax.plot(xs, [r["loss"] for r in tr], lw=0.4, alpha=0.35, color="tab:blue")
-    ema = _ema_series([r["loss"] for r in tr], 0.98)
-    ax.plot(xs, ema, lw=1.8, color="tab:blue", label="train loss (EMA .98)")
-    if va:
-        ax.plot([r["step"] for r in va], [r["val_loss"] for r in va],
-                "o-", ms=4, lw=1.2, color="tab:red", label="val loss")
-    ax.set_yscale("log")
-    ax.set_ylabel("loss (log)")
-    ax.set_title("Vision-Adapter SFT — live curves")
-    ax.legend(loc="upper right", fontsize=8)
-    _shade_grok(ax, grok_lo, grok_hi)
-
-    ax = axes[1]
-    ax.plot(xs, [r["grad_norm"] for r in tr], lw=0.4, alpha=0.35, color="tab:green")
-    ax.plot(xs, _ema_series([r["grad_norm"] for r in tr], 0.98),
-            lw=1.8, color="tab:green", label="grad norm (EMA .98)")
-    ax.set_yscale("log")
-    ax.set_ylabel("||grad|| (log)")
-    ax.legend(loc="upper right", fontsize=8)
-    _shade_grok(ax, grok_lo, grok_hi)
-
-    ax = axes[2]
-    ax2 = ax.twinx()
-    ax.plot(xs, [r["lr"] for r in tr], lw=1.2, color="tab:purple", label="lr")
-    ax2.plot(xs, [r.get("tok_s", 0.0) for r in tr], lw=0.6, alpha=0.6,
-             color="tab:orange", label="tokens/s")
-    ax.set_ylabel("lr"); ax2.set_ylabel("tokens/s")
-    ax.set_xlabel("step")
-    h1, l1 = ax.get_legend_handles_labels()
-    h2, l2 = ax2.get_legend_handles_labels()
-    ax.legend(h1 + h2, l1 + l2, loc="upper right", fontsize=8)
-
-    for a in al:
-        for ax_ in axes[:2]:
-            ax_.axvline(a["step"], color="red", ls="--", alpha=0.7)
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=110)
-    plt.close(fig)
-    return True
-
-
-def _ema_series(vals, beta):
-    out, e = [], None
-    for v in vals:
-        e = v if e is None else beta * e + (1 - beta) * v
-        out.append(e)
-    return out
-
-
-def _shade_grok(ax, lo, hi):
-    if hi > lo:
-        ax.axvspan(lo, hi, color="gold", alpha=0.15)
-        ax.text((lo + hi) / 2, ax.get_ylim()[1], " grok window",
-                fontsize=7, color="darkgoldenrod", va="top")
+# Canonical TrainMonitor + render_curves in vision_adapter/core.py — re-exported
+# so test_train_telemetry / test_train_collate keep importing from modal_train.
+from vision_adapter.core import TrainMonitor, render_train_curves as render_curves  # noqa: E402, F401
+from vision_adapter.core import _ema_series, _shade_grok  # noqa: F401 — re-export for tests (test_train_telemetry imports via modal_train)
 
 
 # =============================== train entry ==============

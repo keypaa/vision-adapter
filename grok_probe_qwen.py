@@ -58,6 +58,19 @@ import numpy as np
 import torch
 import torch.nn as nn
 from vision_adapter.config import colab_probe_config as _colab_probe_config, config_header as _config_header  # single source of truth
+from vision_adapter.core import (  # single shared training core — see vision_adapter/core.py
+    HourglassProjector as _CoreHourglass,
+    ProbeMonitor as _CoreProbeMonitor,
+    TrainMonitor as _CoreTrainMonitor,
+    check_collate_invariants as _core_check,
+    embeds_for as _core_embeds,
+    lr_at as _core_lr_at,
+    make_collate as _core_make_collate,
+    render_curves as _core_render_curves,
+    render_train_curves as _core_render_train_curves,
+    train_step_qwen as _core_train_step_qwen,
+    visual_inject as _CoreVisualInject,
+)
 
 _T0 = time.time()
 
@@ -161,22 +174,8 @@ def enforce_ram_cap_gib(cap_gib: float) -> None:
 
 
 # ----------------------------- projector ------------------------------------
-
-
-class HourglassProjector(nn.Module):
-    """Same structure as modal_train.build_model's projector, dims adapted to
-    the chosen Qwen hidden size (read from config at runtime): for DeepSeek
-    d==h==4096 so up/down were symmetric; here up goes to 2*llm_dim."""
-
-    def __init__(self, vision_dim: int = VISION_DIM, llm_dim: int = 2048):
-        super().__init__()
-        self.ln = nn.LayerNorm(vision_dim)
-        self.up = nn.Linear(vision_dim, 2 * llm_dim)
-        self.act = nn.GELU()
-        self.dn = nn.Linear(2 * llm_dim, llm_dim)
-
-    def forward(self, x):
-        return self.dn(self.act(self.up(self.ln(x))))
+# Canonical implementation in vision_adapter/core.py
+HourglassProjector = _CoreHourglass
 
 
 # ----------------------------- data -----------------------------------------
@@ -580,294 +579,24 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                     rs._span = None
 
 # ----------------------------- telemetry ------------------------------------
-
-
+# Canonical implementations in vision_adapter/core.py
 def make_collate(tok, pad_id: int, max_len: int = MAX_SEQ_LEN):
-    """Port of modal_train.make_collate — identical layout, trimming priority
-    (answer survives, user trims), attention and label masking."""
+    return _core_make_collate(tok, pad_id, max_len=max_len, vision_dim=VISION_DIM)
 
-    def collate(batch):
-        B = len(batch)
-        n_vis = [int(b["vis"].shape[0]) for b in batch]
-        max_v = max(n_vis)
-        u_ids = [tok(b["user"], add_special_tokens=False)["input_ids"] for b in batch]
-        a_ids = [tok(b["assistant"], add_special_tokens=False)["input_ids"] for b in batch]
-        seq_lens, parts = [], []
-        for u, a, nv in zip(u_ids, a_ids, n_vis):
-            budget_text = max_len - nv - 2
-            # answer has PRIORITY on the text budget (it is the loss target);
-            # the user prompt absorbs whatever room is left (modal_train parity).
-            a = a[: max(1, budget_text)]
-            u = u[: max(1, budget_text - len(a))]
-            parts.append((nv, u, a))
-            seq_lens.append(1 + nv + len(u) + len(a) + 1)
-        L = max(max_v, max(seq_lens))
-        input_ids = torch.full((B, L), pad_id, dtype=torch.long)
-        labels = torch.full((B, L), -100, dtype=torch.long)
-        attn = torch.zeros((B, L), dtype=torch.long)
-        for i, (nv, u, a) in enumerate(parts):
-            if tok.bos_token_id is not None:
-                input_ids[i, 0] = tok.bos_token_id
-            pos = 1 + nv                                # first text pos after img span
-            input_ids[i, pos: pos + len(u)] = torch.tensor(u)
-            ans_start = pos + len(u)
-            input_ids[i, ans_start: ans_start + len(a)] = torch.tensor(a)
-            input_ids[i, ans_start + len(a)] = tok.eos_token_id
-            attn[i, : ans_start + len(a) + 1] = 1       # img span attended, pad not
-            labels[i, ans_start: ans_start + len(a) + 1] = \
-                input_ids[i, ans_start: ans_start + len(a) + 1]
-        vis_pad = torch.zeros(B, max_v, VISION_DIM, dtype=torch.float32)
-        for i, b in enumerate(batch):
-            vis_pad[i, : n_vis[i]] = b["vis"]
-        return {"input_ids": input_ids, "attention_mask": attn, "labels": labels,
-                "vis": vis_pad, "n_vis": torch.tensor(n_vis, dtype=torch.long),
-                "g": [b["g"] for b in batch]}
+check_collate_invariants = _core_check  # kept but now re-exports core
 
-    return collate
-
-
-def check_collate_invariants(batch, tok) -> None:
-    """First-batch port of test_train_collate.py's pins — abort loudly rather
-    than train on a drifted sequence contract."""
-    ids = batch["input_ids"][0].tolist()
-    labels = batch["labels"][0].tolist()
-    nv = int(batch["n_vis"][0])
-    assert ids[0] == tok.bos_token_id, "position 0 must be BOS"
-    sup = [i for i, lab in enumerate(labels) if lab != -100]
-    assert sup and sup[-1] == ids.index(tok.eos_token_id), "last supervised position must be EOS"
-    assert labels[sup[-1]] == tok.eos_token_id, "EOS must carry its own label"
-    assert all(labels[j] == -100 for j in range(sup[0])), \
-        "nothing before the answer span may carry labels (BOS/img/user excluded)"
-    assert all(i > 1 + nv for i in sup), "supervised positions must lie past the image span"
-    assert sup == list(range(sup[0], sup[-1] + 1)), "answer span must be contiguous"
-    assert batch["vis"].shape[-1] == VISION_DIM and batch["vis"].dtype == torch.float32
-
-
-def embeds_for(model, batch, proj, device):
-    """inputs_embeds-only injection (see module docstring): base rows from the
-    frozen embedding table, visual span overwritten by projected embeddings
-    (autograd flows through those rows to the projector)."""
-    ids = batch["input_ids"].to(device)
-    attn = batch["attention_mask"].to(device)
-    labels = batch["labels"].to(device)
-    out_dtype = next(model.parameters()).dtype
-    proj_dtype = next(proj.parameters()).dtype                       # projector's actual param dtype
-    with torch.no_grad():
-        base = model.get_input_embeddings()(ids).to(out_dtype)       # [B,L,H]
-    vis = batch["vis"].to(device).to(proj_dtype)                     # avoid mixed-dtype LayerNorm
-    pv = proj(vis).to(out_dtype)                                     # [B,maxv,H]
-    merged = base.clone()
-    for i, nv in enumerate(batch["n_vis"].tolist()):
-        merged[i, 1: 1 + nv] = pv[i, :nv]
-    return {"inputs_embeds": merged, "attention_mask": attn, "labels": labels}
+embeds_for = _core_embeds  # inputs_embeds-only injection; see core.py
 
 
 
-class ProbeMonitor:
-    """EMA loss stream + flat-loss plateau banners + >2x EMA-jump alerts."""
-
-    def __init__(self):
-        self.ema = None
-        self.prev_ema = None
-        self.history: deque = deque(maxlen=PLATEAU_WINDOW)
-        self.ema_history: deque = deque(maxlen=SPIKE_WINDOW)
-        self.last_banner_step = -(10 ** 9)
-        self.last_alert_step = -(10 ** 9)
-        self.n_alerts = 0
-        self.n_banners = 0
-        self.collapse_step = None          # first step where EMA halves vs plateau level
-
-    def update(self, step: int, loss: float, samples_seen: int) -> None:
-        self.prev_ema = self.ema
-        self.ema = loss if self.ema is None else EMA_BETA * self.ema + (1 - EMA_BETA) * loss
-        self.history.append(loss)
-        self.ema_history.append(self.ema)
-
-        # spike alert: EMA rises above SPIKE_FACTOR x its recent floor. A literal
-        # ">2x vs previous step" can never fire at beta=.98 (needs a >51x raw
-        # jump), so the meaningful signal is EMA detaching upward from its
-        # recent floor — a genuine divergence/blowup marker.
-        if (len(self.ema_history) >= SPIKE_MIN_HISTORY
-                and step - self.last_alert_step > 50
-                and self.ema > SPIKE_FACTOR * min(self.ema_history)):
-            print(f"[SPIKE-ALERT] step {step}: ema_loss {self.ema:.4f} > "
-                  f"{SPIKE_FACTOR:.0f}x recent floor "
-                  f"{min(self.ema_history):.4f}", flush=True)
-            self.last_alert_step = step
-            self.n_alerts += 1
-
-        # collapse detector: recent mean falls below half the window MEDIAN —
-        # the cliff the probe exists to timestamp. Median, not min: min tracks
-        # the collapse itself downward and would never trigger on a real cliff.
-        if self.collapse_step is None and len(self.history) >= PLATEAU_WINDOW:
-            base = statistics.median(self.history)
-            recent = sum(list(self.history)[-PLATEAU_CHECK_EVERY:]) / PLATEAU_CHECK_EVERY
-            if recent < 0.5 * base:
-                self.collapse_step = step
-                print(f"\n*** COLLAPSE *** step={step} samples_seen={samples_seen} "
-                      f"(recent-mean {recent:.4f} < 0.5 * window-median {base:.4f})\n",
-                      flush=True)
-
-        # spike: EMA jumped > SPIKE_FACTOR x vs previous step's EMA
-        if (self.prev_ema is not None and step - self.last_alert_step > 50
-                and self.ema > SPIKE_FACTOR * self.prev_ema):
-            print(f"[SPIKE-ALERT] step {step}: ema_loss {self.prev_ema:.4f} -> "
-                  f"{self.ema:.4f} (> {SPIKE_FACTOR:.0f}x jump)", flush=True)
-            self.last_alert_step = step
-            self.n_alerts += 1
-
-        # plateau banner: while loss is flat, keep saying WHY that's expected
-        if (step - self.last_banner_step >= PLATEAU_CHECK_EVERY
-                and len(self.history) >= PLATEAU_WINDOW):
-            old = self.history[0]
-            if old > 0 and abs(self.ema - old) / old < PLATEAU_REL_TOL:
-                print(
-                    "\n" + "=" * 74 + "\n"
-                    "[plateau] FLAT LOSS IS EXPECTED DURING THE GROK PHASE.\n"
-                    f"[plateau] reference: collapse at ~{SAMPLES_PER_BASETEN_GROK} samples_seen\n"
-                    "[plateau] (Baseten GLM-5.2 recipe: batch 64 / step ~900 / 66k imgs).\n"
-                    f"[plateau] current samples_seen={samples_seen} "
-                    f"({100 * samples_seen / SAMPLES_PER_BASETEN_GROK:.1f}% of reference)\n"
-                    "[plateau] keep going — do not restart because the curve looks dead.\n"
-                    + "=" * 74 + "\n",
-                    flush=True)
-                self.last_banner_step = step
-                self.n_banners += 1
+# Canonical in core.py (same banner text; reads _CFG for window/thresholds)
+ProbeMonitor = _CoreProbeMonitor
 
 
-def render_curves(records: list[dict], out_path: str) -> bool:
-    """Raw loss + EMA + LR (log-y), grad-norm below; secondary x-axis in
-    samples_seen on BOTH panels (telemetry contract: x in steps AND samples)."""
-    try:
-        import matplotlib
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as e:                     # charting must never kill training
-        print(f"[probe] chart import failed (ignored): {e}", flush=True)
-        return False
-    if not records:
-        return False
-
-    xs = [r["step"] for r in records]
-    ss = [r["samples_seen"] for r in records]
-
-    def secax(ax):
-        s2 = ax.secondary_xaxis("top", functions=(
-            lambda s: s * ss[-1] / max(1, xs[-1]),
-            lambda v: v * max(1, xs[-1]) / max(1, ss[-1])))
-        s2.set_xlabel("samples_seen")
-
-    fig, axes = plt.subplots(2, 1, figsize=(11, 8))
-    ax = axes[0]
-    ax.plot(xs, [r["loss"] for r in records], lw=0.4, alpha=0.35,
-            color="tab:blue", label="train loss (raw)")
-    ax.plot(xs, [r["ema_loss"] for r in records], lw=1.8, color="tab:blue",
-            label="loss EMA(.98)")
-    ax.plot(xs, [r["lr"] for r in records], lw=1.0, color="tab:purple", label="lr")
-    ax.set_yscale("log")
-    ax.set_ylabel("loss (log) / lr")
-    ax.set_xlabel("steps")
-    ax.set_title(f"grok-probe live curves — {len(records)} steps "
-                 f"| grok ref ~{SAMPLES_PER_BASETEN_GROK} samples")
-    ax.legend(loc="upper right", fontsize=8)
-    secax(ax)
-
-    ax = axes[1]
-    ax.plot(xs, [r["gnorm"] for r in records], lw=0.5, alpha=0.5,
-            color="tab:green", label="grad norm (pre-clip)")
-    ax.set_yscale("log")
-    ax.set_ylabel("||grad|| (log)")
-    ax.set_xlabel("steps")
-    ax.legend(loc="upper right", fontsize=8)
-    secax(ax)
-
-    fig.tight_layout()
-    fig.savefig(out_path, dpi=110)
-    plt.close(fig)
-    return True
-
-
-# ----------------------------- optim ----------------------------------------
-
-
-def lr_at(step: int, max_steps: int, base_lr: float = LR,
-          warmup: int = WARMUP_STEPS) -> float:
-    """Linear warmup then cosine decay to 10% of peak."""
-    if step <= warmup:
-        return base_lr * max(1, step) / warmup
-    t = min(1.0, (step - warmup) / max(1, max_steps - warmup))
-    return base_lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * t)))
-
-
-def train_step(model, proj, opt, batch, device, clip: float = GRAD_CLIP,
-               scaler=None) -> dict:
-    """One fwd/bwd/clip/step. Returns metrics; the caller does logging/I-O.
-
-    RAM-critical: we do NOT pass labels to the model. Full-sequence CE over
-    Qwen's 248,320-token vocab materializes [B, L, V] fp32 logits — ~20 GiB at
-    bs4/L~5000 (the exact OOM seen on a 15-GiB T4 and beside a 22-GiB CPU box).
-    Instead: run the backbone WITHOUT building full logits, gather hidden
-    states at supervised positions only (~tens of tokens), and apply lm_head
-    there. Loss value is IDENTICAL to model(labels=...) up to fp order.
-
-    fp16 stability: when scaler is provided (fp16 GPU path), the loss is scaled
-    before backward and unscaled before clip — without this, pure-fp16 grads
-    underflow to 0 / overflow to inf within a couple of steps. The scaler skips
-    its own step on bad batches; we surface that as finite=False."""
-    import torch.nn.functional as F
-    t0 = time.time()
-    amp_dtype = None
-    if device == "cuda" and next(model.parameters()).dtype == torch.float32:
-        # fp16-GPU true-AMP path: backbone weights are fp32; autocast runs
-        # matmuls/convs in fp16 (softmax/LayerNorm stay fp32 automatically)
-        amp_dtype = torch.float16
-    inp = embeds_for(model, batch, proj, device)
-    labels = inp.pop("labels")
-    base = model.model                                # Qwen3_5TextModel (no lm_head)
-    with torch.autocast("cuda", dtype=amp_dtype,
-                        enabled=amp_dtype is not None):
-        out = base(inputs_embeds=inp["inputs_embeds"],
-                   attention_mask=inp["attention_mask"])
-        hidden = out.last_hidden_state                # [B,L,H]
-
-        # supervised position p predicts token p+1 => hidden[:, :-1] vs labels[:, 1:]
-        shift_labels = labels[:, 1:]
-        mask = shift_labels != -100                   # [B, L-1]
-        pos = mask.nonzero(as_tuple=False)            # [N, 2] rows of (b, p)
-        h_sel = hidden[:, :-1][pos[:, 0], pos[:, 1]]  # [N, H]
-        y_sel = shift_labels[pos[:, 0], pos[:, 1]]    # [N]
-
-        logits_sel = model.lm_head(h_sel).float()     # [N, V] — tiny now
-    loss = F.cross_entropy(logits_sel, y_sel)         # fp32 CE outside autocast
-
-    params = list(proj.parameters())
-    if scaler is not None:
-        scaled_loss = scaler.scale(loss)
-        opt.zero_grad(set_to_none=True)
-        scaled_loss.backward()
-        scaler.unscale_(opt)
-        gnorm = float(nn.utils.clip_grad_norm_(params, clip))
-        # GradScaler.step silently SKIPS the update on inf/NaN grads; the
-        # pre-clip norm is then nan/inf. Skip the (no-op) step explicitly so
-        # telemetry reflects reality, and mark the batch non-finite.
-        step_skipped = math.isnan(gnorm) or math.isinf(gnorm)
-        if not step_skipped:
-            scaler.step(opt)
-        scaler.update()
-        finite = not step_skipped
-    else:
-        finite = bool(torch.isfinite(loss))
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        gnorm = float("nan") if not finite else \
-            float(nn.utils.clip_grad_norm_(params, clip))
-        if finite:
-            opt.step()
-    return {"loss": float(loss.item()), "finite": finite,
-            "gnorm": gnorm,
-            "tokens": int(batch["attention_mask"].sum()),
-            "batch_size": int(batch["input_ids"].shape[0]),
-            "step_ms": round((time.time() - t0) * 1000, 1)}
+# Canonical implementations in vision_adapter/core.py (same curves, LR, selective loss)
+render_curves = _core_render_curves
+lr_at = _core_lr_at
+train_step = _core_train_step_qwen
 
 
 def save_projector(proj, opt, step: int, path: str) -> None:
