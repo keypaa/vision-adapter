@@ -45,31 +45,24 @@ from __future__ import annotations
 import argparse
 import io
 import json
-import math
 import multiprocessing as mp
 import os
-import statistics
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import deque
 
 import numpy as np
 import torch
-import torch.nn as nn
 from vision_adapter.config import colab_probe_config as _colab_probe_config, config_header as _config_header  # single source of truth
 from vision_adapter.core import (  # single shared training core — see vision_adapter/core.py
     HourglassProjector as _CoreHourglass,
     ProbeMonitor as _CoreProbeMonitor,
-    TrainMonitor as _CoreTrainMonitor,
     check_collate_invariants as _core_check,
     embeds_for as _core_embeds,
     lr_at as _core_lr_at,
     make_collate as _core_make_collate,
     render_curves as _core_render_curves,
-    render_train_curves as _core_render_train_curves,
     train_step_qwen as _core_train_step_qwen,
-    visual_inject as _CoreVisualInject,
 )
 
 _T0 = time.time()

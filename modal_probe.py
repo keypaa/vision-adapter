@@ -36,11 +36,8 @@ Options: --gpu l4|a100  --batch-size 16  --sample-size 0(full)|N  --resume
 from __future__ import annotations
 
 import json
-import math
 import os
-import statistics
 import time
-from collections import deque
 
 import modal
 from vision_adapter.config import probe_config as _probe_config, config_header as _config_header  # noqa: E402
@@ -193,7 +190,7 @@ def load_backbone(limit_layers: int | None, device: str,
 
 # Canonical in vision_adapter/core.py (same collate + injection + LR + monitor)
 def make_collate(tok, pad_id: int, max_len: int = MAX_SEQ_LEN):
-    return _core_make_collate(tok, pad_id, max_len=max_len, vision_dim=VISION_DIM if 'VISION_DIM' in dir() else 4096)
+    return _core_make_collate(tok, pad_id, max_len=max_len, vision_dim=4096)
 
 check_collate_invariants = _core_check
 embeds_for = _core_embeds
