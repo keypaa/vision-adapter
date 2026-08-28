@@ -12,4 +12,6 @@ pack.log
 *.log
 probe_log.jsonl
 probe_log*.jsonl
+runs.jsonl
+runs*.jsonl
 session-export-*.jsonl

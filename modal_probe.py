@@ -621,6 +621,9 @@ def train(batch_size: int = DEFAULT_BS,
               os.path.join(VOLUME_DIR, FINAL_PATH))
     render_curves(records, os.path.join(log_dir, CURVES_PNG))
     final_loss = records[-1]["loss"] if records else float("nan")
+    elapsed = max(1e-9, time.time() - t0)
+    avg_step_ms = round(sum(r.get("step_ms", 0) for r in records) / max(1, len(records)), 1) if records else None
+    wall_min = round((time.time() - t0) / 60, 1)
     logger.write(json.dumps({
         "type": "run_end", "run_id": probe_run_id,
         "args": {"batch_size": bs, "max_steps": max_steps, "sample_size": sample_size,
@@ -630,7 +633,22 @@ def train(batch_size: int = DEFAULT_BS,
         "collapse_step": monitor.collapse_step,
         "collapse_samples_seen": (monitor.collapse_step or 0) * bs,
         "n_alerts": monitor.n_alerts, "n_banners": monitor.n_banners,
-        "wall_min": round((time.time() - t0) / 60, 1)}) + "\n")
+        "wall_min": wall_min, "avg_step_ms": avg_step_ms,
+        "samples_per_sec": round(samples_seen / elapsed, 1) if elapsed else None,
+        "tokens_per_sec": round(sum(r.get("tokens", 0) for r in records) / elapsed, 1) if elapsed else None}) + "\n")
+    try:
+        from vision_adapter.config import get_git_sha as _gga2
+        from vision_adapter.registry import append_registry as _ap2, registry_entry as _re2
+        _reg2 = _re2(run_id=probe_run_id, git_sha=_gga2(), config=_CFG_PROBE.to_dict(),
+                     seed=17, device="cuda", dtype="bfloat16",
+                     step_ms=avg_step_ms, wall_min=wall_min,
+                     samples_per_sec=round(samples_seen / elapsed, 1) if elapsed else None,
+                     tokens_per_sec=round(sum(r.get("tokens", 0) for r in records) / elapsed, 1) if elapsed else None,
+                     final_loss=final_loss,
+                     extra={"run": "modal_probe", "gpu": want_gpu})
+        _ap2(os.path.join(log_dir, "runs.jsonl"), _reg2)
+    except Exception:
+        pass
     logger.close()
     vol.commit()
     print(f"[probe] DONE step={step} samples_seen={samples_seen} "

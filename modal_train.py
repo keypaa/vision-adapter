@@ -570,20 +570,40 @@ def _train_impl(offload: bool):
     print(f"[train] projector params={n_params/1e6:.2f}M | "
           f"grok window ≈ step {grok_lo}-{grok_hi} @ bs{int(BATCH_SIZE)} "
           f"(~{SAMPLES_PER_BASETEN_GROK} samples == Baseten's step-900 batch-64 recipe)")
-    _log(logger, _config_header(
-        _CFG_DEFAULT,
-        manifest_path=os.path.join(VOLUME_DIR, DATASET_MANIFEST_REL),
-        extra={
-            "type": "run_start", "ts": round(time.time(), 1),
-            "steps_total": steps_total,
-            "n_trainable_params": n_params,
-            "backbone": DS_REPO, "projector_src": MOONVIT_REPO,
-            "train_manifest": DATASET_MANIFEST_REL,
-            "val_manifest": VAL_MANIFEST_REL,
-            "opt": "adamw(0.9,0.95)",
-            "gpu": GPU, "torch": torch.__version__,
-            "grok_window_steps": [grok_lo, grok_hi],
-        }))
+    train_run_id = None
+    try:
+        _hdr0 = _config_header(
+            _CFG_DEFAULT,
+            manifest_path=os.path.join(VOLUME_DIR, DATASET_MANIFEST_REL),
+            extra={
+                "type": "run_start", "ts": round(time.time(), 1),
+                "steps_total": steps_total,
+                "n_trainable_params": n_params,
+                "backbone": DS_REPO, "projector_src": MOONVIT_REPO,
+                "train_manifest": DATASET_MANIFEST_REL,
+                "val_manifest": VAL_MANIFEST_REL,
+                "opt": "adamw(0.9,0.95)",
+                "gpu": GPU, "torch": torch.__version__,
+                "grok_window_steps": [grok_lo, grok_hi],
+            })
+        train_run_id = _hdr0.get("run_id")
+        _log(logger, _hdr0)
+    except Exception:
+        train_run_id = None
+        _log(logger, _config_header(
+            _CFG_DEFAULT,
+            manifest_path=os.path.join(VOLUME_DIR, DATASET_MANIFEST_REL),
+            extra={
+                "type": "run_start", "ts": round(time.time(), 1),
+                "steps_total": steps_total,
+                "n_trainable_params": n_params,
+                "backbone": DS_REPO, "projector_src": MOONVIT_REPO,
+                "train_manifest": DATASET_MANIFEST_REL,
+                "val_manifest": VAL_MANIFEST_REL,
+                "opt": "adamw(0.9,0.95)",
+                "gpu": GPU, "torch": torch.__version__,
+                "grok_window_steps": [grok_lo, grok_hi],
+            }))
 
     def _on_alert(rec):
         # snapshot the pre-spike weights so a blowup is recoverable without
@@ -676,9 +696,33 @@ def _train_impl(offload: bool):
     torch.save(proj.state_dict(), os.path.join(VOLUME_DIR, CKPT_DIR_REL, "projector_final.safetensors"))
     render_curves(records, os.path.join(VOLUME_DIR, LOG_DIR_REL, "train_curves.png"),
                   grok_lo=grok_lo, grok_hi=grok_hi)
-    _log(logger, {"type": "run_end", "step": step, "samples_seen": samples_seen,
+    wall_min = round((time.time() - t0) / 60, 1)
+    elapsed = max(1e-9, time.time() - t0)
+    avg_step_ms = round(sum(r.get("step_ms", 0) for r in records if r.get("type") == "train") / max(1, len([r for r in records if r.get("type") == "train"])), 1) if records else None
+    _log(logger, {"type": "run_end", "run_id": train_run_id, "step": step, "samples_seen": samples_seen,
                   "tokens_seen": tokens_seen, "n_alerts": monitor.n_alerts,
-                  "wall_min": round((time.time() - t0) / 60, 1), "ts": round(time.time(), 1)})
+                  "wall_min": wall_min, "avg_step_ms": avg_step_ms,
+                  "samples_per_sec": round(samples_seen / elapsed, 1) if elapsed else None,
+                  "tokens_per_sec": round(tokens_seen / elapsed, 1) if elapsed else None,
+                  "ts": round(time.time(), 1)})
+    # Best-effort one-line registry for cross-run comparison (lean step 5).
+    try:
+        from vision_adapter.registry import append_registry, registry_entry
+        _reg = registry_entry(
+            run_id=train_run_id, git_sha=_config_header(_CFG_DEFAULT, manifest_path=os.path.join(VOLUME_DIR, DATASET_MANIFEST_REL)).get("git_sha"),
+            config=_CFG_DEFAULT.to_dict(),
+            manifest_sha256=_config_header(_CFG_DEFAULT, manifest_path=os.path.join(VOLUME_DIR, DATASET_MANIFEST_REL)).get("manifest_sha256"),
+            manifest_rows=_config_header(_CFG_DEFAULT, manifest_path=os.path.join(VOLUME_DIR, DATASET_MANIFEST_REL)).get("manifest_rows"),
+            shard_set_hash=None, seed=None, device="cuda", dtype="bfloat16",
+            step_ms=avg_step_ms, wall_min=wall_min,
+            samples_per_sec=round(samples_seen / elapsed, 1) if elapsed else None,
+            tokens_per_sec=round(tokens_seen / elapsed, 1) if elapsed else None,
+            final_loss=records[-1]["loss"] if records else None,
+            extra={"run": "modal_train", "gpu": GPU if offload else B300_GPU, "offload": offload},
+        )
+        append_registry(os.path.join(VOLUME_DIR, LOG_DIR_REL, "runs.jsonl"), _reg)
+    except Exception:
+        pass
     vol.commit()
     logger.close()
     print(f"[train] DONE after {step} steps | alerts={monitor.n_alerts} "

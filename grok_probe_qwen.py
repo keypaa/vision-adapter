@@ -1021,6 +1021,9 @@ def main():
     save_projector(proj, None, step, os.path.join(args.out_dir, FINAL_PATH))
     render_curves(records, curves_path)
     final_loss = records[-1]["loss"] if records else float("nan")
+    wall_min = round((time.time() - t0) / 60, 1)
+    elapsed = max(1e-9, time.time() - t0)
+    avg_step_ms = round(sum(r.get("step_ms", 0) for r in records) / max(1, len(records)), 1) if records else None
     logger.write(json.dumps({
         "type": "run_end", "run_id": probe_run_id, "args": vars(args),
         "step": step, "samples_seen": samples_seen,
@@ -1028,7 +1031,25 @@ def main():
         "collapse_step": monitor.collapse_step,
         "collapse_samples_seen": (monitor.collapse_step or 0) * args.batch_size,
         "n_alerts": monitor.n_alerts, "n_banners": monitor.n_banners,
-        "wall_min": round((time.time() - t0) / 60, 1)}) + "\n")
+        "wall_min": wall_min, "avg_step_ms": avg_step_ms,
+        "samples_per_sec": round(samples_seen / elapsed, 1) if elapsed else None,
+        "tokens_per_sec": round(sum(r.get("tokens", 0) for r in records) / elapsed, 1) if elapsed else None}) + "\n")
+    # Best-effort one-line registry for cross-run comparison (lean step 5).
+    try:
+        from vision_adapter.config import get_git_sha as _gga
+        from vision_adapter.registry import append_registry, registry_entry
+        reg = registry_entry(
+            run_id=probe_run_id, git_sha=_gga(), config=_CFG.to_dict(),
+            seed=args.seed, device=device, dtype=str(dtype),
+            step_ms=avg_step_ms, wall_min=wall_min,
+            tokens_per_sec=round(sum(r.get("tokens", 0) for r in records) / elapsed, 1) if elapsed else None,
+            samples_per_sec=round(samples_seen / elapsed, 1) if elapsed else None,
+            final_loss=final_loss,
+            extra={"run": "grok_probe_qwen", "model": args.model},
+        )
+        append_registry(os.path.join(args.out_dir, "runs.jsonl"), reg)
+    except Exception:
+        pass
     logger.close()
     push_bundle(args.out_dir, ckpts, step)
     print(f"[probe] DONE step={step} samples_seen={samples_seen} "
