@@ -33,6 +33,10 @@ class DataBackend(Protocol):
         """Read raw bytes (for generic files)."""
         ...
 
+    def write_bytes(self, path: str, data: bytes) -> None:
+        """Write raw bytes."""
+        ...
+
 
 def get_backend(name: str, **kwargs) -> DataBackend:
     """Factory: "local" | "modal". Extra kwargs forwarded to backend ctor.

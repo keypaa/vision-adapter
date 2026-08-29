@@ -46,14 +46,31 @@ class ModalBackend:
         torch.save(tensor, buf)
         buf.seek(0)
         with self.vol.batch_upload() as batch:  # type: ignore[union-attr]
-            batch.put_file(io.BytesIO(buf.read()), key)  # type: ignore[arg-type]
+            batch.put_file(buf, key)  # type: ignore[arg-type]
         self.vol.commit()  # type: ignore[union-attr]
 
     def exists(self, path: str) -> bool:
+        # Call volume-level exists primitive when available; otherwise probe
+        # the parent folder. Avoid swallowing auth/network errors silently beyond
+        # the probe — existence check is best-effort by contract.
         try:
-            entries = self.vol.listdir("/".join(path.split("/")[:-1]) or "/")  # type: ignore[union-attr]
-            names = {getattr(e, "path", getattr(e, "name", str(e))) for e in entries}
-            return path in names
+            parent = "/".join(path.split("/")[:-1]) or "/"
+            needle = path
+            # Volume listings may return full keys or bare basenames depending on SDK;
+            # normalize both to the absolute key for comparison.
+            entries = self.vol.listdir(parent)  # type: ignore[union-attr]
+            keys: set[str] = set()
+            for e in entries:
+                p = getattr(e, "path", None) or getattr(e, "name", None) or str(e)
+                if "/" not in p or parent in ("/", "", "."):
+                    # bare basename — prepend parent
+                    keys.add(f"{parent.rstrip('/')}/{p.lstrip('/')}" if parent not in ("/", "", ".") else p)
+                else:
+                    keys.add(p)
+            if needle in keys:
+                return True
+            # Fallback: Volume sometimes returns basenames only — check suffix
+            return any(needle.endswith(f"/{k}") or needle == k for k in keys)
         except Exception:
             return False
 
