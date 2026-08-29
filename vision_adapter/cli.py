@@ -6,7 +6,25 @@ import sys
 from pathlib import Path
 
 
+def _resolve_hf_token(args: argparse.Namespace) -> str | None:
+    """Resolve HF token: --hf-token > $HF_TOKEN > $HUGGING_FACE_HUB_TOKEN > Colab userdata.
+
+    Does NOT assume Colab — userdata is best-effort. Returned token is also
+    exported to os.environ so downstream huggingface_hub / datasets pick it up.
+    """
+    from vision_adapter.backends.auth import get_hf_token, set_hf_token_env
+
+    tok = get_hf_token(getattr(args, "hf_token", None))
+    set_hf_token_env(tok)
+    if tok:
+        print("[vision-adapter] HF token: present (auth enabled)", flush=True)
+    else:
+        print("[vision-adapter] HF token: absent (anonymous, lower rate limits)", flush=True)
+    return tok
+
+
 def dataset_cmd(args: argparse.Namespace) -> int:
+    _resolve_hf_token(args)
     from vision_adapter.backends.base import get_backend
     from vision_adapter.data.dataset import build_dataset
 
@@ -28,6 +46,7 @@ def dataset_cmd(args: argparse.Namespace) -> int:
 
 
 def precompute_cmd(args: argparse.Namespace) -> int:
+    _resolve_hf_token(args)
     # GPU-gated: precompute runs CUDA kernels; fail fast on CPU with nvidia-smi hint.
     if not getattr(args, "dryrun", False) and getattr(args, "device", "cuda") == "cuda":
         from vision_adapter.backends.gpu import require_gpu
@@ -49,6 +68,7 @@ def precompute_cmd(args: argparse.Namespace) -> int:
 
 
 def pack_cmd(args: argparse.Namespace) -> int:
+    _resolve_hf_token(args)
     from vision_adapter.backends.base import get_backend
 
     # Pack is backend-agnostic when data_dir is local; Modal uses Volume directly.
@@ -65,6 +85,7 @@ def pack_cmd(args: argparse.Namespace) -> int:
 
 
 def train_cmd(args: argparse.Namespace) -> int:
+    _resolve_hf_token(args)
     dryrun = getattr(args, "dryrun", False)
     # GPU-gated: real train (not --dryrun) needs CUDA; --dryrun is CPU-safe.
     if not dryrun:
@@ -154,6 +175,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=54000, help="max rows")
     p.add_argument("--upstream-pin", default=None, help="upstream pin")
     p.add_argument("--dry-run", dest="dry_run", action="store_true", help="dry-run: generate fake rows, no HF I/O")
+    p.add_argument("--hf-token", default=None, help="HF token (or set HF_TOKEN env) — higher rate limits for HF downloads")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
@@ -167,6 +189,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir", default="data", help="data directory")
     p.add_argument("--patch-cap", type=int, default=None, help="max patches per image")
     p.add_argument("--device", default="cuda", help="torch device")
+    p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
@@ -181,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir", default="data", help="data directory")
     p.add_argument("--shard-rows", type=int, default=1360, help="rows per shard")
     p.add_argument("--hf-repo", default=None, help="hf repo id")
+    p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
@@ -201,6 +225,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="train config preset",
     )
     p.add_argument("--max-steps", type=int, default=None, help="max training steps")
+    p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
@@ -214,6 +239,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = subs.add_parser("probe", help="alias for train --config colab")
     p.add_argument("--data-dir", default="data", help="data directory")
     p.add_argument("--max-steps", type=int, default=None, help="max training steps")
+    p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
