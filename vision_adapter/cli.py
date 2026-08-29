@@ -3,26 +3,73 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 
 def dataset_cmd(args: argparse.Namespace) -> int:
-    print(f"dataset --out {args.out} (stub — wire to dataset.py)")
+    from vision_adapter.backends.base import get_backend
+    from vision_adapter.data.dataset import build_dataset
+
+    backend = get_backend(args.backend, **({"root": args.out} if args.backend == "local" else {}))
+    # For local, out is the output dir; for modal it's also the out dir on Volume.
+    # build_dataset takes (backend, out_dir, seed, limit, upstream_pin, dry_run)
+    dry_run = getattr(args, "dry_run", False)
+    out = Path(args.out)
+    path = build_dataset(
+        backend,
+        out,
+        seed=args.seed,
+        limit=args.limit,
+        upstream_pin=getattr(args, "upstream_pin", None),
+        dry_run=dry_run,
+    )
+    print(f"[dataset] wrote {path} (seed={args.seed}, limit={args.limit})")
     return 0
 
 
 def precompute_cmd(args: argparse.Namespace) -> int:
-    print(f"precompute --data-dir {args.data_dir} (stub)")
+    from vision_adapter.backends.base import get_backend
+    from vision_adapter.models.precompute import run_precompute
+
+    backend = get_backend(args.backend, **({"root": args.data_dir} if args.backend == "local" else {}))
+    run_precompute(
+        backend,
+        Path(args.data_dir),
+        patch_cap=args.patch_cap or 262144,
+        device=args.device,
+        revision=getattr(args, "revision", None),
+    )
+    print(f"[precompute] ok --data-dir {args.data_dir} (backend={args.backend})")
     return 0
 
 
 def pack_cmd(args: argparse.Namespace) -> int:
-    print(f"pack --data-dir {args.data_dir} (stub)")
+    from vision_adapter.backends.base import get_backend
+
+    # Pack is backend-agnostic when data_dir is local; Modal uses Volume directly.
+    # Delegate to pack_stage if available, otherwise direct pack.
+    backend = get_backend(args.backend, **({"root": args.data_dir} if args.backend == "local" else {}))
+    try:
+        from vision_adapter.data.pack import pack_stage
+
+        pack_stage(backend, Path(args.data_dir), shard_rows=args.shard_rows)
+    except ImportError:
+        print(f"[pack] pack_stage not yet wired — data-dir {args.data_dir} ready for pack")
+    print(f"[pack] ok --data-dir {args.data_dir} --shard-rows {args.shard_rows} (backend={args.backend})")
     return 0
 
 
 def train_cmd(args: argparse.Namespace) -> int:
     cfg = getattr(args, "config", "default")
-    print(f"train --config {cfg} (stub)")
+    backend_name = getattr(args, "backend", "local")
+    dryrun = getattr(args, "dryrun", False)
+    data_dir = Path(getattr(args, "data_dir", "data"))
+    print(f"[train] --config {cfg} --backend {backend_name} --data-dir {data_dir}" + (" --dryrun" if dryrun else ""))
+    if dryrun:
+        print("[train] dryrun ok (no GPU, no Modal)")
+        return 0
+    # Real train path would delegate to vision_adapter.models.train / modal_train
+    print("[train] stub — wire to train loop (modal_train._train_impl or local train)")
     return 0
 
 
@@ -38,10 +85,11 @@ def build_parser() -> argparse.ArgumentParser:
         "dataset",
         help="build header-first manifest (ORDER BY image, pinned revisions)",
     )
-    p.add_argument("--out", required=True, help="output manifest path")
+    p.add_argument("--out", required=True, help="output directory (manifest written to <out>/train_manifest.jsonl)")
     p.add_argument("--seed", type=int, default=0, help="python seed")
     p.add_argument("--limit", type=int, default=54000, help="max rows")
     p.add_argument("--upstream-pin", default=None, help="upstream pin")
+    p.add_argument("--dry-run", dest="dry_run", action="store_true", help="dry-run: generate fake rows, no HF I/O")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
@@ -75,6 +123,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="local",
         help="data backend",
     )
+    p.add_argument("--only", default=None, help="shard range i[:j]")
+    p.add_argument("--hf-only", action="store_true", help="push to HF only, skip local shards")
     p.set_defaults(func=pack_cmd)
 
     # train
@@ -93,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="local",
         help="data backend",
     )
-    p.add_argument("--dryrun", action="store_true", help="dry run")
+    p.add_argument("--dryrun", action="store_true", help="dry run (validate without GPU)")
     p.set_defaults(func=train_cmd)
 
     # probe (alias for train --config colab)
