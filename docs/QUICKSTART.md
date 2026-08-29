@@ -1,5 +1,7 @@
 # QUICKSTART — from zero to a trained projector
 
+> Clone: `git clone https://github.com/keypaa/vision-adapter.git && cd vision-adapter` — note: folder is **lowercase** `vision-adapter`, not `Vision-Adapter`.
+
 This is the end-to-end, copy-pasteable path. Each step lists what it does, how
 long it takes, and how to verify it succeeded.
 
@@ -8,7 +10,8 @@ long it takes, and how to verify it succeeded.
 ## Prereqs (one-time)
 
 ```bash
-pip install torch pyarrow pillow huggingface_hub
+pip install -e .            # base: torch, pyarrow, pillow
+pip install -e ".[train]"   # training: transformers, safetensors, accelerate, sentencepiece
 # optional for Modal backend:
 pip install modal
 modal token new            # opens browser; links your Modal account

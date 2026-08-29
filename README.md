@@ -18,6 +18,14 @@ DeepSeek-V4-Flash (304B frozen, 155 GiB FP8/int8) <── spliced embeddings ─
 
 Staged CLI: python -m vision_adapter {dataset,precompute,pack,train,probe}  — see docs/PIPELINE.md for the exact rebuild commands.
 
+```bash
+git clone https://github.com/keypaa/vision-adapter.git
+cd vision-adapter
+pip install -e .            # base: torch, pyarrow, pillow
+pip install -e ".[train]"   # training deps: transformers, safetensors, accelerate, sentencepiece
+# any CUDA GPU works (T4, L4, A100, 4090…); dataset/pack run on CPU, train/precompute require GPU
+```
+
 ## Layout
 
 | Path | Role |
@@ -53,7 +61,7 @@ reproducible copy of the same tensors.
 python -m vision_adapter dataset --out ./data --seed 0
 python -m vision_adapter precompute --data-dir ./data --revision <sha>
 python -m vision_adapter pack --data-dir ./data --hf-only        # or --only 0:2
-python -m vision_adapter train --data-dir ./data --config default  # dryrun gate first
+python -m vision_adapter train --data-dir ./data --config default --dryrun  # dryrun: CPU-safe, no GPU needed
 python -m vision_adapter probe --data-dir ./data                  # alias for train --config colab
 # Modal: same, --backend modal
 # Legacy shims still at root during transition: modal run modal_train.py::train_dryrun
