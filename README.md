@@ -16,19 +16,24 @@ image ──[preprocess]──> MoonViT-V2 (401M frozen) ──[2×2 merge]─�
 DeepSeek-V4-Flash (304B frozen, 155 GiB FP8/int8) <── spliced embeddings ──┘
 ```
 
+Staged CLI: python -m vision_adapter {dataset,precompute,pack,train,probe}  — see docs/PIPELINE.md for the exact rebuild commands.
+
 ## Layout
 
 | Path | Role |
 |---|---|
-| `moonvit.py` | Standalone MoonViT-V2 forward (matches Kimi bit-exact) |
-| `preprocess.py` | navit_resize + 0.5/0.5 normalize + patchify |
-| `build_agentic_images.py` | reconstructs agentic screenshots/UI frames from upstream HF sources |
-| `modal_pipeline.py` | Modal: ETL → train-manifest → (A100) MoonViT precompute → I/O bench → parquet pack |
-| `local_pack.py` | Laptop-side resumable packer: volume `.pt` → parquet shards → HF (`--hf-only`) |
-| `modal_train.py` | Modal: dry-run memory gate + SFT trainer (A100 80GB) with live telemetry |
-| `precompute_colab.py` | Same precompute on a free Colab T4 (resumable) |
-| `extract_moonvit_v2.py` | One-off: pulled MoonViT-V2 out of Kimi-K3 |
-| `docs/` | Architecture, data, operations, quickstart, telemetry, training plan |
+| `vision_adapter/` | single package — config, core, manifest, registry, cli, backends, data, models |
+| `vision_adapter/cli.py` | sole entrypoint `python -m vision_adapter {dataset,precompute,pack,train,probe}` |
+| `vision_adapter/config.py` | frozen TrainConfig + config_header provenance |
+| `vision_adapter/core.py` | HourglassProjector + collate + inject + monitors |
+| `vision_adapter/manifest.py` | header-first manifest I/O + ORDER BY determinism |
+| `vision_adapter/registry.py` | runs.jsonl experiment registry |
+| `vision_adapter/data/{agentic,cauldron,dataset,pack}.py` | staged data (positional join, ORDER BY image) |
+| `vision_adapter/models/{moonvit,preprocess,precompute}.py` | MoonViT forward + navit_resize + shared precompute |
+| `vision_adapter/backends/{base,local,modal}.py` | DataBackend local\|modal |
+| `tests/` | 9 test files (collate, pack, preprocess, probe, telemetry, backends, cli, dataset, docs) |
+| `docs/PIPELINE.md` | rebuild manual — exact commands per stage |
+| `docs/` | QUICKSTART, ARCHITECTURE, DATA, TELEMETRY, OPERATIONS, HF_PUBLISH |
 
 ## Data on HuggingFace
 
@@ -45,31 +50,21 @@ reproducible copy of the same tensors.
 ## TL;DR run order
 
 ```bash
-# 1. extract + publish the vision tower (done; weights on keypa/MoonViT-V2-Standalone)
-python3 extract_moonvit_v2.py            # PUSH=1 to re-upload
-
-# 2. build the 79k-image agentic corpus + cauldron manifest on Modal
-modal run modal_pipeline.py::etl
-modal run modal_pipeline.py::build_train_manifest
-
-# 3a. precompute vision embeddings on the A100 (fast), OR
-modal run modal_pipeline.py::precompute
-# 3b. … precompute free on Colab T4 across 4h sessions (see docs/QUICKSTART.md)
-
-# 4. publish the embedding corpus as parquet (resumable; runs on a laptop)
-python local_pack.py --hf-only           # or --only i[:j] for a range
-
-# 5. memory gate, then train
-modal run modal_train.py::train_dryrun   # must print "MEMORY GATE PASS"
-modal run modal_train.py::train          # live curves: modal volume get vision-adapter-data logs/train_curves.png
+python -m vision_adapter dataset --out ./data --seed 0
+python -m vision_adapter precompute --data-dir ./data --revision <sha>
+python -m vision_adapter pack --data-dir ./data --hf-only        # or --only 0:2
+python -m vision_adapter train --data-dir ./data --config default  # dryrun gate first
+python -m vision_adapter probe --data-dir ./data                  # alias for train --config colab
+# Modal: same, --backend modal
+# Legacy shims still at root during transition: modal run modal_train.py::train_dryrun
 ```
 
 ## Tests
 
 ```bash
-source .venv/bin/activate
-python -m pytest -q        # 36 tests: preprocess contract, pack/resume logic,
-                           # training data contract (collate/inject), telemetry analytics
+python -m pytest -q  # 61 tests: preprocess, pack/resume, collate/inject, telemetry, backends, cli, dataset, docs lint
 ```
+
+`testpaths = ["tests"]` in `pyproject.toml`; console script `vision-adapter` (`vision_adapter.cli:main`) installed via `pip install -e .`.
 
 Full step-by-step with exact prerequisites: **`docs/QUICKSTART.md`**.
