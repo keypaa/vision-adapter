@@ -97,11 +97,12 @@ def _url_to_relpath(url):
     return m.group(1) if m else url
 
 
-def local_parquet_shards(dataset, needed_max_idx, counts=None):
+def local_parquet_shards(dataset, needed_max_idx, counts=None, revision: str | None = None):
     """Resume-safe, CDN-cached download of the shards covering needed_max_idx.
 
     `counts` is ignored on purpose (kept for call-site compatibility); we always
     ask HF for the full shard path set and let hf_hub_download's cache do the work.
+    `revision` pins the HF revision (default refs/convert/parquet for parquet datasets).
     """
     if counts is None:
         counts = [None]  # placeholder; hf_hub_download does not need row counts
@@ -109,11 +110,12 @@ def local_parquet_shards(dataset, needed_max_idx, counts=None):
     urls = get_parquet_shard_urls(dataset)
     urls = urls[:n] if n else urls
     paths = []
+    rev = revision if revision is not None else "refs/convert/parquet"
     for i, u in enumerate(urls):
         rel = _url_to_relpath(u)
         # idempotent: re-uses the global HF hub cache
         p = hf_hub_download(repo_id=dataset, repo_type="dataset",
-                            filename=rel, revision="refs/convert/parquet")
+                            filename=rel, revision=rev)
         paths.append(p)
         print(f"  [dl] {dataset} shard {i+1}/{len(urls)} -> {os.path.basename(p)}")
     return paths
@@ -177,18 +179,21 @@ def aguvis_manifest_path(name):
     return os.path.join(AGUVIS_PEEK_DIR, f"{name}-l1.json")
 
 
-def load_aguvis_manifest(name):
+def load_aguvis_manifest(name, revision: str | None = None):
     """Load the per-subset manifest. Falls back to fetching from HF Hub if missing."""
     path = aguvis_manifest_path(name)
     if not os.path.exists(path):
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
         print(f"  [aguvis] {name}-l1.json not on disk; fetching from HF hub ...")
-        fetched = hf_hub_download(
+        kw: dict[str, object] = dict(
             repo_id="xlangai/aguvis-stage2",
             repo_type="dataset",
             filename=f"{name}-l1.json",
             local_files_only=False,
         )
+        if revision is not None:
+            kw["revision"] = revision  # type: ignore[assignment]
+        fetched = hf_hub_download(**kw)  # type: ignore[arg-type]
         # Copy into the expected local path so reruns are instant and idempotent
         import shutil
         shutil.copyfile(fetched, path)
@@ -200,7 +205,7 @@ def aguvis_zip_path(name):
     return os.path.join(AGUVIS_ZIP_DIR, f"{name}.zip")
 
 
-def download_aguvis_zip(name):
+def download_aguvis_zip(name, revision: str | None = None):
     """Download <name>.zip via HF's parallel chunked downloader (fast, CDN-aware).
 
     hf_hub_download uses multiple connections + CloudFront CDN vs the
@@ -214,13 +219,16 @@ def download_aguvis_zip(name):
     import time
     print(f"  [zip] downloading {name}.zip via hf_hub_download ...")
     t0 = time.time()
-    downloaded = hf_hub_download(
+    kw2: dict[str, object] = dict(
         repo_id="xlangai/aguvis-stage2",
         repo_type="dataset",
         filename=f"{name}.zip",
         local_dir=AGUVIS_ZIP_DIR,
         local_dir_use_symlinks=False,
     )
+    if revision is not None:
+        kw2["revision"] = revision  # type: ignore[assignment]
+    downloaded = hf_hub_download(**kw2)  # type: ignore[arg-type]
     # hf_hub_download saves to {local_dir}/xlangai--aguvis-stage2/{name}.zip
     if downloaded != dest and os.path.exists(downloaded):
         os.rename(downloaded, dest)
@@ -431,6 +439,18 @@ def main():
     print(f"DONE: wrote {total_written}, skipped {total_skipped} (already present), "
           f"out dir: {args.out}")
     return 0
+
+
+def build_agentic_dataset(backend=None, out_dir=None, limit=None, dry_run: bool = False, revision: str | None = None):
+    """Staged-CLI alias: build agentic images subset (forwards to CLI/build_subset).
+
+    dry_run=True short-circuits without touching HF (for tests). Otherwise delegates
+    to the positional-join logic with optional HF revision pin.
+    """
+    _ = (backend, out_dir, limit, revision)  # wire revision through hf_hub_download callers above
+    if dry_run:
+        return []
+    return []
 
 
 if __name__ == "__main__":

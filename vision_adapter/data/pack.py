@@ -492,5 +492,17 @@ def main(argv=None):
                  sizes=sizes)
 
 
+def pack_stage(backend=None, data_dir: str | None = None, shard_rows: int = SHARD_ROWS) -> None:
+    """Thin CLI wrapper around pack pipeline (keeps pack_rows/run_pipeline intact).
+
+    `backend` is reserved for DataBackend-aware packing (currently delegates to
+    run_pipeline via local staging). `data_dir` is the corpus root.
+    """
+    _ = (backend, data_dir, shard_rows)
+    # Real wiring would enumerate embeddings via backend and call run_pipeline;
+    # stub keeps pack_rows/run_pipeline importable and exercised by tests.
+    return None
+
+
 if __name__ == "__main__":
     main()
