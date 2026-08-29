@@ -8,7 +8,9 @@ long it takes, and how to verify it succeeded.
 ## Prereqs (one-time)
 
 ```bash
-pip install modal huggingface_hub
+pip install torch pyarrow pillow huggingface_hub
+# optional for Modal backend:
+pip install modal
 modal token new            # opens browser; links your Modal account
 # HF CLI already logged in? If not:
 #   huggingface-cli login
@@ -26,25 +28,35 @@ python3 -c "from huggingface_hub import whoami; print(whoami())"
 
 These are already done and reused; you only re-run if you change something.
 
-* `extract_moonvit_v2.py` — pulled the 401M MoonViT-V2 weights + config out of
+* `vision_adapter/data/extract_moonvit_v2.py` — pulled the 401M MoonViT-V2 weights + config out of
   `moonshotai/Kimi-K3` and pushed them to `keypa/MoonViT-V2-Standalone`.
   *Re-run only if you delete the HF repo.*
-* `build_agentic_images.py --dry-run` — verifies the six positional joins are
+* `python -m vision_adapter dataset --dry-run` — verifies the six positional joins are
   still intact; safe, touches no pixels.
-  *Re-run before any `etl` if the upstream datasets update.*
+  *Re-run before any `dataset` if the upstream datasets update.*
 
 ---
 
-## Step 1 — ETL: build images on Modal  (≈ 30–60 min, one-off)
+## Step 1 — Dataset: build images + header-first manifest  (≈ 30–60 min, one-off)
 
 Downloads the sources (≈ 23 GB), runs the resize/pad pipeline, writes
-`/data/images/{agentic,cauldron}/` + `/data/metadata/cauldron_manifest.jsonl`.
+`./data/images/{agentic,cauldron}/` + `./data/train_manifest.jsonl` (header-first,
+`ORDER BY image`, pinned revisions via `vision_adapter/data/dataset.py`).
 
 ```bash
-modal run modal_pipeline.py::etl
+python -m vision_adapter dataset --out ./data
+# Modal Volume variant:
+# python -m vision_adapter dataset --out ./data --backend modal
 ```
 
-Verify:
+Verify (local):
+
+```bash
+ls ./data/images/agentic | head
+head -1 ./data/train_manifest.jsonl | python -m json.tool   # {"type":"manifest_header",...}
+```
+
+Or on Modal:
 
 ```bash
 modal volume ls vision-adapter-data images/agentic | head
@@ -55,39 +67,22 @@ Expect ~30k PNGs in `images/agentic` + dozens of Cauldron configs in `metadata`.
 
 ---
 
-## Step 2 — Mix manifest  (< 1 min)
-
-Samples the exact 45 % agentic / 45 % doc / 10 % conversational split into
-`/data/train_manifest.jsonl` (the file the trainer actually consumes).
-
-```bash
-modal run modal_pipeline.py::build_train_manifest
-```
-
-Verify (counter should print `agentic:54000, doc:54000, conv:12000, total 120000`):
-
-```bash
-modal volume cat vision-adapter-data train_manifest.jsonl | head -2
-```
-
----
-
-## Step 3 — Precompute MoonViT embeddings (choose ONE)
+## Step 2 — Precompute MoonViT embeddings (choose ONE)
 
 Embeddings are per-image `[n_merged, 4096]` BF16 tensors, hashed
 `sha1(relative_image_path)[:20].pt`. Same hash convention on both backends, so
 results are interchangeable.
 
-### 3a · Modal A100 (fast, ~10–20 min)
+### 2a · Modal A100 (fast, ~10–20 min)
 
 ```bash
-modal run modal_pipeline.py::precompute
+python -m vision_adapter precompute --data-dir ./data --backend modal
 ```
 
-### 3b · Free Colab T4 (≈ 1–2 h, resumable across sessions)
+### 2b · Free Colab T4 (≈ 1–2 h, resumable across sessions)
 
 1. Upload `images/` to Drive: `MyDrive/vision_adapter/images/`
-2. Open the notebook described in `../COLAB_PRECOMPUTE.md`, run cells 1 → 3.
+2. Open `vision_adapter/models/precompute.py` (Colab path uses `--backend local` with a Drive-mounted `--data-dir`; see `vision_adapter/models/precompute_colab.py` — deprecated shim that re-exports the shared precompute), run cells 1 → 3.
 3. When done, sync the embedding folder back to Modal. The safest way is to `zip`
    it first (79 659 files, ~6 GB) and unzip inside the Modal Volume:
 
@@ -112,10 +107,34 @@ modal volume put vision-adapter-data ./. /embeddings/
 modal volume ls vision-adapter-data embeddings | head
 ```
 
-Verify either way:
+Verify either way (local or Modal):
 
 ```bash
-modal volume ls vision-adapter-data embeddings | wc -l   # should approach 120k
+python -m vision_adapter precompute --data-dir ./data --help   # shows --revision pin, --patch-cap
+ls ./data/embeddings | wc -l            # local: should approach 120k
+modal volume ls vision-adapter-data embeddings | wc -l   # Modal: should approach 120k
+```
+
+---
+
+## Step 3 — Pack embeddings into shards  (< 5 min, resumable)
+
+Packs the 120k `.pt` embeddings into ~100 parquet shards (`SHARD_ROWS=1360`,
+`compression=None`, per-shard `sha256`) via `vision_adapter/data/pack.py`.
+
+```bash
+python -m vision_adapter pack --data-dir ./data
+# HF-only push (no local volume copy):
+# python -m vision_adapter pack --data-dir ./data --hf-only
+# single-shard range:
+# python -m vision_adapter pack --data-dir ./data --only 0:2
+```
+
+Verify:
+
+```bash
+ls ./data/shards | head
+python -c "import pyarrow.parquet as pq; print(pq.read_table('./data/shards/emb_0000.parquet').num_rows)"
 ```
 
 ---
@@ -167,8 +186,8 @@ trained projector, eyeball the shapes:
 import torch, json
 from PIL import Image
 from safetensors.torch import load_file
-from moonvit import load_moonvit_from_safetensors
-from preprocess import process_image
+from vision_adapter.models.moonvit import load_moonvit_from_safetensors
+from vision_adapter.models.preprocess import process_image
 
 cfg = json.load(open('.cache/vision_config.json'))
 vit = load_moonvit_from_safetensors('.cache/moonvit_v2.safetensors', cfg,
@@ -188,11 +207,11 @@ the alignment layer.
 
 | Symptom | Fix |
 |---|---|
-| `MEMORY GATE FAIL` on dryrun | batch_size 8 too big for your Modal A100 SKU → lower `BATCH_SIZE` in `modal_train.py` |
+| `MEMORY GATE FAIL` on dryrun | batch_size 8 too big for your Modal A100 SKU → lower `batch_size` in `vision_adapter/config.py` (`TrainConfig`) |
 | loss stays ~7 after step 12 000 | grokking may not happen this run; try `LR = 7e-4` and rerun; see `docs/TELEMETRY.md` |
 | Colab precompute synced but trainer sees no images | `embeddings/` must be at Volume root: `modal volume put vision-adapter-data ./embeddings/. /embeddings/` |
-| Out of RAM in ETL | Cauldron pulls whole configs; raise `memory=` on the `etl` fn |
-| Colab session died | just re-run Cell 3; `_already_done()` skips everything already cached |
-| `KeyError` in aguvis join | upstream re-indexed; re-run `build_agentic_images.py --dry-run` |
+| Out of RAM in ETL | Cauldron pulls whole configs; raise `memory=` on the `dataset` stage (Modal) |
+| Colab session died | just re-run the precompute cell; `_already_done()` skips everything already cached |
+| `KeyError` in aguvis join | upstream re-indexed; re-run `python -m vision_adapter dataset --dry-run` |
 
 If in doubt, re-run the failing step — every stage is idempotent.

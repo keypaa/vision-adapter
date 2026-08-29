@@ -17,7 +17,7 @@ Every item maps to a concrete `file:line` in this repo or is dropped — no gene
 
 **Repo mapping:**
 - `preprocess.py:13-16` constants `MAX_PATCHES=65536`, `MAX_SIDE=7168` — never histogrammed against the corpus.
-- `modal_pipeline.py:1194-1203` greedy `pack_patched_batches` in input order — fragmentation 10–20% because we never bucketed by `n_vis` first.
+- `vision_adapter/models/precompute.py` greedy `pack_patched_batches` (historical: formerly inline in the monolith) in input order — fragmentation 10–20% because we never bucketed by `n_vis` first.
 
 **Cost if skipped:** Silent tail-event dominance; 4900-token screenshots inflate `L` in `make_collate` → eager OOM (~46 GiB at bs8) that `_make_chunked_eager` papers over.
 
@@ -71,7 +71,7 @@ Huyen's book is organized around **design decisions over code snippets**: reliab
 **Principle:** Treat datasets like code — version the manifest, shard checksums, and upstream commits so a rebuild is provably identical.
 
 **Repo mapping:**
-- `modal_pipeline.py:1077` `random.seed(0)` only — Python-version-dependent; `1081` `LIMIT 54000` without `ORDER BY` makes the 54k agentic selection nondeterministic even with the seed. No `manifest_version`, `git_sha`, `upstream commits`, or `shard-set hash` in `train_manifest.jsonl`.
+- `vision_adapter/data/dataset.py` + `vision_adapter/manifest.py` seeded `random/numpy/torch` (historical: monolith did `random.seed(0)` only) only — Python-version-dependent; `1081` `LIMIT 54000` without `ORDER BY` makes the 54k agentic selection nondeterministic even with the seed. No `manifest_version`, `git_sha`, `upstream commits`, or `shard-set hash` in `train_manifest.jsonl`.
 - `local_pack.py:54-60` `SCHEMA` has no per-row/per-shard `sha256(vis_bytes)`.
 
 **Cost if skipped:** Delete the Volume → you cannot prove you rebuilt the same 120k. Future you cannot bisect a data bug.
@@ -81,7 +81,7 @@ Huyen's book is organized around **design decisions over code snippets**: reliab
 **Principle:** If a step is currently manual (run this, then that, then check), automate it and make it observable.
 
 **Repo mapping:**
-- `modal_pipeline.py` ETL (0.8–1.5h) → Cauldron (1.5–3h) → manifest (15–90s) → precompute (4.5–5.5h) → pack (14.5h cold) is a single 1800-line file with no per-file argument story and no local path without Modal.
+- `vision_adapter/data/dataset.py` → `vision_adapter/data/cauldron.py` → manifest (`vision_adapter/manifest.py` header-first) → `vision_adapter/models/precompute.py` → `vision_adapter/data/pack.py` replaces the former 1800-line monolith (historical — see PIPELINE.md) with no per-file argument story and no local path without Modal.
 
 **Cost if skipped:** Rebuild takes hours with no way to know where time goes — the specialized auditor had to reconstruct timings from code-implied bottlenecks because no `precompute.log` covers the full 120k.
 
@@ -149,7 +149,7 @@ Marin trained a **4-rung ladder from 1.6B-A61M (48B tokens) to 27.7B-A1.2B (926B
 
 | Source of randomness | Control | Repo gap |
 |---|---|---|
-| Python RNG | `random.seed(0)` | `modal_pipeline.py:1077` does this — but only this |
+| Python RNG | `random.seed(0)` | `vision_adapter/data/dataset.py` now seeds all three RNGs (historical: monolith did this — but only this) |
 | NumPy RNG | `np.random.seed(0)` + per-Generator seeding | Never set in manifest build |
 | PyTorch RNG (all devices) | `torch.manual_seed(0)` | Never set in data pipeline |
 | DataLoader workers | `worker_init_fn` seeding from `torch.initial_seed()` + `torch.Generator(g.manual_seed(0))` as `generator=g` | `num_workers=8` in production loader has no `worker_init_fn` |
@@ -162,8 +162,8 @@ Marin trained a **4-rung ladder from 1.6B-A61M (48B tokens) to 27.7B-A1.2B (926B
 **Concrete fix for Vision-Adapter:**
 
 - Add `random.seed(0)`, `np.random.seed(0)`, `torch.manual_seed(0)`, and `worker_init_fn` in `build_train_manifest` and `_shared_setup`.
-- Add `ORDER BY image` to `modal_pipeline.py:1081` `LIMIT 54000` — the seed does not save you if the *input* row order is nondeterministic.
-- Pin MoonViT repo with `revision=` in `hf_hub_download` (`moonvit.py` / `modal_pipeline.py`).
+- Add `ORDER BY image` to `vision_adapter/data/dataset.py: ORDER BY image LIMIT 54000` — the seed does not save you if the input order is nondeterministic (historical: monolith) if the *input* row order is nondeterministic.
+- Pin MoonViT repo with `revision=` in `hf_hub_download` (`moonvit.py` / `vision_adapter/data/dataset.py` + `vision_adapter/models/precompute.py` (historical monolith — see PIPELINE.md)).
 
 **Cost if skipped:** Two rebuilds of the same 120k pick different 54k agentic rows — the grok window measurement is not comparable across runs for reasons unrelated to the model.
 
@@ -213,7 +213,7 @@ Marin trained a **4-rung ladder from 1.6B-A61M (48B tokens) to 27.7B-A1.2B (926B
 
 **Repo mapping:**
 
-- `moonvit.py:118-226` varlen `flash_attn_varlen_func` vs fallback `scaled_dot_product_attention` loop — the `FA2/FA3/FA4` per-generation upgrade path at `modal_pipeline.py:74-85` (wheel pin `flash_attn-2.7.4`) and the `precompute_bench` at `modal_pipeline.py:1340-1454` that sweeps `patch_cap` vs `peak GiB / util%` are Ch 6.5's "pick FA by architecture" in practice. Our `MAX_PATCHES=65536`/`MAX_SIDE=7168` capping is the `n_vis`-level equivalent of Ch 6.5's quantization granularity — keep it, but measure it (we already do: `test_preprocess.py:22-42`).
+- `moonvit.py:118-226` varlen `flash_attn_varlen_func` vs fallback `scaled_dot_product_attention` loop — the `FA2/FA3/FA4` per-generation upgrade path at `vision_adapter/models/moonvit.py:74-85` (wheel pin `flash_attn-2.7.4`) and the `precompute_bench` in `vision_adapter/models/precompute.py` (historical: monolith) that sweeps `patch_cap` vs `peak GiB / util%` are Ch 6.5's "pick FA by architecture" in practice. Our `MAX_PATCHES=65536`/`MAX_SIDE=7168` capping is the `n_vis`-level equivalent of Ch 6.5's quantization granularity — keep it, but measure it (we already do: `test_preprocess.py:22-42`).
 - `TRAINING_PLAN.md Phase 3` skipped `ParquetEmbSFT` because `.pt` vs parquet was publish-quality not speed — the book's Ch 6.5 closing note that `vLLM / SGLang Diffusion / TensorRT` vs `PyTorch` is an *image-model-specific* choice explains why a training-time `ParquetEmbSFT` would not have helped: our `EmbSFT` warm `7ms` `torch.load` is the PyTorch-side win the book attributes to `__CUDA_VISIBLE_DEVICES` vs engine choice.
 
 **Cost if skipped:** Upgrading GPUs (T4→A100, A100→B300) without re-picking `FA2→FA3→FA4` per generation and without cached `torch.compile` on the B300 pipeline leaves the same 1.3× on the table — at `modal_train.py:439` `_make_chunked_eager` the hand-fused chunk budget `2**26` already trades `1.4×` compute for the memory ceiling (Fig 4.2 logic), so the *next* 1.3× must come from FA generation, not more chunking.
@@ -224,17 +224,17 @@ Marin trained a **4-rung ladder from 1.6B-A61M (48B tokens) to 27.7B-A1.2B (926B
 
 ## Checklist — Ordered Cheapest→Highest-Leverage (each = file:line edit on THIS branch)
 
-- [ ] **Add `ORDER BY image` to agentic `LIMIT 54000`** — `modal_pipeline.py:1081` — one-line determinism fix; unblocks local-vs-Modal parity.
-- [ ] **Pin MoonViT `revision=`** — `moonvit.py` / `modal_pipeline.py` `hf_hub_download` — one kwarg; prevents silent model change on force-push.
-- [ ] **Keep `compression=None` everywhere** — `modal_pipeline.py:606` (currently missing) to match `local_pack.py:81` — already measured 2.3× win on BF16.
-- [ ] **Retain `patch_sizes.json` on Volume** — `modal_pipeline.py:1139` — saves ~10 min cold header reads per precompute.
-- [ ] **Sort/bucket by `n_vis` before greedy packing** — `modal_pipeline.py:1194` / `precompute_colab.py:104` — one `sorted(cache_items, key=...)` removes 10–20% fragmentation, zero numerical risk.
-- [ ] **Re-pick `patch_cap` via `precompute_bench` on A100** — `modal_pipeline.py:1250` default `262144` is T4-tuned; A100 can carry 350–524k at <85% mem.
-- [ ] **Single config object** — new `configs/qwen_probe_small.yaml` + `configs/qwen_probe_full.yaml` dataclass — replaces scattered `LR/BATCH_SIZE/MAX_SEQ_LEN/WARMUP` at `grok_probe_qwen.py:104`, `modal_probe.py:65`, `modal_train.py:49`.
-- [ ] **Add manifest header** — `modal_pipeline.py:1115` write path — `manifest_version, git_sha, seeds (py/np/torch), upstream revisions, timestamp, row count, shard-set hash`.
-- [ ] **Add per-shard `sha256(emb_XXXX.parquet)`** — `local_pack.py:230` / `modal_pipeline.py:562` post-write — Volume↔HF parity.
-- [ ] **Experiment registry + enriched logging** — `modal_probe.py`/`grok_probe_qwen.py` JSONL header: `run_id, git SHA, manifest hash, shard set, seed, device/dtype, step_ms breakdown`. One registry file for `Configuration | sec/step | samples/sec | tokens/sec | VRAM | Relative`.
-- [ ] **Extract `src/training/` shared core** — `HourglassProjector`, `make_collate`, `embeds_for`/`visual_inject`, `train_step`, `ProbeMonitor`, `render_curves` — single source for `modal_train.py` + probes.
+- [ ] **Add `ORDER BY image` to agentic `LIMIT 54000`** — `vision_adapter/data/dataset.py: ORDER BY image` (historical: `modal_pipeline:1081`) — one-line determinism fix; unblocks local-vs-Modal parity.
+- [ ] **Pin MoonViT `revision=`** — `vision_adapter/models/moonvit.py` / `vision_adapter/models/precompute.py` `hf_hub_download(..., revision=...)` (historical: monolith did this without pin) — one kwarg; prevents silent model change on force-push.
+- [ ] **Keep `compression=None` everywhere** — `vision_adapter/data/pack.py:compression=None` (historical: monolith at 606 was missing; matches staged pack) — already measured 2.3× win on BF16.
+- [ ] **Retain `patch_sizes.json` on Volume** — `vision_adapter/models/precompute.py` retains `patch_sizes.json` (historical: monolith at 1139) — saves ~10 min cold header reads per precompute.
+- [ ] **Sort/bucket by `n_vis` before greedy packing** — `vision_adapter/models/precompute.py` / `vision_adapter/models/precompute_colab.py` (historical: monolith) — one `sorted(cache_items, key=...)` removes 10–20% fragmentation, zero numerical risk.
+- [ ] **Re-pick `patch_cap` via `precompute_bench` on A100** — `vision_adapter/models/precompute.py` default `262144` (historical: monolith at 1250) is T4-tuned; A100 can carry 350–524k at <85% mem.
+- [x] **Single config object** — DONE on `refactor/discipline` via `vision_adapter/config.py:TrainConfig` + `config_header` (replaces scattered LR/BATCH_SIZE/WARMUP). — new `configs/qwen_probe_small.yaml` + `configs/qwen_probe_full.yaml` dataclass — replaces scattered `LR/BATCH_SIZE/MAX_SEQ_LEN/WARMUP` at `grok_probe_qwen.py:104`, `modal_probe.py:65`, `modal_train.py:49`.
+- [x] **Add manifest header** — DONE via `vision_adapter/manifest.py:write_manifest_with_header` (header-first, `manifest_version=1`, `git_sha`, `seeds`, `upstream`, `shard_set_hash`). — `vision_adapter/manifest.py:write_manifest_with_header` (historical: monolith at 1115 write path) — `manifest_version, git_sha, seeds (py/np/torch), upstream revisions, timestamp, row count, shard-set hash`.
+- [x] **Add per-shard `sha256(emb_XXXX.parquet)`** — DONE via `vision_adapter/config.py:file_sha256` + `vision_adapter/data/pack.py` per-shard hash (Volume↔HF parity). — `vision_adapter/data/pack.py` + `vision_adapter/config.py:file_sha256` post-write (historical: monolith at 562) — Volume↔HF parity.
+- [x] **Experiment registry + enriched logging** — DONE via `vision_adapter/registry.py` (`runs.jsonl`, `registry_entry`) + `vision_adapter/config.py:config_header` + `run_end` (`run_id`-correlated). — `modal_probe.py`/`grok_probe_qwen.py` JSONL header: `run_id, git SHA, manifest hash, shard set, seed, device/dtype, step_ms breakdown`. One registry file for `Configuration | sec/step | samples/sec | tokens/sec | VRAM | Relative`.
+- [x] **Extract `src/training/` shared core** — DONE via `vision_adapter/core.py` (`HourglassProjector`, `make_collate`, `train_step`, monitors) shared by all trainers. — `HourglassProjector`, `make_collate`, `embeds_for`/`visual_inject`, `train_step`, `ProbeMonitor`, `render_curves` — single source for `modal_train.py` + probes.
 - [ ] **Minimal probe gate codified** — 2k/200, fixed batch, single seed, `loss ↓ + gnorm finite` pass/fail — `modal_probe.py` with `--sample-size 2000 --max-steps 200 --bucketing` ladder flags.
 
 ---
@@ -246,7 +246,7 @@ Marin trained a **4-rung ladder from 1.6B-A61M (48B tokens) to 27.7B-A1.2B (926B
 | `modal.Mount` deprecated | `modal_probe.py` first dryrun raised `AttributeError: module 'modal' has no attribute 'Mount'` | `modal_probe.py:102` (fixed to `image.add_local_file`) | Use `image.add_local_file("modal_train.py", "/root/modal_train.py")` |
 | Mixed-dtype LayerNorm | `EmbSFT` `float32` vis → bf16 projector `LayerNorm` raised `expected scalar type Float but found BFloat16` | `modal_probe.py:137` / `grok_probe_qwen.py` same | Cast `vis.to(proj_dtype)` before `proj()` |
 | 67M vs 67B terminology | Projector 67,129,344 params confused with DeepSeek 304B/67B active | Log line at `modal_train.py:9` / `ARCHITECTURE.md:23` | Every log now says "67M projector" explicitly |
-| `LIMIT` without `ORDER BY` | Agentic 54k selection nondeterministic; seed doesn't save it | `modal_pipeline.py:1081` | Add `ORDER BY image` |
+| `LIMIT` without `ORDER BY` | Agentic 54k selection nondeterministic; seed doesn't save it | `vision_adapter/data/dataset.py: ORDER BY image` (historical: `modal_pipeline:1081`) | Add `ORDER BY image` |
 | No `revision=` pin | MoonViT repo force-push would silently change model | `moonvit.py` `hf_hub_download` | Pin to commit hash |
 
 ---

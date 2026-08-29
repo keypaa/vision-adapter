@@ -1,13 +1,31 @@
 # TELEMETRY — what to watch when you can't watch it live
 
-The trainer writes a single JSONL stream to `/data/logs/train_log.jsonl`
-(one object per step). After the run — or mid-run from another shell — pull it:
+The trainer writes a single JSONL stream to `./data/logs/train_log.jsonl`
+(and `/data/logs/train_log.jsonl` on Modal — one object per step). After the
+run — or mid-run from another shell — pull it:
 
 ```bash
 modal volume get vision-adapter-data logs/ ./logs/
+# local:
+cat ./data/logs/train_log.jsonl | tail -5
 ```
 
+Line 0 is always the `config_header` (`vision_adapter/config.py:config_header`):
+`{"type":"config_header","run_id":...,"git_sha":...,"manifest_sha256":...,"manifest_rows":...,"config":{...}}`.
+The run's closing `run_end` and the `runs.jsonl` registry entry
+(`vision_adapter/registry.py:registry_entry`) are correlated by `run_id`.
+
 ## Keys you'll see
+
+### config header (`"type": "config_header"` — line 0)
+
+| Field | Meaning |
+|---|---|
+| `run_id` | short run identifier (`YYYYMMDDTHHMMSSZ-xxxxxx`) |
+| `git_sha` | `git rev-parse HEAD` at run start |
+| `manifest_sha256` / `manifest_rows` | hash + row count of the manifest used |
+| `config` | verbatim `TrainConfig` dict (every field) |
+| `timestamp` / `python` / `platform` | provenance |
 
 ### train step (`"type": "train"`)
 
@@ -30,6 +48,11 @@ Every 250th step. Held-out `train_manifest_val.jsonl` — never optimised.
 |---|---|
 | `val_loss` | mean CE on the data never seen by the optimiser |
 | `n_rows`   | how many held-out examples were averaged |
+
+### run end (`"type": "run_end"` — last line)
+
+Written best-effort at trainer exit with `run_id`, `wall_min`, `final_loss`,
+`peak_gib`, and `step_ms` breakdown — mirrors the `runs.jsonl` registry row.
 
 ## The one curve that matters in this project
 
@@ -63,10 +86,11 @@ We have the same objective at batch 8 — watch `samples_seen` for the equivalen
 ## On-disk artefacts you can diff between runs
 
 ```
-/data/logs/train_log.jsonl             # the stream
-/data/dryrun_report.txt                # one-line peak-memory verdict
-/data/checkpoints/projector_step*.safetensors
-/data/checkpoints/projector_final.safetensors
+./data/logs/train_log.jsonl             # the stream (line 0 = config_header)
+./data/runs.jsonl                       # registry: one JSON row per run (vision_adapter/registry.py)
+./data/dryrun_report.txt                # one-line peak-memory verdict
+./data/checkpoints/projector_step*.safetensors
+./data/checkpoints/projector_final.safetensors
 ```
 
 Load a projector locally (no GPU needed):

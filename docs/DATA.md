@@ -8,11 +8,13 @@
   `HuggingFaceM4/the_cauldron`).
 - **Transform** — resize to ≤300k pixels, floor dimensions to 28-px multiples
   (LANCZOS), re-encode PNG/JPEG.
-- **Load** — write into the Modal Volume (`/data/images/...`) so every later
+- **Load** — write via `vision_adapter/backends/{local,modal}` into
+  `./data/images/...` (or the Modal Volume `/data/images/...`) so every later
   stage reads from one durable, idempotent location.
 
-`build_agentic_images.py` + `modal_pipeline.py::etl` are the ETL. The Modal
-`etl` function also downloads the Cauldron subsets. Everything is resumable:
+`vision_adapter/data/agentic.py` + `vision_adapter/data/dataset.py` (with
+`vision_adapter/data/cauldron.py` for Cauldron) are the ETL. The dataset
+orchestrator also writes the header-first manifest. Everything is resumable:
 re-running skips files that already exist.
 
 ## The two corpora
@@ -44,8 +46,11 @@ If any prefix ever fails the coverage check, the builder **refuses to guess**
 (fail-closed `IndexError`). Dry-run before building:
 
 ```bash
-.venv/bin/python3 build_agentic_images.py --dry-run
+python -m vision_adapter dataset --dry-run --out ./data
 ```
+
+Under the hood this calls `vision_adapter/data/agentic.py:build_agentic_dataset(backend, ...)`
+with `ORDER BY image` determinism.
 
 ### 2. General / reasoning (45%) + conversational (10%) — `HuggingFaceM4/the_cauldron`
 
@@ -61,7 +66,8 @@ Chosen because: licenses are (mostly) permissive, answers are *short and
 on-policy* (critical for the grokking dynamics — see ARCHITECTURE.md), and the
 document/chart/screenshot subsets transfer directly to coding-agent screenshot
 reading. `the_cauldron` needs no separate ETL beyond download — images come
-inline in the parquet rows.
+inline in the parquet rows. Pulled via `vision_adapter/data/cauldron.py`
+(N_DL=6, N_SAVE=12, `cauldron_manifest.jsonl` contract).
 
 | Group | Examples | Share |
 |---|---|---|
@@ -95,15 +101,22 @@ exactly why we log everything (see OPERATIONS.md).
 ## Files on disk / Volume
 
 ```
-/data/images/agentic/<name>.png|jpg        # ETL output, 79,659 files
-/data/images/cauldron/<subset>-<idx>-<j>.png
-/data/metadata/cauldron_manifest.jsonl     # raw cauldron rows
-/data/train_manifest.jsonl                 # the 45/45/10 SFT mix (trainer input)
-/data/train_manifest_val.jsonl             # held-out ~2% for eval hooks
-/data/embeddings/<sha1>.pt                 # precomputed MoonViT features
-/data/logs/train_log.jsonl                 # per-step telemetry (see OPERATIONS.md)
-/data/dryrun_report.txt                    # memory-gate verdict
+./data/images/agentic/<name>.png|jpg        # dataset stage output, 79,659 files
+./data/images/cauldron/<subset>-<idx>-<j>.png
+./data/metadata/cauldron_manifest.jsonl     # raw cauldron rows
+./data/train_manifest.jsonl                 # header-first 45/45/10 SFT mix (trainer input)
+./data/train_manifest_val.jsonl             # held-out ~2% for eval hooks
+./data/embeddings/<sha1>.pt                 # precomputed MoonViT features (→ packed to shards)
+./data/shards/emb_XXXX.parquet              # packed shards: key, n_vis, vis_bytes (SHARD_ROWS=1360, compression=None, per-shard sha256)
+./data/logs/train_log.jsonl                 # per-step telemetry (line 0 = config_header, see OPERATIONS.md)
+./data/dryrun_report.txt                    # memory-gate verdict
+./data/runs.jsonl                           # experiment registry (vision_adapter/registry.py)
 ```
+
+Header-first manifest format (see `vision_adapter/manifest.py`):
+line 0 is `{"type":"manifest_header","manifest_version":1,"git_sha":...,"seeds":{...},"upstream":{...},"shard_set_hash":...,"row_count":N}`.
+The `ORDER BY image` fix makes the agentic 54k selection deterministic across
+rebuilds even if parquet write order drifts.
 
 Embedding filename convention: `sha1(relative_image_path)[:20].pt`, where the
 relative path is relative to the `images/` root (`agentic/foo.png`). Identical

@@ -56,15 +56,23 @@ hazard at either end.
 
 | File | What it is | Owns |
 |---|---|---|
-| `extract_moonvit_v2.py` | ONE-OFF. Pulled shards `model-00095/96-of-000096` from Kimi-K3 and saved `vision_tower.*` + `mm_projector.*` to `keypa/MoonViT-V2-Standalone`. | weight extraction |
-| `moonvit.py` | Standalone forward of the frozen vision tower (bit-exact vs. modeling_kimi_k3). | MoonViT |
-| `preprocess.py` | navit_resize (≤65536 patches, ≤7168 px/side, pad-to-28) + 0.5/0.5 normalise → packed `(pixel_values, grid_thws)`. | image → patches |
-| `build_agentic_images.py` | Downloads / resizes / renames the 82,829 agentic images by **positional join** into wave-ui-25k / ShowUI-desktop / aguvis-l1. | agentic image corpus |
-| `modal_pipeline.py` | Modal: ETL (full-image download) → manifest (120k mix) → A100 precompute. | data plane |
-| `precompute_colab.py` | Same precompute on a free Colab T4; resumable. | free alternative |
-| `modal_train.py` | Modal: dry-run memory gate → AdamW SFT on projector only. | training plane |
+| `vision_adapter/data/extract_moonvit_v2.py` | ONE-OFF. Pulled shards `model-00095/96-of-000096` from Kimi-K3 and saved `vision_tower.*` + `mm_projector.*` to `keypa/MoonViT-V2-Standalone`. | weight extraction |
+| `vision_adapter/models/moonvit.py` | Standalone forward of the frozen vision tower (bit-exact vs. modeling_kimi_k3). | MoonViT |
+| `vision_adapter/models/preprocess.py` | navit_resize (≤65536 patches, ≤7168 px/side, pad-to-28) + 0.5/0.5 normalise → packed `(pixel_values, grid_thws)`. | image → patches |
+| `vision_adapter/data/agentic.py` | Downloads / resizes / renames the 82,829 agentic images by **positional join** into wave-ui-25k / ShowUI-desktop / aguvis-l1. | agentic image corpus |
+| `vision_adapter/data/cauldron.py` | Cauldron pull — 6 download / 12 save subsets, writes `cauldron_manifest.jsonl`. | cauldron corpus |
+| `vision_adapter/data/dataset.py` | Orchestrator: agentic + cauldron → header-first `train_manifest.jsonl` (`ORDER BY image`, pinned revisions). | dataset assembly |
+| `vision_adapter/data/pack.py` | Packs embeddings into `SHARD_ROWS=1360` shards (`compression=None`, per-shard `sha256`). | shard packing |
+| `vision_adapter/models/precompute.py` | Shared MoonViT precompute (`--backend local|modal`, `--revision` pin, `--patch-cap`). | embedding precompute |
+| `vision_adapter/config.py` | Single frozen `TrainConfig` + `config_header` provenance (git SHA, manifest hash). | config / provenance |
+| `vision_adapter/core.py` | Shared `HourglassProjector`, `make_collate`, `train_step`, monitors. | training core |
+| `vision_adapter/manifest.py` | Versioned header-first manifest I/O (`manifest_version`, `ORDER BY`). | manifest |
+| `vision_adapter/registry.py` | `runs.jsonl` experiment registry (one row per run, run_id-correlated). | registry |
+| `vision_adapter/backends/base.py` + `local.py` + `modal.py` | `DataBackend` Protocol + Local/Modal implementations. | I/O backends |
+| `vision_adapter/cli.py` | Sole staged entrypoint `python -m vision_adapter {dataset,precompute,pack,train,probe}`. | CLI |
+| `modal_train.py` | Shim → `vision_adapter` training plane (dry-run memory gate → AdamW SFT). | training shim |
 
-`AGENTS.md`-style note: **never put the embedding precompute and the training
+Note: **never put the embedding precompute and the training
 loop in the same memory budget.** The whole point of the split is that the
 vision tower is exercised once (offline) and the LLM only ever sees 4096-dim
 cached tensors.

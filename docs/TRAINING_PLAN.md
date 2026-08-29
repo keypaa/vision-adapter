@@ -4,6 +4,9 @@ Authoritative record of what we decided and why. Each phase has a **Report**
 section to be filled in as the phase runs, so later phases (and future us) can
 see the decisions and numbers that shaped the work.
 
+
+> **2026-08-29 (refactor/discipline):** the former monolithic `modal_pipeline` file has been deleted and split into `vision_adapter/data/*` + `vision_adapter/models/precompute.py` + `vision_adapter/data/pack.py`. Historical refs below now point to those staged modules — see `docs/PIPELINE.md` for the exact `python -m vision_adapter dataset|precompute|pack` commands.
+
 Status legend for Report sections:
 - `[ ] TODO` — not started
 - `[~] IN PROGRESS`
@@ -34,7 +37,7 @@ Status legend for Report sections:
 Volume before deciding how much of the data path to rework.
 
 **Details:**
-- Add a small Modal probe (in `modal_pipeline.py`, `_etl_image`, no GPU).
+- Add a small Modal probe (in `vision_adapter/models/precompute.py` (shared precompute, formerly inline in the monolith), no GPU).
 - Sample ~200 `.pt` files from `/data/embeddings/`, time `torch.load(..., weights_only=True)` per file.
 - Report: avg / p95 latency per file, MB/s, and projected **I/O share of a
   training step** at bs=8, num_workers=2 vs 8.
@@ -67,7 +70,7 @@ the Volume (`/data/shards/`), so one format serves both the trainer and the HF
 publish.
 
 **Details:**
-- New resumable fn in `modal_pipeline.py` (Volume write + `vol.commit()` per shard, skip existing shards).
+- New resumable packing via `vision_adapter/data/pack.py` (staged `python -m vision_adapter pack`, `SHARD_ROWS=1360`, `compression=None`, per-shard `sha256`; historically inline in the monolith).
 - **~1360 rows/shard ⇒ ~100 shards, ~10 GB each** (agreed size).
 - Columns: `key` (`embeddings/<sha1>.pt`, byte-identical to the manifest `emb`
   field ⇒ **100% compatible with existing manifests**), `n_vis` (int),

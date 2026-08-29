@@ -128,8 +128,8 @@ Standalone script (`python local_pack.py`), no Modal decorators:
 
 ## Out of scope
 
-- The full `pack_embeddings_to_parquet` Modal fn stays in `modal_pipeline.py`
-  (unused once the local script takes over, but kept for reference/resume).
+- The full `pack_embeddings_to_parquet` Modal fn stays in `vision_adapter/data/pack.py`
+  (historical — formerly inline in the deleted monolith; unused once the local script takes over, but kept for reference/resume).
 - No GPU, no `precompute`, no image pushing.
 - Deleting `/data/embeddings/*.pt` after pack (still guarded by Phase 6.3 rule:
   only after a full training run).
