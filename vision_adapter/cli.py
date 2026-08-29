@@ -28,6 +28,11 @@ def dataset_cmd(args: argparse.Namespace) -> int:
 
 
 def precompute_cmd(args: argparse.Namespace) -> int:
+    # GPU-gated: precompute runs CUDA kernels; fail fast on CPU with nvidia-smi hint.
+    if not getattr(args, "dryrun", False) and getattr(args, "device", "cuda") == "cuda":
+        from vision_adapter.backends.gpu import require_gpu
+
+        require_gpu("precompute")
     from vision_adapter.backends.base import get_backend
     from vision_adapter.models.precompute import run_precompute
 
@@ -60,17 +65,76 @@ def pack_cmd(args: argparse.Namespace) -> int:
 
 
 def train_cmd(args: argparse.Namespace) -> int:
-    cfg = getattr(args, "config", "default")
-    backend_name = getattr(args, "backend", "local")
     dryrun = getattr(args, "dryrun", False)
+    # GPU-gated: real train (not --dryrun) needs CUDA; --dryrun is CPU-safe.
+    if not dryrun:
+        from vision_adapter.backends.gpu import require_gpu
+
+        require_gpu("train")
+    from vision_adapter.config import colab_probe_config, config_header, default_config, probe_config
+
+    cfg_name = getattr(args, "config", "default")
+    cfg_fn = {"default": default_config, "probe": probe_config, "colab": colab_probe_config}.get(cfg_name, default_config)
+    cfg = cfg_fn()
+    backend_name = getattr(args, "backend", "local")
     data_dir = Path(getattr(args, "data_dir", "data"))
-    print(f"[train] --config {cfg} --backend {backend_name} --data-dir {data_dir}" + (" --dryrun" if dryrun else ""))
+    max_steps = getattr(args, "max_steps", None)
+    # resolve backend (best-effort)
+    try:
+        from vision_adapter.backends.base import get_backend
+
+        if backend_name == "local":
+            backend = get_backend("local", root=data_dir)
+        else:
+            backend = get_backend("modal")
+    except Exception as e:  # noqa: BLE001 — backend init must not crash CLI
+        print(f"[train] backend init failed ({e})", flush=True)
+        backend = None  # type: ignore[assignment]
+
     if dryrun:
-        print("[train] dryrun ok (no GPU, no Modal)")
+        # Real validation instead of stub print — this is what "proven" means before we delete shims.
+        if not data_dir.exists():
+            print(f"[train] data-dir does not exist: {data_dir} (dryrun still ok — will create on dataset)", flush=True)
+        manifest_path = data_dir / "train_manifest.jsonl"
+        if manifest_path.exists():
+            try:
+                from vision_adapter.manifest import read_manifest_header
+
+                hdr = read_manifest_header(manifest_path)
+                if hdr:
+                    print(f"[train] manifest {manifest_path}: header v{hdr.manifest_version} rows={hdr.row_count} git={hdr.git_sha[:8]}", flush=True)
+                else:
+                    rows = sum(1 for _ in open(manifest_path) if _.strip())
+                    print(f"[train] manifest {manifest_path}: {rows} rows (legacy, no header)", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[train] manifest check failed: {e}", flush=True)
+        else:
+            print(f"[train] manifest not found at {manifest_path} (ok for dryrun — run dataset first)", flush=True)
+        try:
+            hdr = config_header(cfg, manifest_path=manifest_path if manifest_path.exists() else None, extra={"run": "train", "backend": backend_name, "config": cfg_name})
+            print(f"[train] config {cfg_name}: batch={cfg.batch_size} lr={cfg.lr} max_steps={max_steps} warmup={cfg.warmup_steps}", flush=True)
+            print(f"[train] run_id {hdr['run_id']} git {hdr['git_sha'][:8] if hdr['git_sha'] != 'unknown' else 'unknown'}", flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[train] config header failed: {e}", flush=True)
+        if backend is not None:
+            try:
+                keys = backend.list_embeddings("embeddings/")
+                print(f"[train] backend {backend_name}: {len(keys)} embeddings under embeddings/", flush=True)
+            except Exception as e:  # noqa: BLE001
+                print(f"[train] backend list failed (ok for dryrun): {e}", flush=True)
+        print("[train] dryrun ok (no GPU, no Modal)", flush=True)
         return 0
-    # Real train path would delegate to vision_adapter.models.train / modal_train
-    print("[train] stub — wire to train loop (modal_train._train_impl or local train)")
-    return 0
+
+    # Real train — delegate to the shared runner. Assumes a GPU (gated above, any CUDA).
+    from vision_adapter.train import run_train
+
+    return run_train(
+        data_dir=data_dir,
+        cfg=cfg,
+        backend=backend,
+        max_steps=max_steps,
+        device="cuda" if not dryrun else None,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
