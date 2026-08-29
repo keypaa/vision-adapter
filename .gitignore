@@ -7,7 +7,6 @@ session-ses_*.md
 .pytest_cache/
 .jspace/
 emb_cache/
-GROK_PROBE.md
 pack.log
 *.log
 probe_log.jsonl
