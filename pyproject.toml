@@ -1,0 +1,16 @@
+[project]
+name = "vision-adapter"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["torch", "pyarrow", "pillow"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "C90"]
+ignore = ["E501"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 15
