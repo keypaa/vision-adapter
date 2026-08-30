@@ -289,7 +289,9 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     scaler = _torch.amp.GradScaler("cuda", enabled=(dev=="cuda" and dtype==_torch.float16), init_scale=1.0, growth_interval=10**9) if dev=="cuda" else None
     collate = make_collate(tok, tok.pad_token_id, max_len=cfg.max_seq_len, vision_dim=cfg.vision_dim)
     monitor = ProbeMonitor()
-    # Build streaming plan
+    # Build streaming plan (ensure cache dirs exist before index save)
+    (data_dir / "cache").mkdir(parents=True, exist_ok=True)
+    (data_dir / "cache" / "rg_cache").mkdir(parents=True, exist_ok=True)
     stream_order = _list_shards(token=tok_hf)
     EXCLUDED = {"data/emb_0000.parquet", "data/emb_0001.parquet"}
     stream_order = [s for s in stream_order if s not in EXCLUDED]

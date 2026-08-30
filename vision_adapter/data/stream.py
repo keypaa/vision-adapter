@@ -180,6 +180,7 @@ def _cache_key_index_path(cache_dir: str) -> str:
 
 
 def save_key_index(index: dict[str, tuple[str, int]], path: str) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
     payload = {"version": 2, "keys": {k: {"shard": s, "row": r} for k, (s, r) in index.items()}}
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
@@ -233,6 +234,8 @@ def build_key_index(
     stream_order: list[str], cache_dir: str | None = None, rebuild: bool = False
 ) -> dict[str, tuple[str, int]]:
     """emb key -> (shard_file, global_row_idx), footer+key-chunk only, cached."""
+    if cache_dir:
+        Path(cache_dir).mkdir(parents=True, exist_ok=True)
     cache_path = _cache_key_index_path(cache_dir or ".")
     if not rebuild:
         index, ok = load_key_index(cache_path)
