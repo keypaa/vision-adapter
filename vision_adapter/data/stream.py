@@ -72,8 +72,8 @@ class RemoteShard(io.RawIOBase):
     """
 
     FOOTER_BYTES = 64 * 2**10
-    FETCH_CHUNK = 16 * 2**20
-    N_STREAMS = 4
+    FETCH_CHUNK = 32 * 2**20
+    N_STREAMS = 8
 
     def __init__(self, url: str, size: int, disk_cache: str | None = None):
         super().__init__()
@@ -93,12 +93,19 @@ class RemoteShard(io.RawIOBase):
         if self.disk_cache:
             cf = self._cache_file(lo, hi)
             if os.path.exists(cf):
-                with open(cf, "rb") as f:
-                    blob = f.read()
-                if len(blob) == hi - lo:
-                    self._span = (lo, blob)
-                    return
-                os.remove(cf)
+                try:
+                    sz = os.path.getsize(cf)
+                    if sz == hi - lo:
+                        with open(cf, "rb") as f:
+                            blob = f.read()
+                        if len(blob) == hi - lo:
+                            self._span = (lo, blob)
+                            return
+                    os.remove(cf)
+                except Exception:
+                    pass
+        # One session per span load — avoids urllib's per-chunk TCP setup.
+        # Keep N_STREAMS chunked Range (HF CDN rewards multi-connection)
         bounds = [(st, min(st + self.FETCH_CHUNK, hi)) for st in range(lo, hi, self.FETCH_CHUNK)]
         with ThreadPoolExecutor(self.N_STREAMS) as ex:
             futs = {ex.submit(_fetch_range, self.url, st, en - 1): (st, en) for st, en in bounds}
@@ -238,9 +245,10 @@ def build_key_index(
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
     cache_path = _cache_key_index_path(cache_dir or ".")
     if not rebuild:
+        hit_t0 = time.time()
         index, ok = load_key_index(cache_path)
         if ok and len(index) > 0:
-            print(f"[stream] key index loaded from cache ({len(index)} embeddings) <- {cache_path}", flush=True)
+            print(f"[stream] key index loaded from cache ({len(index)} embeddings) <- {cache_path} in {time.time()-hit_t0:.1f}s", flush=True)
             return index
         else:
             # Verbose miss reason so Colab rebuild is explainable
