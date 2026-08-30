@@ -121,7 +121,7 @@ def _smoke_train_with_fake_data(
 
 
 
-def _local_train_with_precomputed(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str) -> int:
+def _local_train_with_precomputed(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str, dtype_arg: str = "auto") -> int:
     """Train from local <data-dir>/embeddings/*.pt (produced by `precompute`)."""
     import json
     import time
@@ -137,7 +137,7 @@ def _local_train_with_precomputed(data_dir: Path, cfg: TrainConfig, max_steps: i
     avail = [r for r in rows if r.get("emb", "").split("/")[-1] in local_keys]
     if not avail:
         print(f"[train] local embeddings requested but none matched manifest ({len(rows)} rows, {len(local_keys)} .pt)", flush=True)
-        return _streaming_train(data_dir, cfg, max_steps, device)
+        return _streaming_train(data_dir, cfg, max_steps, device, dtype_arg)
     # Cap to max_steps * batch for smoke, else all
     import random as _rnd
     _rnd.Random(0).shuffle(avail)
@@ -151,10 +151,12 @@ def _local_train_with_precomputed(data_dir: Path, cfg: TrainConfig, max_steps: i
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
     dev = device if device in ("cuda", "cpu") and (device != "cuda" or _torch.cuda.is_available()) else "cpu"
-    # dtype: bf16 on Ampere+, else fp32
+    # dtype: honors --dtype, defaults to bf16 Ampere+ else fp32
     if dev == "cuda":
         p = _torch.cuda.get_device_properties(0)
-        dtype = _torch.bfloat16 if p.major >= 8 else _torch.float32
+        cc = p.major*10 + p.minor
+        dtype_map = {"auto": _torch.bfloat16 if cc>=80 else _torch.float32, "bf16": _torch.bfloat16, "fp16": _torch.float16, "fp32": _torch.float32}
+        dtype = dtype_map.get(dtype_arg, dtype_map["auto"])
     else:
         dtype = _torch.float32
     print(f"[train] local train: {len(sample)} rows, device={dev} dtype={dtype}", flush=True)
@@ -224,7 +226,7 @@ def _local_train_with_precomputed(data_dir: Path, cfg: TrainConfig, max_steps: i
     return 0
 
 
-def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str) -> int:  # noqa: C901
+def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str, dtype_arg: str = "auto") -> int:  # noqa: C901
     """Native HF streaming train — cluster-sampled RemoteShard, no grok import."""
     import json
     import time
@@ -258,12 +260,13 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             return _smoke_train_with_fake_data(data_dir, cfg, max_steps, device)
     else:
         rows = _fetch_manifest(cache_dir=str(data_dir / "cache"), token=tok_hf)
-    # Device / dtype (mirror grok logic: bf16 Ampere+, else fp32/fp16 via autocast)
+    # Device / dtype (mirror grok logic: bf16 Ampere+, else fp32/fp16 via autocast; --dtype overrides)
     dev = device if device in ("cuda","cpu") and (device!="cuda" or _torch.cuda.is_available()) else "cpu"
     if dev == "cuda":
         p = _torch.cuda.get_device_properties(0)
         cc = p.major*10 + p.minor
-        dtype = {"auto": _torch.bfloat16 if cc>=80 else (_torch.float16 if cc>=70 else _torch.float32)}["auto"]
+        dtype_map = {"auto": _torch.bfloat16 if cc>=80 else (_torch.float16 if cc>=70 else _torch.float32), "bf16": _torch.bfloat16, "fp16": _torch.float16, "fp32": _torch.float32}
+        dtype = dtype_map.get(dtype_arg, dtype_map["auto"])
         _torch.backends.cuda.matmul.allow_tf32 = True
     else:
         dtype = _torch.bfloat16 if False else _torch.float32
@@ -362,6 +365,7 @@ def run_train(
     backend=None,
     max_steps: int | None = None,
     device: str | None = None,
+    dtype: str = "auto",
 ) -> int:
     """Entry point for `cli train` non-dryrun.
 
@@ -403,10 +407,10 @@ def run_train(
     has_local_emb = local_emb_dir.is_dir() and any(local_emb_dir.glob("*.pt"))
     if has_local_emb:
         print(f"[train] local embeddings found at {local_emb_dir} — using local path", flush=True)
-        return _local_train_with_precomputed(dd, cfg, max_steps, dev)
+        return _local_train_with_precomputed(dd, cfg, max_steps, dev, dtype)
     print("[train] no local embeddings — streaming from HF (keypa/vision-adapter-embeddings)", flush=True)
     try:
-        return _streaming_train(dd, cfg, max_steps, dev)
+        return _streaming_train(dd, cfg, max_steps, dev, dtype)
     except Exception as e:
         import traceback
         print(f"[train] streaming train failed ({type(e).__name__}: {e})", flush=True)

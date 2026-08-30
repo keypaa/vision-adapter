@@ -168,6 +168,7 @@ def train_cmd(args: argparse.Namespace) -> int:
         backend=backend,
         max_steps=max_steps,
         device="cuda" if not dryrun else None,
+        dtype=getattr(args, "dtype", "auto"),
     )
 
 
@@ -246,6 +247,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--max-steps", type=int, default=None, help="max training steps")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
+    p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32 with true AMP; T4: use bf16 or fp32")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
@@ -260,6 +262,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir", default="data", help="data directory")
     p.add_argument("--max-steps", type=int, default=None, help="max training steps")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
+    p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
