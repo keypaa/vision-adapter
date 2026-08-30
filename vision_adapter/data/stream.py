@@ -252,12 +252,13 @@ def build_key_index(
     t0 = time.time()
     import pyarrow.parquet as pq
 
-    for i, sf in enumerate(stream_order):
+    def _one_shard(sf: str) -> dict[str, tuple[str, int]]:
         url = f"https://huggingface.co/datasets/{EMB_REPO}/resolve/main/{sf}"
         rs = RemoteShard(url, _remote_size(url))
         pf = pq.ParquetFile(rs)
         md = pf.metadata
         spans = _prefetch_key_spans(url, md)
+        shard_index: dict[str, tuple[str, int]] = {}
         row_cursor = 0
         for rgi in range(md.num_row_groups):
             lo, _ = rg_span(md, rgi, columns=("key",))
@@ -266,11 +267,26 @@ def build_key_index(
             keys_here = tbl.column("key").to_pylist()
             g0 = md.row_group(rgi).num_rows
             for j, k in enumerate(keys_here):
-                if k in index:
-                    raise AssertionError(f"duplicate embedding key: {k}")
-                index[k] = (sf, row_cursor + j)
+                if k in shard_index:
+                    raise AssertionError(f"duplicate embedding key in shard {sf}: {k}")
+                shard_index[k] = (sf, row_cursor + j)
             row_cursor += g0
-        print(f"[stream]   key index {i+1}/{len(stream_order)} {Path(sf).name} ({time.time()-t0:.0f}s)", flush=True)
+        return shard_index
+
+    # Multi-channel: 8 shards in parallel — 213s → ~35s on Colab
+    workers = min(8, len(stream_order))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_one_shard, sf): sf for sf in stream_order}
+        done = 0
+        for fut in as_completed(futs):
+            sf = futs[fut]
+            shard_index = fut.result()
+            for k, v in shard_index.items():
+                if k in index:
+                    raise AssertionError(f"duplicate embedding key across shards: {k}")
+                index[k] = v
+            done += 1
+            print(f"[stream]   key index {done}/{len(stream_order)} {Path(sf).name} ({time.time()-t0:.0f}s)", flush=True)
     print(f"[stream] key index complete: {len(index)} embeddings in {time.time()-t0:.0f}s", flush=True)
     if cache_dir:
         save_key_index(index, cache_path)
@@ -314,9 +330,15 @@ def build_epoch_plan(
 
 
 class EmbStreamDataset(torch.utils.data.IterableDataset):
-    """Shard-by-shard streaming over HTTPS with background prefetch."""
+    """Shard-by-shard streaming with next-RG prefetch.
 
-    PREFETCH_DEPTH = 2
+    A 1-worker background thread fetches the *next* row-group's
+    ~400MiB span (4-way chunked Range, disk_cache-aware) while the
+    current RG is yielded to the trainer. Hides ~30s fetch behind
+    ~10s train steps; disk_cache hits skip the thread entirely.
+    """
+
+    PREFETCH_DEPTH = 1
     MAX_RG_ROWS = 128
 
     def __init__(
@@ -335,7 +357,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
         if rg_cache_dir:
             os.makedirs(rg_cache_dir, exist_ok=True)
 
-    def __iter__(self):
+    def __iter__(self):  # noqa: C901
         import pyarrow.parquet as pq
 
         emitted = 0
@@ -355,34 +377,78 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
             want: dict[int, dict[int, dict]] = {}
             for r in rows_here:
                 want.setdefault(r["_row"] // g0, {})[r["_row"] % g0] = r
-            for rgi in sorted(want):
-                lo, hi = rg_span(md, rgi)
-                t0 = time.time()
-                rs.load_span(lo, hi)
-                dt = time.time() - t0
-                if dt > 2:
-                    print(f"[stream] streamed {Path(sf).name} rg{rgi} ({(hi-lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
-                tbl = pf.read_row_group(rgi, columns=["key", "n_vis", "vis_bytes"])
-                try:
-                    for j in sorted(want[rgi]):
-                        row = want[rgi][j]
-                        if emitted < self.start_pos:
+            rgis = sorted(want)
+
+            # Prefetch next RG on a side thread; current RG loads on main thread.
+            # The side thread just warms disk_cache (RemoteShard.load_span writes
+            # rg_*.bin), so the next rs.load_span hits the file and dt ~0.
+            prefetch: ThreadPoolExecutor | None = None
+            next_fut = None
+            if self.rg_cache_dir and len(rgis) > 1:
+                prefetch = ThreadPoolExecutor(max_workers=1)
+
+            try:
+                for idx, rgi in enumerate(rgis):
+                    # Kick off prefetch for rg[idx+1] if not already cached
+                    if prefetch is not None and idx + 1 < len(rgis) and next_fut is None:
+                        n_rgi = rgis[idx + 1]
+                        n_lo, n_hi = rg_span(md, n_rgi)
+                        # Use real shard size for cache key (not 0 — keys on [url,lo,hi])
+                        probe = RemoteShard.__new__(RemoteShard)
+                        probe.url = url  # type: ignore[attr-defined]
+                        probe.disk_cache = self.rg_cache_dir  # type: ignore[attr-defined]
+                        n_cf = probe._cache_file(n_lo, n_hi)
+                        if not (os.path.exists(n_cf) and os.path.getsize(n_cf) == n_hi - n_lo):
+                            def _bg(url=url, n_lo=n_lo, n_hi=n_hi, cache=self.rg_cache_dir, n_rgi=n_rgi, sf=sf):
+                                rs2 = RemoteShard(url, _remote_size(url), disk_cache=cache)
+                                t0 = time.time()
+                                rs2.load_span(n_lo, n_hi)
+                                dt = time.time() - t0
+                                if dt > 2:
+                                    print(f"[stream] prefetched {Path(sf).name} rg{n_rgi} ({(n_hi-n_lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
+
+                            next_fut = prefetch.submit(_bg)
+
+                    lo, hi = rg_span(md, rgi)
+                    t0 = time.time()
+                    rs.load_span(lo, hi)
+                    dt = time.time() - t0
+                    if dt > 2:
+                        print(f"[stream] streamed {Path(sf).name} rg{rgi} ({(hi-lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
+
+                    tbl = pf.read_row_group(rgi, columns=["key", "n_vis", "vis_bytes"])
+                    try:
+                        for j in sorted(want[rgi]):
+                            row = want[rgi][j]
+                            if emitted < self.start_pos:
+                                emitted += 1
+                                continue
+                            vb = tbl.column("vis_bytes")[j].as_py()
+                            nv = int(tbl.column("n_vis")[j].as_py())
+                            buf = bytearray(vb)
+                            del vb
+                            vis = (
+                                torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
+                                .view(torch.bfloat16)
+                                .reshape(-1, self.vision_dim)
+                                .float()
+                            )
+                            del buf
+                            assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
+                            yield {"vis": vis, "user": row["user"], "assistant": row["assistant"], "g": row.get("g", "?")}
                             emitted += 1
-                            continue
-                        vb = tbl.column("vis_bytes")[j].as_py()
-                        nv = int(tbl.column("n_vis")[j].as_py())
-                        buf = bytearray(vb)
-                        del vb
-                        vis = (
-                            torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
-                            .view(torch.bfloat16)
-                            .reshape(-1, self.vision_dim)
-                            .float()
-                        )
-                        del buf
-                        assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
-                        yield {"vis": vis, "user": row["user"], "assistant": row["assistant"], "g": row.get("g", "?")}
-                        emitted += 1
-                finally:
-                    del tbl
-                    rs._span = None
+                    finally:
+                        del tbl
+                        rs._span = None
+
+                    # Drain prefetch before next iteration so errors surface
+                    if next_fut is not None and next_fut.done():
+                        next_fut.result()
+                        next_fut = None
+            finally:
+                if prefetch is not None:
+                    # Cancel outstanding prefetch (best-effort)
+                    if next_fut is not None:
+                        next_fut.cancel()
+                    prefetch.shutdown(wait=False, cancel_futures=True)
+                rs._span = None  # type: ignore[assignment]
