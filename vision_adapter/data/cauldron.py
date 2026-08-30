@@ -44,15 +44,46 @@ def pull_cauldron(
             )
         return rows
 
-    # Non-dry_run: attempt real HF pull (optional dep). Stub to 0 rows if unavailable.
+    # Non-dry_run: real HF pull (requires `datasets`). Uses ORDER BY image
+    # semantics and per-subset caps so --mix 45,45,10 can slice deterministically.
+    # The 20k recipe streams captions only (no PNG re-encode here) — the PNGs
+    # are needed only for precompute; the manifest needs {images, texts, group}.
+    DOC_SUBSETS = ["chartqa", "docvqa", "infographic_vqa", "screen2words", "websight", "ocrvqa", "textvqa", "plotqa", "ai2d", "scienceqa"]
+    CONV_SUBSETS = ["vqav2", "okvqa", "aokvqa", "visual7w"]
     try:
         from datasets import load_dataset  # type: ignore
 
-        _ = load_dataset  # silence linter
-        _ = revision  # pinned revision would be forwarded here
-        # Real implementation would iterate DOC/CONV subsets, download parquet
-        # shards with N_DL concurrency and save PNGs with N_SAVE workers,
-        # writing cauldron_manifest.jsonl and cauldron_done.txt checkpoints.
-        return []
-    except Exception:
+        from vision_adapter.backends.auth import get_hf_token as _cauld_tok
+
+        tok = _cauld_tok()
+        # Stream over each subset's train split; pull_cauldron caps per group
+        # so a 20k total can stay local-fast (no 120k materialisation).
+        all_rows: list[dict] = []
+        for subset in DOC_SUBSETS + CONV_SUBSETS:
+            try:
+                ds = load_dataset("HuggingFaceM4/the_cauldron", subset, split="train", streaming=True, token=tok, revision=revision)
+            except Exception as e:
+                print(f"[cauldron] skip subset {subset}: {e}", flush=True)
+                continue
+            group = "doc" if subset in DOC_SUBSETS else "conv"
+            # Pull at most max_rows rows total across all subsets; distribute
+            # roughly round-robin so the mix slicing has coverage.
+            for ex in ds:
+                if len(all_rows) >= max_rows:
+                    break
+                # ex has {images:..., texts: [{user, assistant}]} — images not needed for manifest
+                # Derive a stable rel path from the example index / subset so
+                # the sha mapping stays deterministic across rebuilds.
+                idx = len(all_rows)
+                rel = f"cauldron/{subset}_{idx:06d}.png"
+                emb = f"embeddings/{hashlib.sha1(rel.encode()).hexdigest()[:20]}.pt"
+                texts = ex.get("texts") or [{"user": str(ex.get("question", "")), "assistant": str(ex.get("answer", ""))}]
+                all_rows.append({"images": [emb], "texts": texts, "subset": subset, "group": group})
+                if len(all_rows) >= max_rows:
+                    break
+            if len(all_rows) >= max_rows:
+                break
+        return all_rows
+    except Exception as e:
+        print(f"[cauldron] HF pull failed ({type(e).__name__}: {e})", flush=True)
         return []

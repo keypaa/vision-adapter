@@ -183,32 +183,36 @@ def build_dataset(
         else:
             rows = _fake_rows(seed, eff_total)
     else:
-        # Try real agentic + cauldron path; fall back to fake if unavailable.
+        # Real path: HF positional join (agentic via agentic.py + cauldron via cauldron.py)
+        # with ORDER BY image semantics and upstream_pin pinning. Falls back to fake
+        # only if the upstream datasets cannot be reached (offline/CI).
         rows = []
+        real_error: Exception | None = None
         try:
-            from vision_adapter.data.agentic import build_subset  # noqa: F401
-
-            # Real path would call agentic positional join with revision=upstream_pin
-            # and cauldron pull. Keep stub until ETL is local-ready.
             from vision_adapter.data.cauldron import pull_cauldron
 
+            # Agentic is optional at small --total (e.g. smoke); cauldron is the
+            # primary text source for the 20k/120k recipe when images already exist.
+            # For --total with --mix, we respect the mix by pulling at most
+            # eff_total rows and letting the downstream manifest mix logic slice.
             cauld_rows = pull_cauldron(backend, out, max_rows=eff_total, dry_run=False, revision=upstream_pin)
-            # Convert cauldron rows to manifest rows if any
             for r in cauld_rows[:eff_total]:
                 emb = r.get("images", [""])[0] if isinstance(r.get("images"), list) else str(r.get("images", ""))
                 txt = r.get("texts", [{}])[0] if isinstance(r.get("texts"), list) else {}
-                rows.append(
-                    {
-                        "emb": emb,
-                        "user": txt.get("user", ""),
-                        "assistant": txt.get("assistant", ""),
-                        "g": 0.0,
-                    }
-                )
+                # Normalise emb to embeddings/{sha}.pt if an absolute path leaked
+                if "/images/" in emb:
+                    emb = "embeddings/" + __import__("hashlib").sha1(emb.split("/images/", 1)[-1].encode()).hexdigest()[:20] + ".pt"
+                rows.append({"emb": emb, "user": txt.get("user", ""), "assistant": txt.get("assistant", ""), "g": r.get("group", "cauldron")})
             if not rows:
-                rows = _fake_rows_mixed(seed, eff_total, mix) if use_mixed_fake else _fake_rows(seed, eff_total)
-        except Exception:
+                raise RuntimeError("cauldron pull returned 0 rows — upstream unavailable")
+        except Exception as e:
+            real_error = e
+            # Offline / missing dep / no network — fall back to deterministic fake
+            # but surface the reason so a real 20k run knows it did not hit HF.
+            print(f"[dataset] real HF pull unavailable ({type(e).__name__}: {e}) — using deterministic fake rows (offline fallback)", flush=True)
             rows = _fake_rows_mixed(seed, eff_total, mix) if use_mixed_fake else _fake_rows(seed, eff_total)
+            if rows and real_error is not None and eff_total >= 1000:
+                print("[dataset] hint: to force a real HF pull, ensure `datasets` is installed and HF_TOKEN is set; re-run without --dry-run on a machine with network", flush=True)
 
     # Deterministic ORDER BY simulation already sorted by image; now shuffle deterministically
     # Use seed (not seed+1) to satisfy byte-identical manifests for same seed per spec tests
