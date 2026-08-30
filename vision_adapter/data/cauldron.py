@@ -22,6 +22,7 @@ def pull_cauldron(
     max_rows: int = 54000,
     dry_run: bool = False,
     revision: str | None = None,
+    allowed_groups: set[str] | None = None,
 ) -> list[dict]:
     """Pull permissive Cauldron subsets and return row dicts.
 
@@ -59,25 +60,33 @@ def pull_cauldron(
         # Stream over each subset's train split; pull_cauldron caps per group
         # so a 20k total can stay local-fast (no 120k materialisation).
         all_rows: list[dict] = []
-        for subset in DOC_SUBSETS + CONV_SUBSETS:
+        per_sub_idx: dict[str, int] = {}
+        if allowed_groups is not None:
+            wanted: list[str] = []
+            if "doc" in allowed_groups:
+                wanted.extend(DOC_SUBSETS)
+            if "conv" in allowed_groups:
+                wanted.extend(CONV_SUBSETS)
+            subsets = wanted
+        else:
+            subsets = DOC_SUBSETS + CONV_SUBSETS
+        for subset in subsets:
             try:
                 ds = load_dataset("HuggingFaceM4/the_cauldron", subset, split="train", streaming=True, token=tok, revision=revision)
             except Exception as e:
                 print(f"[cauldron] skip subset {subset}: {e}", flush=True)
                 continue
             group = "doc" if subset in DOC_SUBSETS else "conv"
-            # Pull at most max_rows rows total across all subsets; distribute
-            # roughly round-robin so the mix slicing has coverage.
             for ex in ds:
                 if len(all_rows) >= max_rows:
                     break
-                # ex has {images:..., texts: [{user, assistant}]} — images not needed for manifest
-                # Derive a stable rel path from the example index / subset so
-                # the sha mapping stays deterministic across rebuilds.
-                idx = len(all_rows)
-                rel = f"cauldron/{subset}_{idx:06d}.png"
+                i = per_sub_idx.get(subset, 0)
+                per_sub_idx[subset] = i + 1
+                rel = f"cauldron/{subset}-{i:07d}-0.png"
                 emb = f"embeddings/{hashlib.sha1(rel.encode()).hexdigest()[:20]}.pt"
                 texts = ex.get("texts") or [{"user": str(ex.get("question", "")), "assistant": str(ex.get("answer", ""))}]
+                if isinstance(texts, dict):
+                    texts = [texts]
                 all_rows.append({"images": [emb], "texts": texts, "subset": subset, "group": group})
                 if len(all_rows) >= max_rows:
                     break

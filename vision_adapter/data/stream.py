@@ -240,8 +240,14 @@ def build_key_index(
     if not rebuild:
         index, ok = load_key_index(cache_path)
         if ok and len(index) > 0:
-            print(f"[stream] key index loaded from cache ({len(index)} embeddings)", flush=True)
+            print(f"[stream] key index loaded from cache ({len(index)} embeddings) <- {cache_path}", flush=True)
             return index
+        else:
+            # Verbose miss reason so Colab rebuild is explainable
+            if cache_dir and not __import__("os").path.exists(cache_path):
+                print(f"[stream] key index cache miss (no file at {cache_path}) — building", flush=True)
+            elif not ok:
+                print(f"[stream] key index cache invalid (version mismatch) at {cache_path} — rebuilding", flush=True)
     index: dict[str, tuple[str, int]] = {}
     t0 = time.time()
     import pyarrow.parquet as pq

@@ -227,28 +227,35 @@ def build_dataset(  # noqa: C901
 
             # --- cauldron (doc/conv) ---
             from vision_adapter.data.cauldron import pull_cauldron as _pull_cauld
-            # Pull doc/conv separately so 45/10 mix is respected, not doc-heavy
+
             cauld_doc: list[dict[str, Any]] = []
             cauld_conv: list[dict[str, Any]] = []
             if n_doc > 0 or n_conv > 0:
-                # _pull_cauld streams; we call it twice with per-group quotas via
-                # a small helper that filters by group after pull, or by pulling
-                # with max_rows and slicing. Simpler: pull up to n_doc+n_conv then split.
-                raw = _pull_cauld(backend, out, max_rows=n_doc + n_conv, dry_run=False, revision=upstream_pin)
-                for r in raw:
-                    g = r.get("group", "doc")
+                doc_raw: list[dict] = []
+                conv_raw: list[dict] = []
+                if n_doc > 0:
+                    doc_raw = _pull_cauld(backend, out, max_rows=n_doc * 2, dry_run=False, revision=upstream_pin, allowed_groups={"doc"})
+                    doc_raw = [r for r in doc_raw if r.get("group", "doc") != "conv"][:n_doc]
+                if n_conv > 0:
+                    conv_raw = _pull_cauld(backend, out, max_rows=n_conv * 4, dry_run=False, revision=upstream_pin, allowed_groups={"conv"})
+                    conv_raw = [r for r in conv_raw if r.get("group") == "conv"][:n_conv]
+                    if len(conv_raw) < n_conv:
+                        extra = _pull_cauld(backend, out, max_rows=(n_conv - len(conv_raw)) * 4, dry_run=False, revision=upstream_pin, allowed_groups={"conv"})
+                        for r in extra:
+                            if r.get("group") == "conv" and len(conv_raw) < n_conv:
+                                conv_raw.append(r)
+                for r in doc_raw:
                     emb = r.get("images", [""])[0] if isinstance(r.get("images"), list) else str(r.get("images", ""))
                     if "/images/" in emb:
                         emb = "embeddings/" + hashlib.sha1(emb.split("/images/", 1)[-1].encode()).hexdigest()[:20] + ".pt"
                     txt = r.get("texts", [{}])[0] if isinstance(r.get("texts"), list) else {}
-                    row = {"emb": emb, "user": txt.get("user", ""), "assistant": txt.get("assistant", ""), "g": g}
-                    if g == "conv" and len(cauld_conv) < n_conv:
-                        cauld_conv.append(row)
-                    elif g != "conv" and len(cauld_doc) < n_doc:
-                        cauld_doc.append(row)
-                    elif g == "conv" and len(cauld_conv) >= n_conv and len(cauld_doc) < n_doc:
-                        # conv quota full, spill conv into doc only if doc still short
-                        pass
+                    cauld_doc.append({"emb": emb, "user": txt.get("user", ""), "assistant": txt.get("assistant", ""), "g": "doc"})
+                for r in conv_raw:
+                    emb = r.get("images", [""])[0] if isinstance(r.get("images"), list) else str(r.get("images", ""))
+                    if "/images/" in emb:
+                        emb = "embeddings/" + hashlib.sha1(emb.split("/images/", 1)[-1].encode()).hexdigest()[:20] + ".pt"
+                    txt = r.get("texts", [{}])[0] if isinstance(r.get("texts"), list) else {}
+                    cauld_conv.append({"emb": emb, "user": txt.get("user", ""), "assistant": txt.get("assistant", ""), "g": "conv"})
                 # If streaming gave 0 rows, fall back to fake but keep agentic
                 if not cauld_doc and not cauld_conv and (n_doc + n_conv) > 0:
                     raise RuntimeError("cauldron pull returned 0 rows — upstream unavailable")
