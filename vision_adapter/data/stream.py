@@ -47,8 +47,9 @@ def _remote_size(url: str) -> int:
     return int(urllib.request.urlopen(req).headers["Content-Length"])
 
 
-def _fetch_range(url: str, start: int, end: int, retries: int = 3) -> bytes:
+def _fetch_range(url: str, start: int, end: int, retries: int = 3) -> bytes:  # noqa: C901
     import urllib.request
+    from http.client import IncompleteRead
 
     headers = dict(_auth_headers())
     headers["Range"] = f"bytes={start}-{end}"
@@ -56,7 +57,13 @@ def _fetch_range(url: str, start: int, end: int, retries: int = 3) -> bytes:
     for attempt in range(retries):
         try:
             req = urllib.request.Request(url, headers=headers)
-            return urllib.request.urlopen(req).read()
+            return urllib.request.urlopen(req, timeout=120).read()
+        except IncompleteRead as e:
+            # HF CDN truncated mid-chunk (common under chunked Range) — retry fresh TCP
+            last_err = e
+            # Discard partial, retry with backoff; avoid tight loop on 20MiB+ truncations
+            if attempt < retries - 1:
+                time.sleep(1.0 * (2**attempt))
         except Exception as e:
             last_err = e
             if attempt < retries - 1:
