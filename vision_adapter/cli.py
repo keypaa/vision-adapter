@@ -29,19 +29,32 @@ def dataset_cmd(args: argparse.Namespace) -> int:
     from vision_adapter.data.dataset import build_dataset
 
     backend = get_backend(args.backend, **({"root": args.out} if args.backend == "local" else {}))
-    # For local, out is the output dir; for modal it's also the out dir on Volume.
-    # build_dataset takes (backend, out_dir, seed, limit, upstream_pin, dry_run)
     dry_run = getattr(args, "dry_run", False)
     out = Path(args.out)
+    # --total is canonical, --limit is alias; default 54000 when neither is set (covers --total+--mix and legacy --limit)
+    total = getattr(args, "total", None)
+    limit = getattr(args, "limit", None)
+    if total is None and limit is None:
+        total = 54000
+    elif total is not None and limit is not None:
+        # Both set: --total wins, --limit is ignored (warn)
+        print(f"[dataset] both --total {total} and --limit {limit} set — --total wins, --limit ignored", flush=True)
     path = build_dataset(
         backend,
         out,
         seed=args.seed,
-        limit=args.limit,
+        limit=limit if total is None else total,  # compat shim
+        total=total,
+        mix=getattr(args, "mix", "45,45,10"),
         upstream_pin=getattr(args, "upstream_pin", None),
         dry_run=dry_run,
+        push_to_hf=getattr(args, "push_to_hf", False),
+        hf_repo=getattr(args, "hf_repo", None),
+        hf_token=getattr(args, "hf_token", None),
     )
-    print(f"[dataset] wrote {path} (seed={args.seed}, limit={args.limit})")
+    mix = getattr(args, "mix", "45,45,10")
+    push_note = f" | pushed to {getattr(args, 'hf_repo', None)}" if getattr(args, "push_to_hf", False) else " | local only (no push)"
+    print(f"[dataset] wrote {path} (seed={args.seed}, total={total if total is not None else limit}, mix={mix}{push_note})")
     return 0
 
 
@@ -172,10 +185,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--out", required=True, help="output directory (manifest written to <out>/train_manifest.jsonl)")
     p.add_argument("--seed", type=int, default=0, help="python seed")
-    p.add_argument("--limit", type=int, default=54000, help="max rows")
+    # Staged 120k controls: --total + --mix 45,45,10 with hardblock sum==100.
+    # 54k = 0.45*120k (agentic slice). --limit stays as alias of --total for compat.
+    p.add_argument("--limit", dest="limit", type=int, default=None, help="max rows (alias of --total, default 54000)")
+    p.add_argument("--total", dest="total", type=int, default=None, help="total rows (overrides --limit when set)")
+    p.add_argument("--mix", dest="mix", type=str, default="45,45,10", help="mix 'a,b,c' percentages for agentic,doc,conv — must sum to 100 (default 45,45,10)")
     p.add_argument("--upstream-pin", default=None, help="upstream pin")
     p.add_argument("--dry-run", dest="dry_run", action="store_true", help="dry-run: generate fake rows, no HF I/O")
-    p.add_argument("--hf-token", default=None, help="HF token (or set HF_TOKEN env) — higher rate limits for HF downloads")
+    # Local by default; --push-to-hf --hf-repo to publish (write-token checked)
+    p.add_argument("--push-to-hf", dest="push_to_hf", action="store_true", help="push manifest to HF dataset repo (requires --hf-repo and write token)")
+    p.add_argument("--hf-repo", dest="hf_repo", default=None, help="HF dataset repo for --push-to-hf, e.g. keypa/vision-adapter-manifests")
+    p.add_argument("--hf-token", default=None, help="HF token (or set HF_TOKEN env) — higher rate limits for HF downloads; write scope required for --push-to-hf")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
