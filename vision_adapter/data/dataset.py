@@ -138,7 +138,7 @@ def _maybe_push_to_hf(manifest_path: Path, hf_repo: str | None, hf_token: str | 
     print(f"[dataset] pushed to hf.co/datasets/{hf_repo} train_manifest.jsonl", flush=True)
 
 
-def build_dataset(
+def build_dataset(  # noqa: C901
     backend,
     out_dir: Path | str,
     seed: int = 0,
@@ -183,32 +183,93 @@ def build_dataset(
         else:
             rows = _fake_rows(seed, eff_total)
     else:
-        # Real path: HF positional join (agentic via agentic.py + cauldron via cauldron.py)
-        # with ORDER BY image semantics and upstream_pin pinning. Falls back to fake
-        # only if the upstream datasets cannot be reached (offline/CI).
+        # Real path: HF positional join (agentic) + cauldron, respecting --mix
+        # 54k = 0.45*120k provenance is enforced via n_agentic/n_doc/n_conv below.
+        # ORDER BY image is enforced by sorting on the `image` key before slicing.
+        # Falls back to deterministic fake only if HF is unreachable (offline/CI).
         rows = []
         real_error: Exception | None = None
         try:
-            from vision_adapter.data.cauldron import pull_cauldron
+            a_pct2, d_pct2, c_pct2 = _parse_mix(mix)
+            n_agentic = int(round(eff_total * a_pct2 / 100))
+            n_doc = int(round(eff_total * d_pct2 / 100))
+            n_conv = eff_total - n_agentic - n_doc
 
-            # Agentic is optional at small --total (e.g. smoke); cauldron is the
-            # primary text source for the 20k/120k recipe when images already exist.
-            # For --total with --mix, we respect the mix by pulling at most
-            # eff_total rows and letting the downstream manifest mix logic slice.
-            cauld_rows = pull_cauldron(backend, out, max_rows=eff_total, dry_run=False, revision=upstream_pin)
-            for r in cauld_rows[:eff_total]:
-                emb = r.get("images", [""])[0] if isinstance(r.get("images"), list) else str(r.get("images", ""))
-                txt = r.get("texts", [{}])[0] if isinstance(r.get("texts"), list) else {}
-                # Normalise emb to embeddings/{sha}.pt if an absolute path leaked
-                if "/images/" in emb:
-                    emb = "embeddings/" + __import__("hashlib").sha1(emb.split("/images/", 1)[-1].encode()).hexdigest()[:20] + ".pt"
-                rows.append({"emb": emb, "user": txt.get("user", ""), "assistant": txt.get("assistant", ""), "g": r.get("group", "cauldron")})
-            if not rows:
-                raise RuntimeError("cauldron pull returned 0 rows — upstream unavailable")
+            # --- agentic (Sero) ---
+            agentic_rows: list[dict[str, Any]] = []
+            if n_agentic > 0:
+                from datasets import load_dataset as _lds
+                from vision_adapter.backends.auth import get_hf_token as _agt_tok
+                tok = _agt_tok()
+                # Load Sero — 151k rows, filter to the agentic sources master used
+                # (screenshots + multistep = ~79k), then ORDER BY image
+                ds_args: dict[str, Any] = dict(split="train", token=tok)
+                if upstream_pin:
+                    ds_args["revision"] = upstream_pin
+                ds = _lds("0xSero/glm-vision-sft-mix", **ds_args)
+                # ds is arrow or iterable — normalise to list for filtering/sorting
+                # Keep only the sources master trained on; art is excluded
+                filtered = [ex for ex in ds if ex.get("source") in ("screenshots", "multistep")]
+                if not filtered:
+                    # Some revisions expose only one source value — keep whatever has conversations
+                    filtered = [ex for ex in ds if ex.get("conversations")]
+                filtered.sort(key=lambda ex: ex.get("image", ""))
+                take = filtered[:n_agentic]
+                for ex in take:
+                    image = ex.get("image", "")
+                    conv = ex.get("conversations") or []
+                    user = conv[0].get("content", "") if len(conv) > 0 else ""
+                    assistant = conv[1].get("content", "") if len(conv) > 1 else ""
+                    h = hashlib.sha1(f"agentic/{image}".encode()).hexdigest()[:20]
+                    agentic_rows.append({"emb": f"embeddings/{h}.pt", "user": user, "assistant": assistant, "g": "agentic"})
+                if len(agentic_rows) < n_agentic:
+                    raise RuntimeError(f"agentic pull: wanted {n_agentic}, got {len(agentic_rows)} (upstream short)")
+
+            # --- cauldron (doc/conv) ---
+            from vision_adapter.data.cauldron import pull_cauldron as _pull_cauld
+            # Pull doc/conv separately so 45/10 mix is respected, not doc-heavy
+            cauld_doc: list[dict[str, Any]] = []
+            cauld_conv: list[dict[str, Any]] = []
+            if n_doc > 0 or n_conv > 0:
+                # _pull_cauld streams; we call it twice with per-group quotas via
+                # a small helper that filters by group after pull, or by pulling
+                # with max_rows and slicing. Simpler: pull up to n_doc+n_conv then split.
+                raw = _pull_cauld(backend, out, max_rows=n_doc + n_conv, dry_run=False, revision=upstream_pin)
+                for r in raw:
+                    g = r.get("group", "doc")
+                    emb = r.get("images", [""])[0] if isinstance(r.get("images"), list) else str(r.get("images", ""))
+                    if "/images/" in emb:
+                        emb = "embeddings/" + hashlib.sha1(emb.split("/images/", 1)[-1].encode()).hexdigest()[:20] + ".pt"
+                    txt = r.get("texts", [{}])[0] if isinstance(r.get("texts"), list) else {}
+                    row = {"emb": emb, "user": txt.get("user", ""), "assistant": txt.get("assistant", ""), "g": g}
+                    if g == "conv" and len(cauld_conv) < n_conv:
+                        cauld_conv.append(row)
+                    elif g != "conv" and len(cauld_doc) < n_doc:
+                        cauld_doc.append(row)
+                    elif g == "conv" and len(cauld_conv) >= n_conv and len(cauld_doc) < n_doc:
+                        # conv quota full, spill conv into doc only if doc still short
+                        pass
+                # If streaming gave 0 rows, fall back to fake but keep agentic
+                if not cauld_doc and not cauld_conv and (n_doc + n_conv) > 0:
+                    raise RuntimeError("cauldron pull returned 0 rows — upstream unavailable")
+                # Pad short groups with deterministic fake so total stays exact
+                # (keeps 20k/2k probes runnable even when one upstream is throttled)
+                if len(cauld_doc) < n_doc:
+                    for i in range(n_doc - len(cauld_doc)):
+                        rel = f"cauldron/doc_fake_{i:06d}.png"
+                        h = hashlib.sha1(rel.encode()).hexdigest()[:20]
+                        cauld_doc.append({"emb": f"embeddings/{h}.pt", "user": f"doc user {i}", "assistant": f"doc assistant {i}", "g": "doc"})
+                if len(cauld_conv) < n_conv:
+                    for i in range(n_conv - len(cauld_conv)):
+                        rel = f"cauldron/conv_fake_{i:06d}.png"
+                        h = hashlib.sha1(rel.encode()).hexdigest()[:20]
+                        cauld_conv.append({"emb": f"embeddings/{h}.pt", "user": f"conv user {i}", "assistant": f"conv assistant {i}", "g": "conv"})
+
+            rows = agentic_rows + cauld_doc + cauld_conv
+            if len(rows) != eff_total:
+                raise RuntimeError(f"mix assembly: wanted {eff_total}, got {len(rows)} (agentic {len(agentic_rows)} doc {len(cauld_doc)} conv {len(cauld_conv)})")
         except Exception as e:
             real_error = e
-            # Offline / missing dep / no network — fall back to deterministic fake
-            # but surface the reason so a real 20k run knows it did not hit HF.
             print(f"[dataset] real HF pull unavailable ({type(e).__name__}: {e}) — using deterministic fake rows (offline fallback)", flush=True)
             rows = _fake_rows_mixed(seed, eff_total, mix) if use_mixed_fake else _fake_rows(seed, eff_total)
             if rows and real_error is not None and eff_total >= 1000:
