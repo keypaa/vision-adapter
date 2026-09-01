@@ -113,6 +113,52 @@ exactly why we log everything (see OPERATIONS.md).
 ./data/runs.jsonl                           # experiment registry (vision_adapter/registry.py)
 ```
 
+## Measured `n_vis` distribution (vision tokens per image)
+
+Sourced from `keypa/vision-adapter-embeddings` (`103 shards ×1360 = 136267 rows`
+via `vision_adapter/data/stream.py:RemoteShard` `n_vis`-only Range, no
+`vis_bytes` on disk; 101 real shards after smoke `emb_0000/0001` excluded;
+`vision_adapter/models/preprocess.py:navit_resize` contract
+`≤65536 patches, ≤7168 px/side, pad-to-28, 14 px patch, 2×2 merge`).
+
+*Full 101-shard histogram (`136267` rows, `8-way` parallel, `2026-08-30`):*
+
+| `n_vis` bucket | count | share | meaning for GPU |
+|---|---|---|---|
+| `0-100` | `11094` | `8.1%` | tiny icons `~32-100` → `0.07 MiB` transient, but batched with `4900` → `38 MiB` transient `~500×` swing within one `make_collate` batch — eager `L` tail inflates to `39k` tokens at `bs8` |
+| `101-500` | `90961` | `66.8%` | **dominant** — median screenshot `avg 836` → `~400` tokens after `2×2 sd2_tpool`; median batch is medium |
+| `501-1000` | `12787` | `9.4%` |  |
+| `1001-2000` | `6538` | `4.8%` |  |
+| `2001-4900` | `10065` | `7.4%` | large screenshot `~19600 raw → 38 MB` before `2×2 merge` |
+| `4901+` | `4822` | `3.5%` | `MAX_PATCHES=4900` overflow — split `RG` `306 MiB` not `450 MiB` (`rg21 54 MiB` observed), `<1%` hit per doc |
+
+`global min 16 max 16653`, `per-shard 20–35 min` — matches precompute
+`35→4900` spread flagged as cheapest `10–20%` fragmentation win (see
+`docs/research/best-practices.md` and `docs/TRAINING_PLAN.md:31`).
+
+**Why bucketing matters now:**
+
+`vision_adapter/data/stream.py:build_epoch_plan` currently seed-shuffles whole
+shards (`Random(0).shuffle`) and takes whole shards greedily until `sample_size`
+(`cluster plan: 1959 rows from 101 shards → ~19 rows/shard → ~1 RG/shard` for
+`2k`). So one `bs8` batch can be `8×~500` (`4k` tokens, `2 GiB` eager) and the
+next `8×4900` (`39k` tokens, `46 GiB` eager before `train.py:_make_chunked_eager`
+`2**26` budget), with `GELU 4096→8192` activations swinging `~10×` — `gnorm`
+`215→129`, `26s/step` spikes, `peak=12.32 GiB` variance at L4 `bs16` already
+measured. The `101-500` majority (`66.8%`) should not pay `4900`'s cost on every
+batch. Same fragmentation at precompute: `greedy pack` in input order leaves
+slack because small `140-patch` and huge `19600-patch` land in one `patch_cap`.
+
+**Next optimization (deferred `Step 6` / `TP=2`, not gated on `200/200` probe):**
+
+* Enrich `key_index` sidecar or `manifest` rows with `n_vis` (fetched with the
+  `key` column at `vision_adapter/data/stream.py:_prefetch_key_spans` — already
+  `~KB` per `RG`) and sort `plan` rows by `n_vis` before batching, or bucket
+  `small/medium/large` explicitly — so `B300`/T4 batches are size-homogeneous.
+* At `vision_adapter/models/precompute.py` sort by `n_vis` before `greedy
+  packing` (one `sorted(cache_items, key=…)` — zero numerical risk, `10–20%`
+  fragmentation gone, `nvidia-smi util` up).
+
 Header-first manifest format (see `vision_adapter/manifest.py`):
 line 0 is `{"type":"manifest_header","manifest_version":1,"git_sha":...,"seeds":{...},"upstream":{...},"shard_set_hash":...,"row_count":N}`.
 The `ORDER BY image` fix makes the agentic 54k selection deterministic across
