@@ -744,19 +744,74 @@ def train_b300():
 
 
 # Phase 4 — HF-only training (drop vision-adapter-data 930GiB volume)
+# Ladder: probe 2k/200 Qwen2B + dryrun 70GiB gate MUST pass before train_hf.
 # Uses vision_adapter/data/stream.py hf_transfer LRU (warm 7ms vs volume 4ms, 0.7% vs 0.4% of step)
 # Ephemeral hf_cache only; no /data mount. Delete volume after Gates 1-3:
 #   modal volume delete vision-adapter-data  (keep vision-adapter-hf as 64GiB warm cache if strict 4ms cold needed)
+def _hf_dryrun_impl(mem_cap: float, offload: bool):  # noqa: C901
+    """HF streaming dryrun: 1 fwd/bwd via Qwen2B streaming (not Volume EmbSFT), peak gate."""
+    import pathlib
+    import torch
+
+    torch.backends.cuda.matmul.allow_tf32 = True
+    props = torch.cuda.get_device_properties(0)
+    print(f"[hf-dryrun] gpu={props.name} cc={props.major}.{props.minor} vram={props.total_memory/2**30:.0f}GiB offload={'on' if offload else 'OFF'} (HF streaming)", flush=True)
+    # Use vision_adapter/train.py streaming path with max_steps=1 — this exercises the real HF pipeline
+    # (key_index 0.2s cache hit, cluster plan bucketed, hf_transfer warm 7ms) at batch=8
+    from vision_adapter.config import default_config
+    from vision_adapter.train import run_train
+
+    cfg = default_config()
+    # Dryrun is 1 step, batch=8, measures peak — same gate as Volume _dryrun_impl
+    t0 = time.time()
+    rc = run_train(data_dir=pathlib.Path("/tmp/hf_stream"), cfg=cfg, max_steps=1, device="cuda", dtype="auto")
+    peak = torch.cuda.max_memory_allocated() / 2**30
+    cur = torch.cuda.memory_allocated() / 2**30
+    line = f"[hf-dryrun] rc={rc} mem_alloc={cur:.2f}GiB peak={peak:.2f}GiB budget={mem_cap:.0f}GiB -> {'PASS' if peak < mem_cap else 'FAIL'} wall={(time.time()-t0)/60:.1f}min"
+    print(line, flush=True)
+    # Persist same report path as Volume dryrun so train_hf can gate on it
+    try:
+        os.makedirs("/tmp", exist_ok=True)
+        with open("/tmp/hf_dryrun_report.txt", "w") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    assert peak < mem_cap, "HF MEMORY GATE FAIL — do not run train_hf"
+
+
+@app.function(image=train_image, gpu=GPU, volumes={HF_CACHE: hf_vol},
+              timeout=3600, memory=f"{A100_CONTAINER_RAM_GB}GB")
+def train_hf_dryrun():
+    """Phase 4 gate: HF streaming dryrun on A100 (1 step, peak <70GiB) — run before train_hf_a100."""
+    _hf_dryrun_impl(GPU_MEM_CAP_GIB, offload=True)
+
+
+@app.function(image=train_image_b300, gpu=B300_GPU, volumes={HF_CACHE: hf_vol},
+              timeout=3600, memory=f"{B300_CONTAINER_RAM_GB}GB")
+def train_hf_dryrun_b300():
+    """Phase 4 gate: HF streaming dryrun on B300 (all-in-VRAM, peak <250GiB)."""
+    _hf_dryrun_impl(B300_GPU_MEM_CAP_GIB, offload=False)
+
+
 @app.function(image=train_image_b300, gpu=B300_GPU, volumes={HF_CACHE: hf_vol},
               timeout=86400, memory=f"{B300_CONTAINER_RAM_GB}GB")
 def train_hf():
-    """Phase 4 HF streaming on B300 — no /data volume, ephemeral hf_cache only (warm 7ms)."""
+    """Phase 4 HF streaming on B300 — no /data volume, ephemeral hf_cache only (warm 7ms). Gated on dryrun."""
+    # Gate: require hf_dryrun PASS (same discipline as Volume train_dryrun → train)
+    if not os.path.exists("/tmp/hf_dryrun_report.txt"):
+        print("[train_hf] ABORT: run `modal run modal_train.py::train_hf_dryrun_b300` first (peak gate not found at /tmp/hf_dryrun_report.txt)", flush=True)
+        raise SystemExit(2)
+    with open("/tmp/hf_dryrun_report.txt") as f:
+        txt = f.read()
+    if "PASS" not in txt:
+        print(f"[train_hf] ABORT: last hf_dryrun was FAIL: {txt.strip()}", flush=True)
+        raise SystemExit(2)
+    print(f"[train_hf] gate PASS ({txt.strip()}) — proceeding to full SFT", flush=True)
     import pathlib
 
     from vision_adapter.config import default_config
 
     cfg = default_config()
-    # HF streaming via vision_adapter/train.py (cluster sampling + bucketed plan + hf_transfer LRU)
     from vision_adapter.train import run_train
 
     run_train(data_dir=pathlib.Path("/tmp/hf_stream"), cfg=cfg, max_steps=None, device="cuda", dtype="auto")
@@ -765,7 +820,16 @@ def train_hf():
 @app.function(image=train_image, gpu=GPU, volumes={HF_CACHE: hf_vol},
               timeout=86400, memory=f"{A100_CONTAINER_RAM_GB}GB")
 def train_hf_a100():
-    """Phase 4 HF streaming on A100 — no /data volume."""
+    """Phase 4 HF streaming on A100 — no /data volume. Gated on train_hf_dryrun."""
+    if not os.path.exists("/tmp/hf_dryrun_report.txt"):
+        print("[train_hf_a100] ABORT: run `modal run modal_train.py::train_hf_dryrun` first", flush=True)
+        raise SystemExit(2)
+    with open("/tmp/hf_dryrun_report.txt") as f:
+        txt = f.read()
+    if "PASS" not in txt:
+        print(f"[train_hf_a100] ABORT: last hf_dryrun was FAIL: {txt.strip()}", flush=True)
+        raise SystemExit(2)
+    print(f"[train_hf_a100] gate PASS ({txt.strip()}) — proceeding", flush=True)
     import pathlib
 
     from vision_adapter.config import default_config
