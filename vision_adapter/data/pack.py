@@ -25,6 +25,40 @@ class FileEntryLike:
         self.path = path
 
 
+def _bucket_id(n_vis: int) -> int:
+    """6-bucket id from docs/DATA.md histogram (0-100/101-500/501-1000/1001-2000/2001-4900/4901+)."""
+    if n_vis <= 100:
+        return 0
+    if n_vis <= 500:
+        return 1
+    if n_vis <= 1000:
+        return 2
+    if n_vis <= 2000:
+        return 3
+    if n_vis <= 4900:
+        return 4
+    return 5
+
+
+def bucketed_embedding_order(names: list[str], pt_dir: str | None = None) -> list[str]:
+    """Return names sorted by n_vis bucket (docs/DATA.md 0-100/101-500/…) then name.
+
+    `pt_dir` points to directory holding the .pt files for n_vis extraction.
+    Without it (e.g. in tests), falls back to plain sorted order."""
+    if pt_dir is None:
+        return sorted(names)
+    scored: list[tuple[int, str]] = []
+    for nm in names:
+        try:
+            t = torch.load(os.path.join(pt_dir, os.path.basename(nm)), map_location="cpu")
+            nv = int(t.shape[0])
+        except Exception:
+            nv = 500  # fallback to dominant bucket center
+        scored.append((_bucket_id(nv), nm))
+    scored.sort(key=lambda kv: (kv[0], kv[1]))
+    return [nm for _, nm in scored]
+
+
 def sorted_embedding_names(entries):
     """Return sorted `embeddings/<sha1>.pt` paths (matches Modal's sorted(glob)).
 
