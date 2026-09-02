@@ -15,6 +15,43 @@ VOL_NAME = "vision-adapter-data"
 EMB_REPO = "keypa/vision-adapter-embeddings"
 REPO_TYPE = "dataset"
 
+# Modal entrypoint for bucketed repack (Phase 1, 930GiB rewrite).
+# Lean: keep pack logic in one file, no /tmp wrapper. Run with:
+#   modal run vision_adapter/data/pack.py::pack_bucketed --detach
+# This is the gated repack that makes shards n_vis-homogeneous (2k probe touches 2 shards).
+try:
+    import modal as _modal
+
+    _pack_image = (
+        _modal.Image.debian_slim(python_version="3.11")
+        .pip_install("torch==2.5.1", "pyarrow", "huggingface_hub", "hf_transfer", "numpy", "pillow")
+        .add_local_dir("vision_adapter", "/root/vision_adapter")
+    )
+    _pack_vol = _modal.Volume.from_name(VOL_NAME, create_if_missing=True)
+    _pack_app = _modal.App("vision-adapter-pack-bucketed")
+
+    @_pack_app.function(image=_pack_image, volumes={"/data": _pack_vol}, timeout=7200, memory=8192)
+    def pack_bucketed():
+        """Bucketed repack entrypoint — sorts by n_vis 6-bucket before sharding, pushes to HF."""
+        import os
+        import sys
+
+        sys.path.insert(0, "/root")
+        tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        if tok:
+            print(f"[pack-bucketed] HF token present ({len(tok)} chars)", flush=True)
+        else:
+            print("[pack-bucketed] HF token absent (anonymous, will be rate-limited)", flush=True)
+        # Call the same main that handles --bucketed --hf-only correctly (0f55ad4)
+        main(["--bucketed", "--hf-only", "--shard-rows", "1360", "--stage-dir", "/var/tmp/emb_stage"])
+
+    @_pack_app.local_entrypoint()
+    def _pack_bucketed_main():
+        pack_bucketed.remote()
+except Exception:
+    _pack_app = None  # type: ignore[assignment]
+    pack_bucketed = None  # type: ignore[assignment]
+
 
 class FileEntryLike:
     """Minimal FileEntry shim for tests (only `path` is needed)."""
