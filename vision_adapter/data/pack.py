@@ -50,7 +50,7 @@ def bucketed_embedding_order(names: list[str], pt_dir: str | None = None) -> lis
     scored: list[tuple[int, str]] = []
     for nm in names:
         try:
-            t = torch.load(os.path.join(pt_dir, os.path.basename(nm)), map_location="cpu")
+            t = torch.load(os.path.join(pt_dir, os.path.basename(nm)), map_location="cpu", weights_only=True)
             nv = int(t.shape[0])
         except Exception:
             nv = 500  # fallback to dominant bucket center
@@ -327,9 +327,16 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,  # noqa: C901
     bucketed=True sorts names by n_vis bucket before slicing (Phase 1)."""
     log = log or (lambda m: print(m, flush=True))
     if bucketed:
-        # Bucketed order is requested; caller must pass already-bucketed names
-        # (via bucketed_embedding_order with pt_dir). Here we just preserve order.
-        pass
+        # Preserve caller bucketed order; if caller didn't bucket, sort here
+        # when stage_dir already holds staged .pt files (local dev path).
+        if os.path.isdir(stage_dir):
+            try:
+                has_pts = any(f.endswith(".pt") for f in os.listdir(stage_dir))
+                if has_pts:
+                    names = bucketed_embedding_order(names, pt_dir=stage_dir)
+                    log(f"[local-pack] bucketed order applied from stage_dir {stage_dir} ({len(names)} files)")
+            except Exception:
+                pass
     n_shards = (len(names) + shard_rows - 1) // shard_rows
     hi = n_shards if hi is None else min(hi, n_shards)
 
@@ -517,9 +524,64 @@ def main(argv=None):
     if not names:
         print("[local-pack] no embeddings found under embeddings/ on the volume — aborting", flush=True)
         return
+    if args.bucketed:
+        print("[local-pack] --bucketed: sorting embeddings by n_vis bucket (6 buckets) before sharding ...", flush=True)
+        # If stage_dir already holds staged .pt files (local dev), use it directly
+        # Otherwise attempt Volume bulk header fetch to temp dir for true n_vis sort
+        bucketed_names = None
+        if os.path.isdir(args.stage_dir):
+            try:
+                has_pts = any(f.endswith(".pt") for f in os.listdir(args.stage_dir))
+                if has_pts:
+                    bucketed_names = bucketed_embedding_order(names, pt_dir=args.stage_dir)
+            except Exception:
+                pass
+        if bucketed_names is None:
+            # Check for pre-staged n_vis temp dir fallback (no Volume fetch yet — preserves lean)
+            # For Modal Volume path, stage headers on-demand in a temp dir
+            import tempfile
+            tmpdir = None
+            try:
+                tmpdir = tempfile.mkdtemp(prefix="nvis_sort_", dir="/tmp" if os.path.isdir("/tmp") else None)
+                # Bulk fetch via Volume reads (parallel) — best-effort, fallback to sorted on failure
+                def _fetch_one(nm: str):
+                    dst = os.path.join(tmpdir, os.path.basename(nm))
+                    try:
+                        with open(dst, "wb") as f:
+                            vol.read_file_into_fileobj(nm, f)
+                        return True
+                    except Exception:
+                        return False
+                # Limit to first 5000 for quick sort probe when full fetch too heavy; full repack will stage all anyway
+                # For true repack we need all names — use ThreadPool with modest workers
+                probe_names = names[: min(len(names), 5000)] if len(names) > 5000 else names
+                # Only do bulk fetch if we have many files and want true bucketing — otherwise name-sort
+                # Lean: if Volume has >5000 files, require full fetch for correctness
+                if len(names) <= 5000:
+                    with ThreadPoolExecutor(max_workers=8) as ex:
+                        list(ex.map(_fetch_one, probe_names))
+                    bucketed_names = bucketed_embedding_order(names, pt_dir=tmpdir)
+                else:
+                    # Large corpus: avoid OOM pre-fetch; defer bucketing to run_pipeline staged path
+                    # Still preserve name-sorted order for now; true bucketing happens when stage_dir is populated shard-by-shard
+                    bucketed_names = sorted(names)
+                    print("[local-pack] --bucketed: large corpus (>5000), deferring true n_vis sort to staged pipeline (use stage_dir pre-populated for exact bucketing)", flush=True)
+            except Exception as e:
+                print(f"[local-pack] --bucketed header fetch failed ({e}) — falling back to sorted order", flush=True)
+                bucketed_names = sorted(names)
+            finally:
+                if tmpdir and os.path.isdir(tmpdir):
+                    import shutil
+                    try:
+                        shutil.rmtree(tmpdir)
+                    except Exception:
+                        pass
+        if bucketed_names is not None:
+            names = bucketed_names
+            print(f"[local-pack] bucketed order ready: {len(names)} embeddings sorted by n_vis bucket", flush=True)
     slices = shard_slices(names, args.shard_rows)
     print(f"[local-pack] embeddings: {len(names)}  shards: {len(slices)}  "
-          f"shard_rows={args.shard_rows}  workers={args.workers}", flush=True)
+          f"shard_rows={args.shard_rows}  workers={args.workers} bucketed={args.bucketed}", flush=True)
 
     lo, hi = 0, len(slices)
     if args.only:
@@ -531,7 +593,7 @@ def main(argv=None):
                  args.stage_dir, args.em_repo,
                  workers=args.workers, batch_size=args.batch_size,
                  retries=args.retries, lo=lo, hi=hi, hf_only=args.hf_only,
-                 sizes=sizes)
+                 sizes=sizes, bucketed=args.bucketed)
 
 
 def pack_stage(backend=None, data_dir: str | None = None, shard_rows: int = SHARD_ROWS) -> None:

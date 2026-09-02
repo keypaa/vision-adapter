@@ -743,6 +743,39 @@ def train_b300():
     _train_impl(offload=False)
 
 
+# Phase 4 — HF-only training (drop vision-adapter-data 930GiB volume)
+# Uses vision_adapter/data/stream.py hf_transfer LRU (warm 7ms vs volume 4ms, 0.7% vs 0.4% of step)
+# Ephemeral hf_cache only; no /data mount. Delete volume after Gates 1-3:
+#   modal volume delete vision-adapter-data  (keep vision-adapter-hf as 64GiB warm cache if strict 4ms cold needed)
+@app.function(image=train_image_b300, gpu=B300_GPU, volumes={HF_CACHE: hf_vol},
+              timeout=86400, memory=f"{B300_CONTAINER_RAM_GB}GB")
+def train_hf():
+    """Phase 4 HF streaming on B300 — no /data volume, ephemeral hf_cache only (warm 7ms)."""
+    import pathlib
+
+    from vision_adapter.config import default_config
+
+    cfg = default_config()
+    # HF streaming via vision_adapter/train.py (cluster sampling + bucketed plan + hf_transfer LRU)
+    from vision_adapter.train import run_train
+
+    run_train(data_dir=pathlib.Path("/tmp/hf_stream"), cfg=cfg, max_steps=None, device="cuda", dtype="auto")
+
+
+@app.function(image=train_image, gpu=GPU, volumes={HF_CACHE: hf_vol},
+              timeout=86400, memory=f"{A100_CONTAINER_RAM_GB}GB")
+def train_hf_a100():
+    """Phase 4 HF streaming on A100 — no /data volume."""
+    import pathlib
+
+    from vision_adapter.config import default_config
+
+    cfg = default_config()
+    from vision_adapter.train import run_train
+
+    run_train(data_dir=pathlib.Path("/tmp/hf_stream"), cfg=cfg, max_steps=None, device="cuda", dtype="auto")
+
+
 def _one_step(sig, model, proj, opt, tok):
     import torch
     import torch.nn as nn

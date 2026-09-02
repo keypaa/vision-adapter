@@ -316,6 +316,26 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         print(f"[train] header failed: {e}", flush=True)
         run_id = None
         open(log_path,"w").close()
+    # Phase 2 daemon: prefetch shard i+1 via hf_transfer while GPU trains shard i (1GiB/s, pipelined)
+    # EmbStreamDataset already has shard-level prefetch + LRU 4 shards; this top-level daemon warms the first shard
+    # before the loop so the first batch never stalls (12min cold pipelined over 33h).
+    _prefetch_exec = None
+    _first_shard_fut = None
+    try:
+        from concurrent.futures import ThreadPoolExecutor as _TPE
+
+        from vision_adapter.data.stream import _download_shard_hf_transfer as _dl_shard, _get_hf_shard_path as _get_path, _in_modal as _is_modal
+
+        if _is_modal():
+            # Warm first shard in background (if not already cached)
+            first_sf = next((s for s in stream_order if s in plan), None)
+            if first_sf and _get_path(first_sf, cache_dir=str(data_dir / "cache" / "rg_cache")) is None:
+                _prefetch_exec = _TPE(max_workers=1)
+                _first_shard_fut = _prefetch_exec.submit(_dl_shard, first_sf, str(data_dir / "cache" / "rg_cache"))
+                print(f"[train] daemon prefetching first shard {first_sf} ...", flush=True)
+    except Exception:
+        _prefetch_exec = None
+        _first_shard_fut = None
     # Batch iterator
     def _batch_iter():
         ds = _EmbDS(plan, stream_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"), vision_dim=cfg.vision_dim)
@@ -327,6 +347,13 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             loader2 = _torch.utils.data.DataLoader(ds2, batch_size=cfg.batch_size, drop_last=True, collate_fn=collate, num_workers=0)
             yield from loader2
     it = _batch_iter()
+    # Ensure first shard prefetch completes before first batch (or timeout 30s)
+    if _first_shard_fut is not None:
+        try:
+            _first_shard_fut.result(timeout=30)
+            print("[train] first shard prefetch ready", flush=True)
+        except Exception:
+            pass
     steps = max_steps or 5
     recs: list[dict] = []
     t0 = time.time()
@@ -357,6 +384,12 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         append_registry(str(data_dir / "runs.jsonl"), reg)
     except Exception:
         pass
+    # Cleanup daemon
+    if _prefetch_exec is not None:
+        try:
+            _prefetch_exec.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
     return 0
 
 def run_train(

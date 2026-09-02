@@ -124,6 +124,7 @@ class RemoteShard(io.RawIOBase):
                 with open(tmp, "wb") as f:
                     f.write(blob)
                 os.replace(tmp, self._cache_file(lo, hi))
+                _enforce_rg_cache_limit(self.disk_cache)
             except Exception:
                 pass
         self._span = (lo, blob)
@@ -267,10 +268,82 @@ def _download_shard_hf_transfer(shard: str, cache_dir: str | None = None, token:
             kw["token"] = tok  # type: ignore[assignment]
         if cache_dir:
             kw["local_dir"] = cache_dir  # type: ignore[assignment]
+            # Ensure cache_dir exists and is writable (ephemeral NVMe on B300 288GiB)
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
         p = hf_hub_download(**kw)  # type: ignore[arg-type]
         return p if os.path.exists(p) else None
     except Exception:
         return None
+
+
+def _enforce_lru_cache(cache_dir: str | None, max_shards: int = 4) -> None:
+    """LRU eviction for whole-shard hf_transfer cache (Phase 2).
+
+    Keeps at most `max_shards` (≈32GiB for 4×8GiB shards) on B300 288GiB ephemeral.
+    Colab 12GiB keeps Range fallback, so this is Modal-only.
+    Evicts oldest `emb_*.parquet` by mtime."""
+    if not _in_modal() or not cache_dir or not os.path.isdir(cache_dir):
+        return
+    try:
+        import glob
+
+        shards = glob.glob(os.path.join(cache_dir, "emb_*.parquet"))
+        if len(shards) <= max_shards:
+            return
+        shards.sort(key=lambda p: os.path.getmtime(p))
+        for old in shards[: len(shards) - max_shards]:
+            try:
+                os.remove(old)
+                print(f"[stream] LRU evicted {os.path.basename(old)} (cache >{max_shards} shards)", flush=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def _coalesce_ranges(ranges: list[tuple[int, int]], gap: int = 2 * 2**20) -> list[tuple[int, int]]:
+    """Coalesce sorted [lo,hi] ranges when gap <=2MiB (Phase 3 micro-Range).
+
+    Merges nearby per-row slices into one Range request to avoid 8× tiny fetches.
+    Used for Colab 12GiB path when manifest has vis_off/len (future)."""
+    if not ranges:
+        return []
+    ranges = sorted(ranges)
+    out = [ranges[0]]
+    for lo, hi in ranges[1:]:
+        plo, phi = out[-1]
+        if lo - phi <= gap:
+            out[-1] = (plo, max(phi, hi))
+        else:
+            out.append((lo, hi))
+    return out
+
+
+def _enforce_rg_cache_limit(cache_dir: str | None, max_bytes: int = 12 * 2**30) -> None:
+    """Keep rg_*.bin disk cache under 12GiB for Colab (Phase 3).
+
+    Modal uses whole-shard LRU instead; this is for Range fallback path."""
+    if not cache_dir or not os.path.isdir(cache_dir) or _in_modal():
+        return
+    try:
+        import glob
+
+        files = glob.glob(os.path.join(cache_dir, "rg_*.bin"))
+        if not files:
+            return
+        files.sort(key=lambda p: os.path.getmtime(p))
+        total = sum(os.path.getsize(p) for p in files)
+        while total > max_bytes and files:
+            old = files.pop(0)
+            try:
+                sz = os.path.getsize(old)
+                os.remove(old)
+                total -= sz
+                print(f"[stream] RG cache evicted {os.path.basename(old)} ({sz/2**20:.0f}MiB, cap 12GiB)", flush=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def list_shards(token: str | None = None) -> list[str]:
@@ -334,7 +407,7 @@ def build_key_index(
         shard_index: dict[str, tuple[str, int] | tuple[str, int, int]] = {}
         row_cursor = 0
         for rgi in range(md.num_row_groups):
-            lo, _ = rg_span(md, rgi, columns=("key",))
+            lo, _ = rg_span(md, rgi, columns=("key", "n_vis"))
             rs._span = (lo, spans[rgi])
             tbl = pf.read_row_group(rgi, columns=["key", "n_vis"])
             keys_here = tbl.column("key").to_pylist()
@@ -471,10 +544,28 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
         import pyarrow.parquet as pq
 
         emitted = 0
+        # Phase 2 daemon: shard-level prefetch (whole-shard hf_transfer 1GiB/s, LRU 4 shards)
+        shard_list = [s for s in self.order if self.plan.get(s)]
+        shard_idx = {s: i for i, s in enumerate(shard_list)}
+        shard_prefetch: ThreadPoolExecutor | None = None
+        next_shard_fut = None
+        if _in_modal() and self.rg_cache_dir:
+            shard_prefetch = ThreadPoolExecutor(max_workers=1)
         for sf in self.order:
             rows_here = self.plan.get(sf)
             if not rows_here:
                 continue
+            # Schedule next shard download while GPU trains current shard (pipelined 12min cold over 33h)
+            if shard_prefetch is not None and sf in shard_idx:
+                cur = shard_idx[sf]
+                if cur + 1 < len(shard_list) and (next_shard_fut is None or next_shard_fut.done()):
+                    nxt = shard_list[cur + 1]
+                    nxt_path = _get_hf_shard_path(nxt, cache_dir=self.rg_cache_dir)
+                    if nxt_path is None:
+                        try:
+                            next_shard_fut = shard_prefetch.submit(_download_shard_hf_transfer, nxt, self.rg_cache_dir)
+                        except Exception:
+                            pass
             # Phase 2 fast path: whole-shard hf_transfer (Modal, 1 GiB/s) — local parquet read, no Range
             local_path: str | None = None
             if _in_modal():
@@ -513,6 +604,13 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                         assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
                         yield {"vis": vis, "user": row["user"], "assistant": row["assistant"], "g": row.get("g", "?")}
                         emitted += 1
+                _enforce_lru_cache(self.rg_cache_dir, max_shards=4)
+                if next_shard_fut is not None and next_shard_fut.done():
+                    try:
+                        next_shard_fut.result()
+                    except Exception:
+                        pass
+                    next_shard_fut = None
                 continue
             url = f"https://huggingface.co/datasets/{EMB_REPO}/resolve/main/{sf}"
             rs = RemoteShard(url, _remote_size(url), disk_cache=self.rg_cache_dir)
@@ -601,3 +699,22 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                         next_fut.cancel()
                     prefetch.shutdown(wait=False, cancel_futures=True)
                 rs._span = None  # type: ignore[assignment]
+            _enforce_lru_cache(self.rg_cache_dir, max_shards=4)
+            if next_shard_fut is not None and next_shard_fut.done():
+                try:
+                    next_shard_fut.result()
+                except Exception:
+                    pass
+                next_shard_fut = None
+        # Shutdown shard-level prefetch daemon
+        if shard_prefetch is not None:
+            if next_shard_fut is not None:
+                try:
+                    next_shard_fut.result(timeout=5)
+                except Exception:
+                    pass
+                try:
+                    next_shard_fut.cancel()
+                except Exception:
+                    pass
+            shard_prefetch.shutdown(wait=False, cancel_futures=True)
