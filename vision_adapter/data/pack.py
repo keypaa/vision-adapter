@@ -342,6 +342,11 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,  # noqa: C901
 
     vol_shards = existing_volume_shards(vol)
     hf_shards = existing_hf_shards(api, em_repo)
+    if bucketed:
+        # Bucketed repack must overwrite existing shards (new n_vis-homogeneous order, new shard_set_hash)
+        log(f"[local-pack] bucketed=True: forcing repack of all {n_shards} shards (overwrite existing {len(vol_shards)} vol / {len(hf_shards)} hf)")
+        vol_shards = set()
+        hf_shards = set()
 
     def chunk(i):
         return names[i * shard_rows:(i + 1) * shard_rows]
@@ -496,7 +501,7 @@ def _render_pack_progress(progress_path: str):
     return True
 
 
-def main(argv=None):
+def main(argv=None):  # noqa: C901
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--shard-rows", type=int, default=SHARD_ROWS)
@@ -537,13 +542,13 @@ def main(argv=None):
             except Exception:
                 pass
         if bucketed_names is None:
-            # Check for pre-staged n_vis temp dir fallback (no Volume fetch yet — preserves lean)
-            # For Modal Volume path, stage headers on-demand in a temp dir
+            # True bucketed repack for 138k: bulk fetch n_vis headers for global sort (930GiB once, 1-2h)
+            # This is the correct bucketed rewrite that makes shards n_vis-homogeneous.
             import tempfile
             tmpdir = None
             try:
-                tmpdir = tempfile.mkdtemp(prefix="nvis_sort_", dir="/tmp" if os.path.isdir("/tmp") else None)
-                # Bulk fetch via Volume reads (parallel) — best-effort, fallback to sorted on failure
+                tmpdir = tempfile.mkdtemp(prefix="nvis_sort_", dir="/var/tmp" if os.path.isdir("/var/tmp") else "/tmp")
+                print(f"[local-pack] --bucketed: bulk fetching {len(names)} headers to {tmpdir} for n_vis sort (this is the 930GiB bucketed rewrite) ...", flush=True)
                 def _fetch_one(nm: str):
                     dst = os.path.join(tmpdir, os.path.basename(nm))
                     try:
@@ -552,22 +557,26 @@ def main(argv=None):
                         return True
                     except Exception:
                         return False
-                # Limit to first 5000 for quick sort probe when full fetch too heavy; full repack will stage all anyway
-                # For true repack we need all names — use ThreadPool with modest workers
-                probe_names = names[: min(len(names), 5000)] if len(names) > 5000 else names
-                # Only do bulk fetch if we have many files and want true bucketing — otherwise name-sort
-                # Lean: if Volume has >5000 files, require full fetch for correctness
-                if len(names) <= 5000:
-                    with ThreadPoolExecutor(max_workers=8) as ex:
-                        list(ex.map(_fetch_one, probe_names))
-                    bucketed_names = bucketed_embedding_order(names, pt_dir=tmpdir)
-                else:
-                    # Large corpus: avoid OOM pre-fetch; defer bucketing to run_pipeline staged path
-                    # Still preserve name-sorted order for now; true bucketing happens when stage_dir is populated shard-by-shard
-                    bucketed_names = sorted(names)
-                    print("[local-pack] --bucketed: large corpus (>5000), deferring true n_vis sort to staged pipeline (use stage_dir pre-populated for exact bucketing)", flush=True)
+                # Full corpus sort — 138k × ~6.8MiB avg = 930GiB, parallel 8 workers, pipelined
+                # Use ThreadPoolExecutor with progress callback every 3s
+                t0 = time.time()
+                done = [0]
+                total = len(names)
+                with ThreadPoolExecutor(max_workers=8) as ex:
+                    futs = {ex.submit(_fetch_one, nm): nm for nm in names}
+                    for fut in futs:
+                        fut.result()
+                        done[0] += 1
+                        if done[0] % 5000 == 0 or done[0] == total:
+                            elapsed = time.time() - t0
+                            rate = done[0] / max(1e-9, elapsed)
+                            print(f"[local-pack] --bucketed header fetch {done[0]}/{total} ({100*done[0]/total:.0f}%) {rate:.0f} files/s {elapsed/60:.1f}min", flush=True)
+                bucketed_names = bucketed_embedding_order(names, pt_dir=tmpdir)
+                print(f"[local-pack] --bucketed header fetch done in {(time.time()-t0)/60:.1f}min, sorting by 6 buckets ...", flush=True)
             except Exception as e:
                 print(f"[local-pack] --bucketed header fetch failed ({e}) — falling back to sorted order", flush=True)
+                import traceback
+                traceback.print_exc()
                 bucketed_names = sorted(names)
             finally:
                 if tmpdir and os.path.isdir(tmpdir):
