@@ -30,18 +30,31 @@ try:
     _pack_vol = _modal.Volume.from_name(VOL_NAME, create_if_missing=True)
     _pack_app = _modal.App("vision-adapter-pack-bucketed")
 
-    @_pack_app.function(image=_pack_image, volumes={"/data": _pack_vol}, timeout=7200, memory=8192)
+    @_pack_app.function(
+        image=_pack_image, volumes={"/data": _pack_vol}, timeout=7200, memory=8192, secrets=[_modal.Secret.from_name("huggingface-token")]
+    )
     def pack_bucketed():
         """Bucketed repack entrypoint — sorts by n_vis 6-bucket before sharding, pushes to HF."""
         import os
         import sys
 
         sys.path.insert(0, "/root")
-        tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        # Secret huggingface-token injects HF_TOKEN/HUGGING_FACE_HUB_TOKEN
+        tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN")
+        # Also try to read token via huggingface_hub cache if secret uses different key name
+        if not tok:
+            try:
+                from vision_adapter.backends.auth import get_hf_token as _get_tok
+
+                tok = _get_tok()
+            except Exception:
+                pass
         if tok:
-            print(f"[pack-bucketed] HF token present ({len(tok)} chars)", flush=True)
+            print(f"[pack-bucketed] HF token present ({len(tok)} chars) via huggingface-token secret", flush=True)
+            os.environ["HF_TOKEN"] = tok
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = tok
         else:
-            print("[pack-bucketed] HF token absent (anonymous, will be rate-limited)", flush=True)
+            print("[pack-bucketed] HF token absent (anonymous, will be rate-limited) — check `huggingface-token` secret", flush=True)
         # Call the same main that handles --bucketed --hf-only correctly (0f55ad4)
         main(["--bucketed", "--hf-only", "--shard-rows", "1360", "--stage-dir", "/var/tmp/emb_stage"])
 
