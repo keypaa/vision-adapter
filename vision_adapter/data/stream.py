@@ -193,24 +193,36 @@ def _cache_key_index_path(cache_dir: str) -> str:
     return os.path.join(cache_dir, KEY_INDEX_CACHE)
 
 
-def save_key_index(index: dict[str, tuple[str, int]], path: str) -> None:
+def save_key_index(index: dict[str, tuple[str, int] | tuple[str, int, int]], path: str) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    payload = {"version": 2, "keys": {k: {"shard": s, "row": r} for k, (s, r) in index.items()}}
+    payload = {"version": 3, "keys": {}}
+    for k, v in index.items():
+        if len(v) == 2:
+            payload["keys"][k] = {"shard": v[0], "row": v[1]}
+        else:
+            payload["keys"][k] = {"shard": v[0], "row": v[1], "n_vis": v[2]}
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(payload, f, separators=(",", ":"))
     os.replace(tmp, path)
 
 
-def load_key_index(path: str) -> tuple[dict[str, tuple[str, int]], bool]:
+def load_key_index(path: str) -> tuple[dict[str, tuple[str, int] | tuple[str, int, int]], bool]:
     if not os.path.exists(path):
         return {}, False
     try:
         with open(path) as f:
             payload = json.load(f)
-        if payload.get("version") != 2 or not isinstance(payload.get("keys"), dict):
+        ver = payload.get("version")
+        if ver not in (2, 3) or not isinstance(payload.get("keys"), dict):
             return {}, False
-        return {k: (v["shard"], v["row"]) for k, v in payload["keys"].items()}, True
+        out: dict[str, tuple[str, int] | tuple[str, int, int]] = {}
+        for k, v in payload["keys"].items():
+            if ver == 3 and "n_vis" in v:
+                out[k] = (v["shard"], v["row"], v["n_vis"])
+            else:
+                out[k] = (v["shard"], v["row"])
+        return out, True  # type: ignore[return-value]
     except Exception:
         return {}, False
 
@@ -246,7 +258,7 @@ def fetch_manifest(cache_dir: str | None = None, token: str | None = None) -> li
 
 def build_key_index(
     stream_order: list[str], cache_dir: str | None = None, rebuild: bool = False
-) -> dict[str, tuple[str, int]]:
+) -> dict[str, tuple[str, int] | tuple[str, int, int]]:
     """emb key -> (shard_file, global_row_idx), footer+key-chunk only, cached."""
     if cache_dir:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
@@ -267,24 +279,25 @@ def build_key_index(
     t0 = time.time()
     import pyarrow.parquet as pq
 
-    def _one_shard(sf: str) -> dict[str, tuple[str, int]]:
+    def _one_shard(sf: str) -> dict[str, tuple[str, int] | tuple[str, int, int]]:
         url = f"https://huggingface.co/datasets/{EMB_REPO}/resolve/main/{sf}"
         rs = RemoteShard(url, _remote_size(url))
         pf = pq.ParquetFile(rs)
         md = pf.metadata
         spans = _prefetch_key_spans(url, md)
-        shard_index: dict[str, tuple[str, int]] = {}
+        shard_index: dict[str, tuple[str, int] | tuple[str, int, int]] = {}
         row_cursor = 0
         for rgi in range(md.num_row_groups):
             lo, _ = rg_span(md, rgi, columns=("key",))
             rs._span = (lo, spans[rgi])
-            tbl = pf.read_row_group(rgi, columns=["key"])
+            tbl = pf.read_row_group(rgi, columns=["key", "n_vis"])
             keys_here = tbl.column("key").to_pylist()
+            nvis_here = tbl.column("n_vis").to_pylist()
             g0 = md.row_group(rgi).num_rows
-            for j, k in enumerate(keys_here):
+            for j, (k, nv) in enumerate(zip(keys_here, nvis_here)):
                 if k in shard_index:
                     raise AssertionError(f"duplicate embedding key in shard {sf}: {k}")
-                shard_index[k] = (sf, row_cursor + j)
+                shard_index[k] = (sf, row_cursor + j, int(nv))
             row_cursor += g0
         return shard_index
 
@@ -311,12 +324,18 @@ def build_key_index(
 
 def build_epoch_plan(
     rows: list[dict],
-    index: dict[str, tuple[str, int]],
+    index: dict[str, tuple[str, int] | tuple[str, int, int]],
     sample_size: int,
     seed: int,
     excluded_shards: set[str] | None = None,
+    bucket_by_n_vis: bool = True,
 ) -> dict[str, list[dict]]:
-    """Cluster sampling: seed-shuffle shards, take whole shards until budget."""
+    """Cluster sampling with n_vis bucketing: shards are shuffled within bucket.
+
+    When index carries n_vis (v3 sidecar), bucket boundaries from docs/DATA.md
+    histogram (0-100/101-500/501-1000/1001-2000/2001-4900/4901+) keep batches
+    size-homogeneous — the 66.8% 101-500 majority no longer pays 4900's cost.
+    Backward-compatible: v2 index (no n_vis) falls back to plain shuffle."""
     rng = random.Random(seed)
     excluded = {f"datasets/{s}" if "/" in s and not s.startswith("data/") else s for s in (excluded_shards or set())}
     by_shard_rows: dict[str, list[tuple[int, dict]]] = {}
@@ -329,18 +348,48 @@ def build_epoch_plan(
     dropped = len(rows) - n_available
     if dropped:
         print(f"[stream] NOTE: {dropped} manifest rows skipped (no embedding or excluded)", flush=True)
-    shard_files = sorted(by_shard_rows)
-    rng.shuffle(shard_files)
+    # Bucket shards by median n_vis when v3 sidecar available
+    if bucket_by_n_vis and any(len(v) == 3 for v in index.values()):
+        def _median_n_vis(sf: str) -> int:
+            nvis = [v[2] for k, v in index.items() if v[0] == sf and len(v) == 3]  # type: ignore[index]
+            if not nvis:
+                return 500  # fallback to dominant bucket center
+            nvis.sort()
+            return nvis[len(nvis)//2]
+        buckets = [(0,100),(101,500),(501,1000),(1001,2000),(2001,4900),(4901,99999)]
+        bucketed: dict[int, list[str]] = {i: [] for i in range(len(buckets))}
+        for sf in sorted(by_shard_rows):
+            med = _median_n_vis(sf)
+            for i,(a,b) in enumerate(buckets):
+                if a <= med <= b:
+                    bucketed[i].append(sf)
+                    break
+        shard_files = []
+        for i in range(len(buckets)):
+            grp = bucketed[i]
+            rng.shuffle(grp)
+            shard_files.extend(grp)
+    else:
+        shard_files = sorted(by_shard_rows)
+        rng.shuffle(shard_files)
     plan: dict[str, list[dict]] = {}
     budget = sample_size
     for sf in shard_files:
         if budget <= 0:
             break
         take = min(budget, len(by_shard_rows[sf]))
-        selected = sorted(by_shard_rows[sf], key=lambda t: t[0])[:take]
+        if bucket_by_n_vis and any(len(v) == 3 for v in index.values()):
+            # Sort within shard by n_vis so sequential batches are size-homogeneous
+            def _row_nvis(t: tuple[int, dict]) -> int:
+                emb = t[1].get("emb", "")
+                loc = index.get(emb)
+                return loc[2] if loc is not None and len(loc) == 3 else 500  # type: ignore[index]
+            selected = sorted(by_shard_rows[sf], key=_row_nvis)[:take]
+        else:
+            selected = sorted(by_shard_rows[sf], key=lambda t: t[0])[:take]
         plan[sf] = [{**r, "_row": j} for j, r in selected]
         budget -= take
-    print(f"[stream] cluster plan: {sum(len(v) for v in plan.values())} rows from {len(plan)} shards", flush=True)
+    print(f"[stream] cluster plan: {sum(len(v) for v in plan.values())} rows from {len(plan)} shards (bucketed={bucket_by_n_vis and any(len(v)==3 for v in index.values())})", flush=True)
     return plan
 
 
