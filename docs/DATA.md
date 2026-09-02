@@ -149,15 +149,20 @@ measured. The `101-500` majority (`66.8%`) should not pay `4900`'s cost on every
 batch. Same fragmentation at precompute: `greedy pack` in input order leaves
 slack because small `140-patch` and huge `19600-patch` land in one `patch_cap`.
 
-**Next optimization (deferred `Step 6` / `TP=2`, not gated on `200/200` probe):**
+**Next optimization — landed on `feat/bucketed-hf-streaming@f13ad17` (Phases 0–1 of
+`gossamer-launching-minnow.md`):**
 
-* Enrich `key_index` sidecar or `manifest` rows with `n_vis` (fetched with the
-  `key` column at `vision_adapter/data/stream.py:_prefetch_key_spans` — already
-  `~KB` per `RG`) and sort `plan` rows by `n_vis` before batching, or bucket
-  `small/medium/large` explicitly — so `B300`/T4 batches are size-homogeneous.
-* At `vision_adapter/models/precompute.py` sort by `n_vis` before `greedy
-  packing` (one `sorted(cache_items, key=…)` — zero numerical risk, `10–20%`
-  fragmentation gone, `nvidia-smi util` up).
+* `vision_adapter/data/stream.py` key-index sidecar bumped to `v3` (`shard,row,n_vis`
+  per key; `v2` still loads with backward compat). `_one_shard` fetches `key+n_vis`
+  together via `rg_span(key)` span. `build_epoch_plan(bucket_by_n_vis=True)` buckets
+  shards by median `n_vis` into `0-100/101-500/501-1000/1001-2000/2001-4900/4901+`
+  and sorts rows within each shard by `n_vis` so `bs=8` batches are size-homogeneous
+  (`66.8%` `101-500` no longer pays `4900`'s `46 GiB` eager).
+* `vision_adapter/data/pack.py:_bucket_id` + `bucketed_embedding_order` helpers for
+  future bucketed repack (sorted `cache_items` by `n_vis` before `pack_rows`;
+  `10–20%` fragmentation gone when repack runs).
+* Remaining Phases 2–3 (`hf_transfer` whole-shard on Modal, micro-Range on Colab) and
+  Phase 4 (`modal volume delete`) are next — see `gossamer-launching-minnow.md`.
 
 Header-first manifest format (see `vision_adapter/manifest.py`):
 line 0 is `{"type":"manifest_header","manifest_version":1,"git_sha":...,"seeds":{...},"upstream":{...},"shard_set_hash":...,"row_count":N}`.

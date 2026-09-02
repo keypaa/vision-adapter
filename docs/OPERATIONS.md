@@ -77,13 +77,40 @@ which usually means LR too high or a corrupted embedding cache (rerun
 
 ---
 
+## Streaming mode and volume strategy
+
+`vision_adapter/data/stream.py` has two paths for embeddings:
+
+| Backend | Path | Speed | When |
+|---|---|---|---|
+| Modal (`MODAL_TASK_ID` set) + `hf_transfer` | Whole-shard `hf_hub_download` (Rust, `1 GiB/s agg`) → local parquet read, no Range | Cold `13min` for `120k` pipelined, warm `7ms/file` vs Volume `4ms` (`56ms/batch` vs `32ms`) | Default on Modal B300/A100 |
+| Modal without `hf_transfer` | `RemoteShard` `32MiB×8` chunked Range (`117 MiB/s` inside Modal) + `rg_cache` + next-RG prefetch | `4.1s/RG`, `240s` wall for `5 steps` observed | Fallback |
+| Local (Colab T4) | Same `RemoteShard` Range with `IncompleteRead` retry (`timeout=120` + fresh TCP) + `v3` bucketed plan | `29s` key-index cold → `0.2s` warm, bucketed `101-500` majority no longer pays `4900`'s cost | Default on Colab |
+
+`vision_adapter/data/stream.py:EmbStreamDataset` auto-selects: if `_in_modal()` + local parquet cached via `_get_hf_shard_path` / `_download_shard_hf_transfer`, it reads `pq.ParquetFile(local_path)` directly; otherwise it streams via `RemoteShard` Range. Exact output — same `vis` decode in both cases.
+
+`HF_HUB_ENABLE_HF_TRANSFER=1` is the switch that activates the Rust accelerator when `hf_transfer` is installed (`pyproject.toml:[train]` optional dep). Without it, the trainer still works — just slower cold.
+
+### Dropping `vision-adapter-data` 930 GiB
+
+On `feat/bucketed-hf-streaming` the training path no longer requires `modal.Volume.from_name("vision-adapter-data")` — HF streaming is the source of truth. To cut the `$0.85/day` over-`1TB` charge:
+
+```bash
+modal volume delete vision-adapter-data    # keep vision-adapter-hf (HF cache) if you want 7ms warm on next run
+# or keep a minimal 64 GiB HF_CACHE volume (4 shards) for 7ms warm from job start
+```
+
+Honest limit: strict `4ms/file` cold over network is impossible (`1.6 GiB/s` needed). First batch of a fresh container pays `16s` for `2` shards (probe) or `13min` pipelined for `120k`. Keep the volume only as build-time staging for `pack.py` repack, not for training.
+
 ## The absolute minimal watch loop
 
 If you only remember one section, it's this. During training, open a second
 shell and poll the loss every minute or two:
 
 ```bash
-modal volume cat vision-adapter-data logs/train_log.jsonl | tail -5
+modal volume cat vision-adapter-data logs/train_log.jsonl | tail -5  # when still on volume
+# HF streaming (feat/bucketed-hf-streaming):
+tail -5 ./data/logs/train_log.jsonl  # probe_log.jsonl in data_dir
 # local:
 tail -5 ./data/logs/train_log.jsonl
 ```

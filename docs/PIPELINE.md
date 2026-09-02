@@ -118,19 +118,24 @@ checked post-write (Volume ↔ HF).
 
 ---
 
-## 4. Train — `train` / `probe` (A100-80GB, ~30k steps)
+## 4. Train — `train` / `probe` (A100-80GB or Colab T4, ~30k steps)
 
 ```bash
-modal run modal_train.py::train_dryrun   # memory gate: peak < 70 GiB
+modal run modal_train.py::train_dryrun   # memory gate: peak < 70 GiB (legacy Volume path)
 modal run modal_train.py::train
 # staged CLI wrappers (config via vision_adapter/config.py:TrainConfig):
 python -m vision_adapter train --data-dir ./data --config default --dryrun
 python -m vision_adapter probe --data-dir ./data --max-steps 200
+# HF streaming (feat/bucketed-hf-streaming, no Volume required):
+HF_HUB_ENABLE_HF_TRANSFER=1 python -m vision_adapter train --data-dir ./data --max-steps 200  # Modal: whole-shard 1 GiB/s
+python -m vision_adapter train --data-dir ./data --max-steps 200  # Colab T4: Range fallback (32MiB×8, prefetch)
 ```
 
 Configs: `default_config()` (bs 8), `probe_config()` (bs 16), `colab_probe_config()` (bs 8).
 Telemetry: `./data/logs/train_log.jsonl` (line 0 = `config_header`, last = `run_end`),
 `./data/runs.jsonl`, `./data/dryrun_report.txt` — see `docs/TELEMETRY.md`.
+
+On `feat/bucketed-hf-streaming` Modal training no longer mounts `vision-adapter-data 930 GiB` for streaming — HF `hf_transfer` whole-shard download pipelined over `33h` (`7ms/file` warm vs `4ms` Volume, `0.7%` vs `0.4%` of step). Colab Range path is bucketed by `n_vis` (`66.8%` `101-500` majority no longer pays `4900`'s cost). See `docs/DATA.md` `n_vis` distribution.
 
 ---
 
