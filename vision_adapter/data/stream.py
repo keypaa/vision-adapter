@@ -227,6 +227,52 @@ def load_key_index(path: str) -> tuple[dict[str, tuple[str, int] | tuple[str, in
         return {}, False
 
 
+def _in_modal() -> bool:
+    return bool(os.environ.get("MODAL_TASK_ID") or os.environ.get("MODAL_ENVIRONMENT"))
+
+
+def _get_hf_shard_path(shard: str, cache_dir: str | None = None) -> str | None:
+    """If HF_HUB_CACHE-stored shard exists locally, return its path; else None."""
+    # Check hf_transfer / huggingface_hub cache for the shard file
+    candidates = []
+    if cache_dir:
+        candidates.append(os.path.join(cache_dir, os.path.basename(shard)))
+    # Global HF cache mirrors hf_hub_download local_dir behavior
+    for base in (os.environ.get("HF_HUB_CACHE"), os.path.expanduser("~/.cache/huggingface/hub")):
+        if base:
+            # Search for emb_XXXX.parquet under any snapshot
+            import glob
+
+            candidates.extend(glob.glob(os.path.join(base, "**", os.path.basename(shard)), recursive=True))
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return None
+
+
+def _download_shard_hf_transfer(shard: str, cache_dir: str | None = None, token: str | None = None) -> str | None:
+    """Try whole-shard download via hf_transfer (Rust, 1GiB/s agg) when in Modal.
+
+    Returns local path on success, None on miss/failure (caller falls back to Range).
+    Uses `hf_hub_download` with HF_HUB_ENABLE_HF_TRANSFER=1 when set; falls back
+    gracefully when hf_transfer not installed."""
+    if not _in_modal():
+        return None
+    try:
+        from huggingface_hub import hf_hub_download  # type: ignore[import]
+
+        tok = token or _get_hf_token()
+        kw: dict[str, object] = {"repo_id": EMB_REPO, "repo_type": "dataset", "filename": shard}
+        if tok:
+            kw["token"] = tok  # type: ignore[assignment]
+        if cache_dir:
+            kw["local_dir"] = cache_dir  # type: ignore[assignment]
+        p = hf_hub_download(**kw)  # type: ignore[arg-type]
+        return p if os.path.exists(p) else None
+    except Exception:
+        return None
+
+
 def list_shards(token: str | None = None) -> list[str]:
     from huggingface_hub import HfApi
 
@@ -428,6 +474,45 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
         for sf in self.order:
             rows_here = self.plan.get(sf)
             if not rows_here:
+                continue
+            # Phase 2 fast path: whole-shard hf_transfer (Modal, 1 GiB/s) — local parquet read, no Range
+            local_path: str | None = None
+            if _in_modal():
+                local_path = _get_hf_shard_path(sf, cache_dir=self.rg_cache_dir)
+                if local_path is None:
+                    local_path = _download_shard_hf_transfer(sf, cache_dir=self.rg_cache_dir)
+            if local_path and os.path.exists(local_path):
+                pf = pq.ParquetFile(local_path)
+                md = pf.metadata
+                biggest = shard_row_group_size(md)
+                assert biggest <= self.MAX_RG_ROWS, (
+                    f"{sf}: row group {biggest} rows (~9 GiB) not streamable — exclude smoke shards"
+                )
+                g0 = md.row_group(0).num_rows or 64
+                want: dict[int, dict[int, dict]] = {}
+                for r in rows_here:
+                    want.setdefault(r["_row"] // g0, {})[r["_row"] % g0] = r
+                for rgi in sorted(want):
+                    tbl = pq.ParquetFile(local_path).read_row_group(rgi, columns=["key", "n_vis", "vis_bytes"])
+                    for j in sorted(want[rgi]):
+                        row = want[rgi][j]
+                        if emitted < self.start_pos:
+                            emitted += 1
+                            continue
+                        vb = tbl.column("vis_bytes")[j].as_py()
+                        nv = int(tbl.column("n_vis")[j].as_py())
+                        buf = bytearray(vb)
+                        del vb
+                        vis = (
+                            torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
+                            .view(torch.bfloat16)
+                            .reshape(-1, self.vision_dim)
+                            .float()
+                        )
+                        del buf
+                        assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
+                        yield {"vis": vis, "user": row["user"], "assistant": row["assistant"], "g": row.get("g", "?")}
+                        emitted += 1
                 continue
             url = f"https://huggingface.co/datasets/{EMB_REPO}/resolve/main/{sf}"
             rs = RemoteShard(url, _remote_size(url), disk_cache=self.rg_cache_dir)
