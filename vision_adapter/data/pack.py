@@ -497,7 +497,9 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,  # noqa: C901
                 _render_pack_progress(progress_path)
             except Exception:
                 pass  # charting must never kill packing
-        log(f"[local-pack] done {rows_done}/{len(names)} ({100*rows_done/len(names):.0f}%)  "
+        # Visual progress bar for Modal logs (heartbeat already covers n_vis sort; this covers shard pipeline)
+        _bar = "█" * int(40 * rows_done / max(1, len(names))) + "─" * (40 - int(40 * rows_done / max(1, len(names))))
+        log(f"[local-pack] |{_bar}| {rows_done}/{len(names)} ({100*rows_done/len(names):.0f}%)  "
             f"{rate:.0f} rows/s  ETA {eta:.0f} min  shard {i}/{hi} ({n} rows) action={action} "
             f"| wall {shard_wall:.0f}s (stage {t_stage:.0f}s pack {t_pack:.0f}s push {t_push:.0f}s)")
     progress.close()
@@ -602,13 +604,18 @@ def main(argv=None):  # noqa: C901
 
             stop_hb = threading.Event()
 
+            def _bar(done: int, total: int, width: int = 40) -> str:
+                filled = int(width * done / max(1, total))
+                return "█" * filled + "─" * (width - filled)
+
             def _heartbeat():
                 while not stop_hb.wait(10):
                     elapsed = time.time() - t0
                     done = len(nvis_map)
                     rate = done / max(1e-9, elapsed)
                     eta = (total - done) / max(1e-9, rate) / 60 if rate else 0
-                    print(f"[local-pack] heartbeat: {done}/{total} ({100*done/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min elapsed {elapsed/60:.1f}min", flush=True)
+                    bar = _bar(done, total)
+                    print(f"[local-pack] heartbeat |{bar}| {done}/{total} ({100*done/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min elapsed {elapsed/60:.1f}min", flush=True)
 
             hb = threading.Thread(target=_heartbeat, daemon=True)
             hb.start()
@@ -635,7 +642,8 @@ def main(argv=None):  # noqa: C901
                             elapsed = now - t0
                             rate = len(nvis_map) / max(1e-9, elapsed)
                             eta = (total - len(nvis_map)) / max(1e-9, rate) / 60 if rate else 0
-                            print(f"[local-pack] --bucketed n_vis {len(nvis_map)}/{total} ({100*len(nvis_map)/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min", flush=True)
+                            bar = _bar(len(nvis_map), total)
+                            print(f"[local-pack] --bucketed n_vis |{bar}| {len(nvis_map)}/{total} ({100*len(nvis_map)/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min", flush=True)
                 # Bucketed sort by (bucket_id, name) — same as bucketed_embedding_order but from map
                 scored = [(_bucket_id(nvis_map.get(nm, 500)), nm) for nm in names]
                 scored.sort(key=lambda kv: (kv[0], kv[1]))
