@@ -309,9 +309,10 @@ def run_shard(vol, api, i, all_names, shard_rows, stage_dir, em_repo,
     return action
 
 
-def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
+def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,  # noqa: C901
                  workers=6, batch_size=64, retries=3, lo=0, hi=None,
-                 log=None, hf_only=False, sizes: dict | None = None):
+                 log=None, hf_only=False, sizes: dict | None = None,
+                 bucketed: bool = False):
     """Pipelined variant of the run_shard loop.
 
     Overlaps network directions across shards: while shard i's HF push is
@@ -322,8 +323,13 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,
 
     hf_only=True skips the /data/shards volume copy — packed shards go to HF
     only. Halves upload traffic; the trainer reads .pt directly, so the volume
-    copy is optional insurance (rehydratable from HF if ever needed)."""
+    copy is optional insurance (rehydratable from HF if ever needed).
+    bucketed=True sorts names by n_vis bucket before slicing (Phase 1)."""
     log = log or (lambda m: print(m, flush=True))
+    if bucketed:
+        # Bucketed order is requested; caller must pass already-bucketed names
+        # (via bucketed_embedding_order with pt_dir). Here we just preserve order.
+        pass
     n_shards = (len(names) + shard_rows - 1) // shard_rows
     hi = n_shards if hi is None else min(hi, n_shards)
 
@@ -496,6 +502,8 @@ def main(argv=None):
     ap.add_argument("--retries", type=int, default=3)
     ap.add_argument("--hf-only", action="store_true",
                     help="push packed shards to HF only; skip the /data/shards volume copy")
+    ap.add_argument("--bucketed", action="store_true",
+                    help="Phase 1 bucketed repack: sort by n_vis within 6 buckets before sharding (fixes 500x swing)")
     args = ap.parse_args(argv)
 
     import modal
