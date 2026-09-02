@@ -183,7 +183,7 @@ def shard_row_group_size(md) -> int:
 
 
 def _prefetch_key_spans(url: str, md) -> dict[int, bytes]:
-    spans = [(rgi, *rg_span(md, rgi, columns=("key",))) for rgi in range(md.num_row_groups)]
+    spans = [(rgi, *rg_span(md, rgi, columns=("key", "n_vis"))) for rgi in range(md.num_row_groups)]
     with ThreadPoolExecutor(max_workers=min(12, len(spans))) as ex:
         futs = {ex.submit(_fetch_range, url, lo, hi - 1): rgi for rgi, lo, hi in spans}
         return {futs[fut]: fut.result() for fut in as_completed(futs)}
