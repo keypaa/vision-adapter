@@ -579,49 +579,88 @@ def main(argv=None):  # noqa: C901
             except Exception:
                 pass
         if bucketed_names is None:
-            # True bucketed repack for 138k: bulk fetch n_vis headers for global sort (930GiB once, 1-2h)
-            # This is the correct bucketed rewrite that makes shards n_vis-homogeneous.
-            import tempfile
-            tmpdir = None
+            # True bucketed repack: compute n_vis in-memory (no 930GiB tmpdir writes).
+            # Previous /var/tmp/nvis_sort_* approach wrote 930GiB to disk then re-read via
+            # torch.load — double I/O, killed by Modal cancellation (7 threads blocked).
+            # Fix: read each .pt via vol.read_file_into_fileobj → BytesIO → torch.load
+            # → n_vis int, keep only {name: n_vis} map (≈1MiB). Heartbeat every 5s prevents
+            # Modal "no output" cancellation. HF write token required for 930GiB rewrite.
+            tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+            if not tok:
+                print("[local-pack] --bucketed requires HF_TOKEN with write (anonymous is rate-limited for 930GiB) — aborting, set HF_TOKEN", flush=True)
+                raise SystemExit(2)
+            import io
+            from concurrent.futures import as_completed
+
+            print(f"[local-pack] --bucketed: computing n_vis for {len(names)} embeddings in-memory (no tmpdir, 930GiB streamed once) ...", flush=True)
+            nvis_map: dict[str, int] = {}
+            t0 = time.time()
+            last_log = [t0]
+            total = len(names)
+            # Heartbeat thread to prevent Modal cancellation when bulk fetch is slow
+            import threading
+
+            stop_hb = threading.Event()
+
+            def _heartbeat():
+                while not stop_hb.wait(10):
+                    elapsed = time.time() - t0
+                    done = len(nvis_map)
+                    rate = done / max(1e-9, elapsed)
+                    eta = (total - done) / max(1e-9, rate) / 60 if rate else 0
+                    print(f"[local-pack] heartbeat: {done}/{total} ({100*done/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min elapsed {elapsed/60:.1f}min", flush=True)
+
+            hb = threading.Thread(target=_heartbeat, daemon=True)
+            hb.start()
             try:
-                tmpdir = tempfile.mkdtemp(prefix="nvis_sort_", dir="/var/tmp" if os.path.isdir("/var/tmp") else "/tmp")
-                print(f"[local-pack] --bucketed: bulk fetching {len(names)} headers to {tmpdir} for n_vis sort (this is the 930GiB bucketed rewrite) ...", flush=True)
-                def _fetch_one(nm: str):
-                    dst = os.path.join(tmpdir, os.path.basename(nm))
+
+                def _fetch_nvis(nm: str) -> tuple[str, int]:
                     try:
-                        with open(dst, "wb") as f:
-                            vol.read_file_into_fileobj(nm, f)
-                        return True
+                        buf = io.BytesIO()
+                        vol.read_file_into_fileobj(nm, buf)
+                        buf.seek(0)
+                        t = torch.load(buf, map_location="cpu", weights_only=True)
+                        return nm, int(t.shape[0])
                     except Exception:
-                        return False
-                # Full corpus sort — 138k × ~6.8MiB avg = 930GiB, parallel 8 workers, pipelined
-                # Use ThreadPoolExecutor with progress callback every 3s
-                t0 = time.time()
-                done = [0]
-                total = len(names)
+                        return nm, 500  # fallback to dominant bucket center
+
                 with ThreadPoolExecutor(max_workers=8) as ex:
-                    futs = {ex.submit(_fetch_one, nm): nm for nm in names}
-                    for fut in futs:
-                        fut.result()
-                        done[0] += 1
-                        if done[0] % 5000 == 0 or done[0] == total:
-                            elapsed = time.time() - t0
-                            rate = done[0] / max(1e-9, elapsed)
-                            print(f"[local-pack] --bucketed header fetch {done[0]}/{total} ({100*done[0]/total:.0f}%) {rate:.0f} files/s {elapsed/60:.1f}min", flush=True)
-                bucketed_names = bucketed_embedding_order(names, pt_dir=tmpdir)
-                print(f"[local-pack] --bucketed header fetch done in {(time.time()-t0)/60:.1f}min, sorting by 6 buckets ...", flush=True)
+                    futs = {ex.submit(_fetch_nvis, nm): nm for nm in names}
+                    for fut in as_completed(futs):
+                        nm, nv = fut.result()
+                        nvis_map[nm] = nv
+                        now = time.time()
+                        if now - last_log[0] >= 5 or len(nvis_map) == total:
+                            last_log[0] = now
+                            elapsed = now - t0
+                            rate = len(nvis_map) / max(1e-9, elapsed)
+                            eta = (total - len(nvis_map)) / max(1e-9, rate) / 60 if rate else 0
+                            print(f"[local-pack] --bucketed n_vis {len(nvis_map)}/{total} ({100*len(nvis_map)/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min", flush=True)
+                # Bucketed sort by (bucket_id, name) — same as bucketed_embedding_order but from map
+                scored = [(_bucket_id(nvis_map.get(nm, 500)), nm) for nm in names]
+                scored.sort(key=lambda kv: (kv[0], kv[1]))
+                bucketed_names = [nm for _, nm in scored]
+                # Log bucket histogram for visual feedback
+                from collections import Counter
+
+                hist = Counter(_bucket_id(nvis_map.get(nm, 500)) for nm in names)
+                print(f"[local-pack] --bucketed histogram: 0-100:{hist[0]} 101-500:{hist[1]} 501-1000:{hist[2]} 1001-2000:{hist[3]} 2001-4900:{hist[4]} 4901+:{hist[5]}", flush=True)
+                print(f"[local-pack] --bucketed n_vis sort done in {(time.time()-t0)/60:.1f}min", flush=True)
+            except KeyboardInterrupt:
+                print("[local-pack] --bucketed interrupted (Modal cancellation) — cleaning up", flush=True)
+                raise
             except Exception as e:
-                print(f"[local-pack] --bucketed header fetch failed ({e}) — falling back to sorted order", flush=True)
+                print(f"[local-pack] --bucketed n_vis fetch failed ({e}) — falling back to sorted order", flush=True)
                 import traceback
+
                 traceback.print_exc()
                 bucketed_names = sorted(names)
             finally:
-                if tmpdir and os.path.isdir(tmpdir):
-                    import shutil
-                    try:
-                        shutil.rmtree(tmpdir)
-                    except Exception:
-                        pass
+                stop_hb.set()
+                try:
+                    hb.join(timeout=2)
+                except Exception:
+                    pass
         if bucketed_names is not None:
             names = bucketed_names
             print(f"[local-pack] bucketed order ready: {len(names)} embeddings sorted by n_vis bucket", flush=True)
