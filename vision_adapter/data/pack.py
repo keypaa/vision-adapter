@@ -636,15 +636,23 @@ def main(argv=None):  # noqa: C901
 
                 def _fetch_nvis(nm: str) -> tuple[str, int]:
                     try:
-                        buf = io.BytesIO()
-                        vol.read_file_into_fileobj(nm, buf)
-                        buf.seek(0)
-                        t = torch.load(buf, map_location="cpu", weights_only=True)
+                        # Fast path: Volume is mounted at /data in Modal container — use local FS (50-100 files/s)
+                        # Fallback to Volume RPC when /data not mounted (local dev)
+                        local_path = f"/data/{nm}" if os.path.exists("/data/embeddings") else None
+                        if local_path and os.path.exists(local_path):
+                            t = torch.load(local_path, map_location="cpu", weights_only=True)
+                        else:
+                            buf = io.BytesIO()
+                            vol.read_file_into_fileobj(nm, buf)
+                            buf.seek(0)
+                            t = torch.load(buf, map_location="cpu", weights_only=True)
                         return nm, int(t.shape[0])
                     except Exception:
                         return nm, 500  # fallback to dominant bucket center
 
-                with ThreadPoolExecutor(max_workers=8) as ex:
+                # 16 workers on local FS, 8 on RPC (same code, faster I/O)
+                workers = 16 if os.path.exists("/data/embeddings") else 8
+                with ThreadPoolExecutor(max_workers=workers) as ex:
                     futs = {ex.submit(_fetch_nvis, nm): nm for nm in names}
                     for fut in as_completed(futs):
                         nm, nv = fut.result()
