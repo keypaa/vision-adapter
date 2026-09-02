@@ -31,7 +31,7 @@ try:
     _pack_app = _modal.App("vision-adapter-pack-bucketed")
 
     @_pack_app.function(
-        image=_pack_image, volumes={"/data": _pack_vol}, timeout=7200, memory=8192, secrets=[_modal.Secret.from_name("huggingface-token")]
+        image=_pack_image, volumes={"/data": _pack_vol}, timeout=21600, memory=8192, secrets=[_modal.Secret.from_name("huggingface-token")]
     )
     def pack_bucketed():
         """Bucketed repack entrypoint — sorts by n_vis 6-bucket before sharding, pushes to HF."""
