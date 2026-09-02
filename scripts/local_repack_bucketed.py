@@ -22,7 +22,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import time
+from pathlib import Path
+
+# Ensure `vision_adapter` is importable when run as `python scripts/...` without pip install -e .
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # Cap CPU: don't oversubscribe 6 cores
 os.environ.setdefault("OMP_NUM_THREADS", "4")
@@ -53,6 +58,13 @@ def main(argv=None):  # noqa: C901
             from vision_adapter.backends.auth import get_hf_token
 
             tok = get_hf_token()
+        except Exception:
+            pass
+    if not tok:
+        try:
+            from huggingface_hub import get_token as _hf_get_token
+
+            tok = _hf_get_token()
         except Exception:
             pass
     if tok:
