@@ -608,7 +608,23 @@ def main(argv=None):  # noqa: C901
             from concurrent.futures import as_completed
 
             print(f"[local-pack] --bucketed: computing n_vis for {len(names)} embeddings in-memory (no tmpdir, 930GiB streamed once) ...", flush=True)
+            # Checkpoint: survive Modal worker disappearance (spot preemption) — previous ap-0Vq3 lost 4091/138987
+            ckpt_path = "/var/tmp/nvis_map_checkpoint.jsonl"
             nvis_map: dict[str, int] = {}
+            if os.path.exists(ckpt_path):
+                try:
+                    import json as _json
+
+                    with open(ckpt_path) as f:
+                        for line in f:
+                            try:
+                                o = _json.loads(line)
+                                nvis_map[o["nm"]] = int(o["nv"])
+                            except Exception:
+                                pass
+                    print(f"[local-pack] checkpoint resume: {len(nvis_map)}/{len(names)} already done from {ckpt_path}", flush=True)
+                except Exception as e:
+                    print(f"[local-pack] checkpoint load failed ({e}), starting fresh", flush=True)
             t0 = time.time()
             last_log = [t0]
             total = len(names)
@@ -644,19 +660,35 @@ def main(argv=None):  # noqa: C901
                     except Exception:
                         return nm, 500  # fallback to dominant bucket center
 
-                with ThreadPoolExecutor(max_workers=8) as ex:
-                    futs = {ex.submit(_fetch_nvis, nm): nm for nm in names}
-                    for fut in as_completed(futs):
-                        nm, nv = fut.result()
-                        nvis_map[nm] = nv
-                        now = time.time()
-                        if now - last_log[0] >= 5 or len(nvis_map) == total:
-                            last_log[0] = now
-                            elapsed = now - t0
-                            rate = len(nvis_map) / max(1e-9, elapsed)
-                            eta = (total - len(nvis_map)) / max(1e-9, rate) / 60 if rate else 0
-                            bar = _bar(len(nvis_map), total)
-                            print(f"[local-pack] --bucketed n_vis |{bar}| {len(nvis_map)}/{total} ({100*len(nvis_map)/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min", flush=True)
+                # 4 workers on 6-core laptop cap, also reduces Modal OOM / worker disappearance
+                pending = [nm for nm in names if nm not in nvis_map]
+                print(f"[local-pack] pending {len(pending)}/{total} after checkpoint", flush=True)
+                with ThreadPoolExecutor(max_workers=4) as ex:
+                    futs = {ex.submit(_fetch_nvis, nm): nm for nm in pending}
+                    ckpt_f = open(ckpt_path, "a", buffering=1)
+                    try:
+                        for fut in as_completed(futs):
+                            try:
+                                nm, nv = fut.result()
+                            except Exception as e:
+                                # Worker disappeared — will be re-scheduled by Modal, count as fallback
+                                print(f"[local-pack] worker failed for {futs[fut]} ({e}), using fallback 500", flush=True)
+                                nm, nv = futs[fut], 500
+                            nvis_map[nm] = nv
+                            try:
+                                ckpt_f.write(f'{{"nm": "{nm}", "nv": {nv}}}\n')
+                            except Exception:
+                                pass
+                            now = time.time()
+                            if now - last_log[0] >= 5 or len(nvis_map) == total:
+                                last_log[0] = now
+                                elapsed = now - t0
+                                rate = len(nvis_map) / max(1e-9, elapsed)
+                                eta = (total - len(nvis_map)) / max(1e-9, rate) / 60 if rate else 0
+                                bar = _bar(len(nvis_map), total)
+                                print(f"[local-pack] --bucketed n_vis |{bar}| {len(nvis_map)}/{total} ({100*len(nvis_map)/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min", flush=True)
+                    finally:
+                        ckpt_f.close()
                 # Bucketed sort by (bucket_id, name) — same as bucketed_embedding_order but from map
                 scored = [(_bucket_id(nvis_map.get(nm, 500)), nm) for nm in names]
                 scored.sort(key=lambda kv: (kv[0], kv[1]))
@@ -667,6 +699,12 @@ def main(argv=None):  # noqa: C901
                 hist = Counter(_bucket_id(nvis_map.get(nm, 500)) for nm in names)
                 print(f"[local-pack] --bucketed histogram: 0-100:{hist[0]} 101-500:{hist[1]} 501-1000:{hist[2]} 1001-2000:{hist[3]} 2001-4900:{hist[4]} 4901+:{hist[5]}", flush=True)
                 print(f"[local-pack] --bucketed n_vis sort done in {(time.time()-t0)/60:.1f}min", flush=True)
+                # Clean checkpoint on success — next run will start fresh if needed
+                try:
+                    if os.path.exists(ckpt_path):
+                        os.remove(ckpt_path)
+                except Exception:
+                    pass
             except KeyboardInterrupt:
                 print("[local-pack] --bucketed interrupted (Modal cancellation) — cleaning up", flush=True)
                 raise
