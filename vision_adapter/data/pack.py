@@ -33,7 +33,7 @@ try:
     @_pack_app.function(
         image=_pack_image, volumes={"/data": _pack_vol}, timeout=36000, memory=16384, secrets=[_modal.Secret.from_name("huggingface-token")]
     )
-    def pack_bucketed():
+    def pack_bucketed(only: str = ""):
         """Bucketed repack entrypoint — sorts by n_vis 6-bucket before sharding, pushes to HF."""
         import os
         import sys
@@ -56,7 +56,11 @@ try:
         else:
             print("[pack-bucketed] HF token absent (anonymous, will be rate-limited) — check `huggingface-token` secret", flush=True)
         # Call the same main that handles --bucketed --hf-only correctly (0f55ad4)
-        main(["--bucketed", "--hf-only", "--shard-rows", "1360", "--stage-dir", "/var/tmp/emb_stage"])
+        # only="41:103" resumes at 41 after a mid-run kill (shard 41 888s stall)
+        args = ["--bucketed", "--hf-only", "--shard-rows", "1360", "--stage-dir", "/var/tmp/emb_stage"]
+        if only:
+            args += ["--only", only]
+        main(args)
 
     @_pack_app.local_entrypoint()
     def _pack_bucketed_main():
