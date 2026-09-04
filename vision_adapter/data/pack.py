@@ -393,10 +393,29 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,  # noqa: C901
     vol_shards = existing_volume_shards(vol)
     hf_shards = existing_hf_shards(api, em_repo)
     if bucketed:
-        # Bucketed repack must overwrite existing shards (new n_vis-homogeneous order, new shard_set_hash)
-        log(f"[local-pack] bucketed=True: forcing repack of all {n_shards} shards (overwrite existing {len(vol_shards)} vol / {len(hf_shards)} hf)")
-        vol_shards = set()
-        hf_shards = set()
+        # Bucketed repack must overwrite *non-bucketed* shards, but resume cleanly after a mid-run kill (shard 41 888s stall)
+        # Marker on Volume (/data) survives worker disappearance, unlike /var/tmp
+        marker_path = "/data/.bucketed_done" if os.path.isdir("/data") else os.path.join(stage_dir, ".bucketed_done")
+        resume_marker = marker_path
+        done_bucketed: set[str] = set()
+        if os.path.exists(resume_marker):
+            try:
+                with open(resume_marker) as f:
+                    for line in f:
+                        done_bucketed.add(line.strip())
+            except Exception:
+                pass
+        # Only force un-done shards; already bucketed shards (in HF and in marker) are skipped like normal resume
+        n_done = len(done_bucketed & hf_shards)
+        if n_done:
+            log(f"[local-pack] bucketed=True: resume {n_done}/{n_shards} already bucketed (skip 0-{n_done-1}), force remaining {n_shards-n_done}")
+        else:
+            log(f"[local-pack] bucketed=True: forcing repack of all {n_shards} shards (overwrite {len(hf_shards)} hf)")
+            # First bucketed run — no marker, force all
+            pass
+        # For shards not yet done, pretend they are not in hf_shards so resume_action returns "pack"
+        hf_shards = done_bucketed & hf_shards  # keep only already-bucketed as done
+        vol_shards = set()  # Volume copy is optional with --hf-only, always pack
 
     def chunk(i):
         return names[i * shard_rows:(i + 1) * shard_rows]
@@ -489,6 +508,13 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,  # noqa: C901
             except Exception:
                 pass
             hf_shards.add(shard)
+            # Resume marker on Volume (survives worker disappearance, next run skips 0-40)
+            try:
+                _marker = "/data/.bucketed_done" if os.path.isdir("/data") else os.path.join(stage_dir, ".bucketed_done")
+                with open(_marker, "a") as mf:
+                    mf.write(shard + "\n")
+            except Exception:
+                pass
             try:
                 os.remove(local_parquet)
             except FileNotFoundError:
