@@ -31,7 +31,7 @@ try:
     _pack_app = _modal.App("vision-adapter-pack-bucketed")
 
     @_pack_app.function(
-        image=_pack_image, volumes={"/data": _pack_vol}, timeout=21600, memory=8192, secrets=[_modal.Secret.from_name("huggingface-token")]
+        image=_pack_image, volumes={"/data": _pack_vol}, timeout=36000, memory=16384, secrets=[_modal.Secret.from_name("huggingface-token")]
     )
     def pack_bucketed():
         """Bucketed repack entrypoint — sorts by n_vis 6-bucket before sharding, pushes to HF."""
@@ -660,10 +660,10 @@ def main(argv=None):  # noqa: C901
                     except Exception:
                         return nm, 500  # fallback to dominant bucket center
 
-                # 4 workers on 6-core laptop cap, also reduces Modal OOM / worker disappearance
+                # 8 workers for max perf (previous 16-18 files/s), 4 was stable but 2× slower (5 files/s)
                 pending = [nm for nm in names if nm not in nvis_map]
                 print(f"[local-pack] pending {len(pending)}/{total} after checkpoint", flush=True)
-                with ThreadPoolExecutor(max_workers=4) as ex:
+                with ThreadPoolExecutor(max_workers=8) as ex:
                     futs = {ex.submit(_fetch_nvis, nm): nm for nm in pending}
                     ckpt_f = open(ckpt_path, "a", buffering=1)
                     try:
