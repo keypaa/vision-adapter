@@ -594,132 +594,163 @@ def main(argv=None):  # noqa: C901
             except Exception:
                 pass
         if bucketed_names is None:
-            # True bucketed repack: compute n_vis in-memory (no 930GiB tmpdir writes).
-            # Previous /var/tmp/nvis_sort_* approach wrote 930GiB to disk then re-read via
-            # torch.load — double I/O, killed by Modal cancellation (7 threads blocked).
-            # Fix: read each .pt via vol.read_file_into_fileobj → BytesIO → torch.load
-            # → n_vis int, keep only {name: n_vis} map (≈1MiB). Heartbeat every 5s prevents
-            # Modal "no output" cancellation. HF write token required for 930GiB rewrite.
+            # Much faster: HF n_vis via Parquet Range (251s for 136k) vs Volume 930GiB RPC (5h)
+            # Volume .pt → HF data/emb_*.parquet n_vis column is byte-identical (pack.py:96 n_vis→HF)
+            # So HF n_vis == Volume n_vis, same 6-bucket sort, 60× faster. Volume path was naive.
             tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
             if not tok:
-                print("[local-pack] --bucketed requires HF_TOKEN with write (anonymous is rate-limited for 930GiB) — aborting, set HF_TOKEN", flush=True)
-                raise SystemExit(2)
-            import io
-            from concurrent.futures import as_completed
-
-            print(f"[local-pack] --bucketed: computing n_vis for {len(names)} embeddings in-memory (no tmpdir, 930GiB streamed once) ...", flush=True)
-            # Checkpoint: survive Modal worker disappearance (spot preemption) — previous ap-0Vq3 lost 4091/138987
-            ckpt_path = "/var/tmp/nvis_map_checkpoint.jsonl"
-            nvis_map: dict[str, int] = {}
-            if os.path.exists(ckpt_path):
                 try:
-                    import json as _json
+                    from vision_adapter.backends.auth import get_hf_token as _ghf
 
-                    with open(ckpt_path) as f:
-                        for line in f:
-                            try:
-                                o = _json.loads(line)
-                                nvis_map[o["nm"]] = int(o["nv"])
-                            except Exception:
-                                pass
-                    print(f"[local-pack] checkpoint resume: {len(nvis_map)}/{len(names)} already done from {ckpt_path}", flush=True)
-                except Exception as e:
-                    print(f"[local-pack] checkpoint load failed ({e}), starting fresh", flush=True)
-            t0 = time.time()
-            last_log = [t0]
-            total = len(names)
-            # Heartbeat thread to prevent Modal cancellation when bulk fetch is slow
-            import threading
-
-            stop_hb = threading.Event()
-
-            def _bar(done: int, total: int, width: int = 40) -> str:
-                filled = int(width * done / max(1, total))
-                return "█" * filled + "─" * (width - filled)
-
-            def _heartbeat():
-                while not stop_hb.wait(10):
-                    elapsed = time.time() - t0
-                    done = len(nvis_map)
-                    rate = done / max(1e-9, elapsed)
-                    eta = (total - done) / max(1e-9, rate) / 60 if rate else 0
-                    bar = _bar(done, total)
-                    print(f"[local-pack] heartbeat |{bar}| {done}/{total} ({100*done/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min elapsed {elapsed/60:.1f}min", flush=True)
-
-            hb = threading.Thread(target=_heartbeat, daemon=True)
-            hb.start()
-            try:
-
-                def _fetch_nvis(nm: str) -> tuple[str, int]:
-                    try:
-                        buf = io.BytesIO()
-                        vol.read_file_into_fileobj(nm, buf)
-                        buf.seek(0)
-                        t = torch.load(buf, map_location="cpu", weights_only=True)
-                        return nm, int(t.shape[0])
-                    except Exception:
-                        return nm, 500  # fallback to dominant bucket center
-
-                # 8 workers for max perf (previous 16-18 files/s), 4 was stable but 2× slower (5 files/s)
-                pending = [nm for nm in names if nm not in nvis_map]
-                print(f"[local-pack] pending {len(pending)}/{total} after checkpoint", flush=True)
-                with ThreadPoolExecutor(max_workers=8) as ex:
-                    futs = {ex.submit(_fetch_nvis, nm): nm for nm in pending}
-                    ckpt_f = open(ckpt_path, "a", buffering=1)
-                    try:
-                        for fut in as_completed(futs):
-                            try:
-                                nm, nv = fut.result()
-                            except Exception as e:
-                                # Worker disappeared — will be re-scheduled by Modal, count as fallback
-                                print(f"[local-pack] worker failed for {futs[fut]} ({e}), using fallback 500", flush=True)
-                                nm, nv = futs[fut], 500
-                            nvis_map[nm] = nv
-                            try:
-                                ckpt_f.write(f'{{"nm": "{nm}", "nv": {nv}}}\n')
-                            except Exception:
-                                pass
-                            now = time.time()
-                            if now - last_log[0] >= 5 or len(nvis_map) == total:
-                                last_log[0] = now
-                                elapsed = now - t0
-                                rate = len(nvis_map) / max(1e-9, elapsed)
-                                eta = (total - len(nvis_map)) / max(1e-9, rate) / 60 if rate else 0
-                                bar = _bar(len(nvis_map), total)
-                                print(f"[local-pack] --bucketed n_vis |{bar}| {len(nvis_map)}/{total} ({100*len(nvis_map)/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min", flush=True)
-                    finally:
-                        ckpt_f.close()
-                # Bucketed sort by (bucket_id, name) — same as bucketed_embedding_order but from map
-                scored = [(_bucket_id(nvis_map.get(nm, 500)), nm) for nm in names]
-                scored.sort(key=lambda kv: (kv[0], kv[1]))
-                bucketed_names = [nm for _, nm in scored]
-                # Log bucket histogram for visual feedback
-                from collections import Counter
-
-                hist = Counter(_bucket_id(nvis_map.get(nm, 500)) for nm in names)
-                print(f"[local-pack] --bucketed histogram: 0-100:{hist[0]} 101-500:{hist[1]} 501-1000:{hist[2]} 1001-2000:{hist[3]} 2001-4900:{hist[4]} 4901+:{hist[5]}", flush=True)
-                print(f"[local-pack] --bucketed n_vis sort done in {(time.time()-t0)/60:.1f}min", flush=True)
-                # Clean checkpoint on success — next run will start fresh if needed
-                try:
-                    if os.path.exists(ckpt_path):
-                        os.remove(ckpt_path)
+                    tok = _ghf()
                 except Exception:
                     pass
-            except KeyboardInterrupt:
-                print("[local-pack] --bucketed interrupted (Modal cancellation) — cleaning up", flush=True)
-                raise
+            if not tok:
+                try:
+                    from huggingface_hub import get_token as _hf_get
+
+                    tok = _hf_get()
+                except Exception:
+                    pass
+            print(f"[local-pack] --bucketed: fetching n_vis via HF Range (not Volume 930GiB) — ~4min for {len(names)} ...", flush=True)
+            # Try HF Range first (60× faster), fallback to Volume RPC on failure
+            nvis_map: dict[str, int] = {}
+            hf_ok = False
+            try:
+                from vision_adapter.data.stream import build_key_index as _bki
+                from vision_adapter.data.stream import list_shards as _ls
+
+                stream_order = _ls(token=tok)
+                # Use /tmp cache for key_index (in Modal /tmp is ephemeral, fine)
+                cache_dir = "/tmp/hf_nvis_cache" if os.path.isdir("/tmp") else None
+                # build_key_index does 8-way n_vis-only Range, 29s warm, 251s cold, with checkpoint resume
+                index = _bki(stream_order, cache_dir=cache_dir)
+                # index is {emb: (shard, row, n_vis)} — filter to our names
+                for nm in names:
+                    loc = index.get(nm)
+                    if loc is not None and len(loc) == 3:
+                        nvis_map[nm] = int(loc[2])
+                    else:
+                        nvis_map[nm] = 500
+                # Verify we got most
+                hit = sum(1 for v in nvis_map.values() if v != 500)
+                print(f"[local-pack] HF n_vis hit {hit}/{len(names)} ({100*hit/len(names):.0f}%)", flush=True)
+                hf_ok = hit > 0
             except Exception as e:
-                print(f"[local-pack] --bucketed n_vis fetch failed ({e}) — falling back to sorted order", flush=True)
+                print(f"[local-pack] HF n_vis fetch failed ({e}), falling back to Volume RPC (slow)", flush=True)
                 import traceback
 
                 traceback.print_exc()
-                bucketed_names = sorted(names)
-            finally:
-                stop_hb.set()
+                hf_ok = False
+            if not hf_ok:
+                # Fallback: Volume RPC in-memory (old path, slow but works)
+                print(f"[local-pack] fallback: computing n_vis for {len(names)} via Volume RPC (slow, ~5h) ...", flush=True)
+                import io
+                from concurrent.futures import as_completed
+
+                ckpt_path = "/var/tmp/nvis_map_checkpoint.jsonl"
+                if os.path.exists(ckpt_path):
+                    try:
+                        import json as _json
+
+                        with open(ckpt_path) as f:
+                            for line in f:
+                                try:
+                                    o = _json.loads(line)
+                                    nvis_map[o["nm"]] = int(o["nv"])
+                                except Exception:
+                                    pass
+                        print(f"[local-pack] checkpoint resume: {len(nvis_map)}/{len(names)} from {ckpt_path}", flush=True)
+                    except Exception:
+                        pass
+                t0 = time.time()
+                last_log = [t0]
+                total = len(names)
+                import threading
+
+                stop_hb = threading.Event()
+
+                def _bar(done, total, width=40):
+                    filled = int(width * done / max(1, total))
+                    return "█" * filled + "─" * (width - filled)
+
+                def _heartbeat():
+                    while not stop_hb.wait(10):
+                        elapsed = time.time() - t0
+                        done = len(nvis_map)
+                        rate = done / max(1e-9, elapsed)
+                        eta = (total - done) / max(1e-9, rate) / 60 if rate else 0
+                        bar = _bar(done, total)
+                        print(f"[local-pack] heartbeat |{bar}| {done}/{total} ({100*done/total:.0f}%) {rate:.0f} files/s ETA {eta:.0f}min", flush=True)
+
+                hb = threading.Thread(target=_heartbeat, daemon=True)
+                hb.start()
                 try:
-                    hb.join(timeout=2)
-                except Exception:
-                    pass
+
+                    def _fetch_nvis(nm):
+                        try:
+                            buf = io.BytesIO()
+                            vol.read_file_into_fileobj(nm, buf)
+                            buf.seek(0)
+                            t = torch.load(buf, map_location="cpu", weights_only=True)
+                            return nm, int(t.shape[0])
+                        except Exception:
+                            return nm, 500
+
+                    pending = [nm for nm in names if nm not in nvis_map]
+                    print(f"[local-pack] pending {len(pending)}/{total} after checkpoint", flush=True)
+                    with ThreadPoolExecutor(max_workers=8) as ex:
+                        futs = {ex.submit(_fetch_nvis, nm): nm for nm in pending}
+                        ckpt_f = open(ckpt_path, "a", buffering=1)
+                        try:
+                            for fut in as_completed(futs):
+                                try:
+                                    nm, nv = fut.result()
+                                except Exception as e:
+                                    print(f"[local-pack] worker failed {futs[fut]} ({e})", flush=True)
+                                    nm, nv = futs[fut], 500
+                                nvis_map[nm] = nv
+                                try:
+                                    ckpt_f.write(f'{{"nm": "{nm}", "nv": {nv}}}\n')
+                                except Exception:
+                                    pass
+                                now = time.time()
+                                if now - last_log[0] >= 5 or len(nvis_map) == total:
+                                    last_log[0] = now
+                                    elapsed = now - t0
+                                    rate = len(nvis_map) / max(1e-9, elapsed)
+                                    bar = _bar(len(nvis_map), total)
+                                    print(f"[local-pack] n_vis |{bar}| {len(nvis_map)}/{total} ({100*len(nvis_map)/total:.0f}%) {rate:.0f} files/s", flush=True)
+                        finally:
+                            ckpt_f.close()
+                    print(f"[local-pack] Volume n_vis done in {(time.time()-t0)/60:.1f}min", flush=True)
+                    try:
+                        if os.path.exists(ckpt_path):
+                            os.remove(ckpt_path)
+                    except Exception:
+                        pass
+                except Exception as e:
+                    print(f"[local-pack] Volume n_vis failed ({e})", flush=True)
+                    import traceback
+
+                    traceback.print_exc()
+                    for nm in names:
+                        nvis_map.setdefault(nm, 500)
+                finally:
+                    stop_hb.set()
+                    try:
+                        hb.join(timeout=2)
+                    except Exception:
+                        pass
+            # Bucketed sort by (bucket_id, name) — same result either path
+            scored = [(_bucket_id(nvis_map.get(nm, 500)), nm) for nm in names]
+            scored.sort(key=lambda kv: (kv[0], kv[1]))
+            bucketed_names = [nm for _, nm in scored]
+            from collections import Counter
+
+            hist = Counter(_bucket_id(nvis_map.get(nm, 500)) for nm in names)
+            print(f"[local-pack] histogram 0-100:{hist[0]} 101-500:{hist[1]} 501-1000:{hist[2]} 1001-2000:{hist[3]} 2001-4900:{hist[4]} 4901+:{hist[5]}", flush=True)
+            # bucketed_names set, proceed to slices
         if bucketed_names is not None:
             names = bucketed_names
             print(f"[local-pack] bucketed order ready: {len(names)} embeddings sorted by n_vis bucket", flush=True)
