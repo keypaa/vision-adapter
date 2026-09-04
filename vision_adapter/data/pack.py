@@ -271,7 +271,26 @@ def download_shard(vol, shard_names: list[str], stage_dir: str, workers: int = 6
     def _one(name):
         dst = os.path.join(stage_dir, os.path.basename(name))
         expected = sizes.get(name)
+        # Fast path: Volume mounted at /data — use local FS copy (50-100 files/s, no RPC throttle)
+        # Keeps old RPC path as fallback for revert (commented below, git history also keeps it)
+        if os.path.exists("/data/embeddings"):
+            src = f"/data/{name}"
+            if os.path.exists(src):
+                try:
+                    import shutil
 
+                    shutil.copyfile(src, dst)
+                    if expected is not None and os.path.getsize(dst) != expected:
+                        raise IOError(f"short read {name}: {os.path.getsize(dst)} != {expected} bytes")
+                    return name, dst, os.path.getsize(dst)
+                except Exception:
+                    # Fallback to Volume RPC below on copy fail
+                    try:
+                        os.remove(dst)
+                    except Exception:
+                        pass
+        # Fallback: Volume RPC (old working path, kept for easy revert via git checkout HEAD~1)
+        # Previous 1MB/s on large 3.8GB shards (shard 57 8→4 MB/s 500s) due to RPC throttle
         def _get():
             with open(dst, "wb") as f:
                 vol.read_file_into_fileobj(name, f)
