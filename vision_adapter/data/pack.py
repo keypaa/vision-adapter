@@ -621,9 +621,14 @@ def main(argv=None):  # noqa: C901
                 from vision_adapter.data.stream import list_shards as _ls
 
                 stream_order = _ls(token=tok)
-                # Use /tmp cache for key_index (in Modal /tmp is ephemeral, fine)
-                cache_dir = "/tmp/hf_nvis_cache" if os.path.isdir("/tmp") else None
-                # build_key_index does 8-way n_vis-only Range, 29s warm, 251s cold, with checkpoint resume
+                # Checkpoint survives worker disappearance: keep key_index cache on Volume (/data) if mounted, else /var/tmp
+                if os.path.isdir("/data"):
+                    cache_dir = "/data/.hf_nvis_cache"
+                elif os.path.isdir("/var/tmp"):
+                    cache_dir = "/var/tmp/hf_nvis_cache"
+                else:
+                    cache_dir = "/tmp/hf_nvis_cache" if os.path.isdir("/tmp") else None
+                # build_key_index does 8-way n_vis-only Range, 29s warm, 251s cold, with cache resume
                 index = _bki(stream_order, cache_dir=cache_dir)
                 # index is {emb: (shard, row, n_vis)} — filter to our names
                 for nm in names:
@@ -643,12 +648,12 @@ def main(argv=None):  # noqa: C901
                 traceback.print_exc()
                 hf_ok = False
             if not hf_ok:
-                # Fallback: Volume RPC in-memory (old path, slow but works)
+                # Fallback: Volume RPC in-memory (old path, slow but works) — checkpoint on Volume survives worker loss
                 print(f"[local-pack] fallback: computing n_vis for {len(names)} via Volume RPC (slow, ~5h) ...", flush=True)
                 import io
                 from concurrent.futures import as_completed
 
-                ckpt_path = "/var/tmp/nvis_map_checkpoint.jsonl"
+                ckpt_path = "/data/.nvis_map_checkpoint.jsonl" if os.path.isdir("/data") else "/var/tmp/nvis_map_checkpoint.jsonl"
                 if os.path.exists(ckpt_path):
                     try:
                         import json as _json
