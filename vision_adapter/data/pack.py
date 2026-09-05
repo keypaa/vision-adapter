@@ -416,36 +416,61 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,  # noqa: C901
     vol_shards = existing_volume_shards(vol)
     hf_shards = existing_hf_shards(api, em_repo)
     if bucketed:
-        # --only 57:58 must force 57 even if on HF (old non-bucketed) — user asked for that shard
+        # Real fix: check HF shard homogeneity via n_vis Range (not marker/list existence)
+        # Old shards are MIXED 500× swing (buckets {0,1,2...}), bucketed are {0} or {1} etc.
+        # Marker /data/.bucketed_done is stale (17 vs 100 done), HF list 103 old vs new same names.
+        # So read n_vis via HF Range and keep only homogeneous as done.
         is_resume_only = (lo != 0 or hi != n_shards)
         if is_resume_only:
-            log(f"[local-pack] bucketed=True --only {lo}:{hi} force pack for {hi-lo} shards (ignore HF existence)")
+            log(f"[local-pack] bucketed=True --only {lo}:{hi} force pack for {hi-lo} shards (ignore HF homogeneity)")
             hf_shards = set()
             vol_shards = set()
         else:
-            # Bucketed repack must overwrite *non-bucketed* shards, but resume cleanly after a mid-run kill (shard 41 888s stall)
-            # Marker on Volume (/data) survives worker disappearance, unlike /var/tmp
-            marker_path = "/data/.bucketed_done" if os.path.isdir("/data") else os.path.join(stage_dir, ".bucketed_done")
-            resume_marker = marker_path
+            log("[local-pack] bucketed=True: checking HF shards for homogeneity via n_vis Range (not marker) ...")
             done_bucketed: set[str] = set()
-            if os.path.exists(resume_marker):
+            # For 103 shards, n_vis-only Range is ~4MiB/RG ×2 RGs avg = 8MiB/shard ×103 = 0.8GiB, ~1min parallel
+            # Use 8-way parallel to speed up, keep Volume marker as fallback but HF homogeneity is truth
+            from concurrent.futures import ThreadPoolExecutor as _TPE
+            from vision_adapter.data.stream import RemoteShard as _RS
+            from vision_adapter.data.stream import _remote_size as _rsize
+            from vision_adapter.data.stream import rg_span as _rg_span
+
+            def _is_bucketed(shard: str) -> tuple[str, bool]:
                 try:
-                    with open(resume_marker) as f:
-                        for line in f:
-                            done_bucketed.add(line.strip())
+                    url = f"https://huggingface.co/datasets/{EMB_REPO}/resolve/main/data/{shard}"
+                    sz = _rsize(url)
+                    rs = _RS(url, sz)
+                    pf = __import__("pyarrow.parquet", fromlist=["ParquetFile"]).ParquetFile(rs)
+                    md = pf.metadata
+                    buckets: set[int] = set()
+                    for rgi in range(md.num_row_groups):
+                        lo2, hi2 = _rg_span(md, rgi, columns=("n_vis",))
+                        rs.load_span(lo2, hi2)
+                        tbl = pf.read_row_group(rgi, columns=["n_vis"])
+                        for nv in tbl.column("n_vis").to_pylist():
+                            buckets.add(_bucket_id(int(nv)))
+                            if len(buckets) > 1:
+                                rs._span = None
+                                return shard, False
+                        rs._span = None
+                    return shard, len(buckets) == 1
                 except Exception:
-                    pass
-            # Only force un-done shards; already bucketed shards (in HF and in marker) are skipped like normal resume
-            n_done = len(done_bucketed & hf_shards)
-            if n_done:
-                log(f"[local-pack] bucketed=True: resume {n_done}/{n_shards} already bucketed (skip 0-{n_done-1}), force remaining {n_shards-n_done}")
-            else:
-                log(f"[local-pack] bucketed=True: forcing repack of all {n_shards} shards (overwrite {len(hf_shards)} hf)")
-                # First bucketed run — no marker, force all
-                pass
-            # For shards not yet done, pretend they are not in hf_shards so resume_action returns "pack"
-            hf_shards = done_bucketed & hf_shards  # keep only already-bucketed as done
-            vol_shards = set()  # Volume copy is optional with --hf-only, always pack
+                    return shard, False
+
+            # Parallel check, 8 shards at a time
+            with _TPE(max_workers=8) as ex:
+                futs = {ex.submit(_is_bucketed, s): s for s in hf_shards}
+                for fut in futs:
+                    try:
+                        shard, ok = fut.result()
+                        if ok:
+                            done_bucketed.add(shard)
+                    except Exception:
+                        pass
+            n_done = len(done_bucketed)
+            log(f"[local-pack] bucketed=True: {n_done}/{n_shards} already homogeneous (skip), force {n_shards-n_done} MIXED")
+            hf_shards = done_bucketed  # keep only homogeneous as done
+            vol_shards = set()
 
     def chunk(i):
         return names[i * shard_rows:(i + 1) * shard_rows]
