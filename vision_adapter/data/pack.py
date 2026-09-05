@@ -555,11 +555,17 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,  # noqa: C901
         rows_done += n
         elapsed = time.time() - t0
         rate = rows_done / max(1e-9, elapsed)
-        eta = (len(names) - rows_done) / max(1e-9, rate) / 60
+        # Fix for --only 58:103: ETA/rows_total/bar should be for the requested range, not full 138987
+        # e.g. shard 59/103 2720/138987 (2%) is wrong — should be 2720/61200 (4%) for 45 shards
+        range_total = min(len(names), hi * shard_rows) - lo * shard_rows
+        # range_total is 0 when hi is None (full run), fallback to len(names)
+        if range_total <= 0:
+            range_total = len(names)
+        eta = (range_total - rows_done) / max(1e-9, rate) / 60
         # sha256 best-effort: parquet already removed at this point, so omit here
         progress.write(json.dumps({
             "ts": round(time.time(), 1), "shard": i, "action": action,
-            "rows_done": rows_done, "rows_total": len(names),
+            "rows_done": rows_done, "rows_total": range_total,
             "rows_s": round(rate, 1), "eta_min": round(eta, 1)}) + "\n")
         if (i - lo + 1) % 10 == 0 or i + 1 == hi:
             try:
@@ -567,8 +573,8 @@ def run_pipeline(vol, api, names, shard_rows, stage_dir, em_repo,  # noqa: C901
             except Exception:
                 pass  # charting must never kill packing
         # Visual progress bar for Modal logs (heartbeat already covers n_vis sort; this covers shard pipeline)
-        _bar = "█" * int(40 * rows_done / max(1, len(names))) + "─" * (40 - int(40 * rows_done / max(1, len(names))))
-        log(f"[local-pack] |{_bar}| {rows_done}/{len(names)} ({100*rows_done/len(names):.0f}%)  "
+        _bar = "█" * int(40 * rows_done / max(1, range_total)) + "─" * (40 - int(40 * rows_done / max(1, range_total)))
+        log(f"[local-pack] |{_bar}| {rows_done}/{range_total} ({100*rows_done/range_total:.0f}%)  "
             f"{rate:.0f} rows/s  ETA {eta:.0f} min  shard {i}/{hi} ({n} rows) action={action} "
             f"| wall {shard_wall:.0f}s (stage {t_stage:.0f}s pack {t_pack:.0f}s push {t_push:.0f}s)")
     progress.close()
