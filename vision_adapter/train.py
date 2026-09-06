@@ -397,9 +397,28 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             pass
         wall = round((time.time()-t0)/60,1)
         lf.write(json.dumps({"type":"run_end","run_id":run_id,"step":steps,"samples_seen":steps*cfg.batch_size,"final_loss": recs[-1]["loss"] if recs else None,"wall_min":wall})+"\n")
+        # ALWAYS save final projector (even if steps < save_every) — probe must be reusable for qual samples
+        try:
+            final_path = _cache_root / f"projector_final_{steps}.pt"
+            _torch.save({"proj": proj.state_dict(), "step": steps, "cfg": cfg.to_dict(), "final_loss": recs[-1]["loss"] if recs else None}, str(final_path))
+            print(f"[train] saved final projector {final_path} ({final_path.stat().st_size/1e6:.1f}MB)", flush=True)
+            # also mirror to data_dir for local fetches
+            try:
+                import shutil as _sh
+                _sh.copyfile(str(final_path), str(data_dir / f"projector_final_{steps}.pt"))
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[train] final projector save failed: {e}", flush=True)
     try:
         reg = registry_entry(run_id=run_id, git_sha=get_git_sha(), config=cfg.to_dict(), seed=0, device=dev, dtype=str(dtype), step_ms=recs[-1].get("step_ms") if recs else None, final_loss=recs[-1]["loss"] if recs else None, extra={"run":"train-stream"})
         append_registry(str(data_dir / "runs.jsonl"), reg)
+        # persist registry to hf_vol too
+        try:
+            import shutil as _sh2
+            _sh2.copyfile(str(data_dir / "runs.jsonl"), str(_cache_root / "runs.jsonl"))
+        except Exception:
+            pass
     except Exception:
         pass
     # Cleanup daemon
