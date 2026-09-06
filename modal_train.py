@@ -836,6 +836,7 @@ def train_hf_dryrun_l4():
 def train_hf_probe_l4():
     """L4 Qwen2B probe 200 steps via HF streaming (probe_config bs16) — same network as hero."""
     import pathlib
+    import shutil
 
     from vision_adapter.config import probe_config
     from vision_adapter.train import run_train
@@ -843,6 +844,20 @@ def train_hf_probe_l4():
     cfg = probe_config()
     rc = run_train(data_dir=pathlib.Path("/tmp/hf_stream"), cfg=cfg, max_steps=200, device="cuda", dtype="auto")
     print(f"[probe-l4] rc={rc} done", flush=True)
+    # persist probe artifacts to hf_vol for `modal volume get`
+    try:
+        import pathlib as _p
+        for name in ("probe_log.jsonl", "probe_curves.png", "runs.jsonl"):
+            src = _p.Path("/tmp/hf_stream") / name
+            dst = _p.Path("/hf/hf_stream_cache") / f"probe_l4_200_{name}"
+            if src.is_file():
+                shutil.copyfile(src, dst)
+                print(f"[probe-l4] persisted {src} -> {dst} ({src.stat().st_size}B)", flush=True)
+        # also copy key_index for debugging
+        import modal as _m
+        _m.Volume.from_name("vision-adapter-hf").commit()
+    except Exception as e:
+        print(f"[probe-l4] persist failed: {e}", flush=True)
     if rc != 0:
         raise SystemExit(rc)
 
