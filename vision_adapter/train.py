@@ -281,7 +281,11 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     for pa in model.parameters():
         pa.requires_grad_(False)
     model.train()
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    if os.environ.get("VISION_ADAPTER_CKPT_OFF") == "1":
+        model.gradient_checkpointing_disable()
+        print("[train] ckpt OFF (B300 ON vs OFF comparison, FlexAttention TODO)", flush=True)
+    else:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     cfg_llm = getattr(model.config, "text_config", model.config)
     llm_dim = int(cfg_llm.hidden_size)
     proj_dtype = _torch.float32 if (dev=="cuda" and dtype==_torch.float16) else dtype
@@ -305,7 +309,12 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     stream_order = _list_shards(token=tok_hf)
     EXCLUDED = {"data/emb_0000.parquet", "data/emb_0001.parquet"}
     stream_order = [s for s in stream_order if s not in EXCLUDED]
-    random.Random(0).shuffle(stream_order)
+    if os.environ.get("FORCE_LARGEST_BUCKET") == "1":
+        # worst-case VRAM: last 4 bucketed shards = 4901+ 59.4GiB each (sorted numeric = bucket order)
+        stream_order = sorted(stream_order)[-4:]
+        print(f"[train] FORCE_LARGEST_BUCKET: testing {len(stream_order)} largest shards {stream_order} (worst VRAM, FlexAttention TODO)", flush=True)
+    else:
+        random.Random(0).shuffle(stream_order)
     index = _build_index(stream_order, cache_dir=str(_cache_root))
     sample_size = min(len(rows), (max_steps or 5) * cfg.batch_size * 2)
     plan = _build_plan(rows, index, sample_size=sample_size, seed=0, excluded_shards=EXCLUDED)

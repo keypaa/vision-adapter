@@ -748,14 +748,17 @@ def train_b300():
 # Uses vision_adapter/data/stream.py hf_transfer LRU (warm 7ms vs volume 4ms, 0.7% vs 0.4% of step)
 # Ephemeral hf_cache only; no /data mount. Delete volume after Gates 1-3:
 #   modal volume delete vision-adapter-data  (keep vision-adapter-hf as 64GiB warm cache if strict 4ms cold needed)
-def _hf_dryrun_impl(mem_cap: float, offload: bool):  # noqa: C901
+def _hf_dryrun_impl(mem_cap: float, offload: bool, force_largest: bool = False, compare_ckpt: bool = False):  # noqa: C901
     """HF streaming dryrun: 1 fwd/bwd via Qwen2B streaming (not Volume EmbSFT), peak gate."""
     import pathlib
     import torch
 
     torch.backends.cuda.matmul.allow_tf32 = True
     props = torch.cuda.get_device_properties(0)
-    print(f"[hf-dryrun] gpu={props.name} cc={props.major}.{props.minor} vram={props.total_memory/2**30:.0f}GiB offload={'on' if offload else 'OFF'} (HF streaming)", flush=True)
+    print(f"[hf-dryrun] gpu={props.name} cc={props.major}.{props.minor} vram={props.total_memory/2**30:.0f}GiB offload={'on' if offload else 'OFF'} (HF streaming) force_largest={force_largest}", flush=True)
+    if force_largest:
+        import os as _os
+        _os.environ["FORCE_LARGEST_BUCKET"] = "1"
     # Use vision_adapter/train.py streaming path with max_steps=1 — this exercises the real HF pipeline
     # (key_index 0.2s cache hit, cluster plan bucketed, hf_transfer warm 7ms) at batch=8
     from vision_adapter.config import default_config
@@ -767,8 +770,40 @@ def _hf_dryrun_impl(mem_cap: float, offload: bool):  # noqa: C901
     rc = run_train(data_dir=pathlib.Path("/tmp/hf_stream"), cfg=cfg, max_steps=1, device="cuda", dtype="auto")
     peak = torch.cuda.max_memory_allocated() / 2**30
     cur = torch.cuda.memory_allocated() / 2**30
-    line = f"[hf-dryrun] rc={rc} mem_alloc={cur:.2f}GiB peak={peak:.2f}GiB budget={mem_cap:.0f}GiB -> {'PASS' if peak < mem_cap else 'FAIL'} wall={(time.time()-t0)/60:.1f}min"
+    line = f"[hf-dryrun] rc={rc} mem_alloc={cur:.2f}GiB peak={peak:.2f}GiB budget={mem_cap:.0f}GiB -> {'PASS' if peak < mem_cap else 'FAIL'} wall={(time.time()-t0)/60:.1f}min largest={force_largest}"
     print(line, flush=True)
+    # For B300: also measure ckpt OFF if requested (compare OFF vs ON headroom)
+    if compare_ckpt and not offload:
+        # disable ckpt and re-measure one step on same largest bucket to see OFF cost
+        try:
+            from transformers import AutoModelForCausalLM  # noqa: F401 — ensure import
+            import torch as _t
+            _t.cuda.empty_cache()
+            _t.cuda.reset_peak_memory_stats()
+            # quick OFF measurement via second run_train with ckpt disabled env
+            import os as _os2
+            _os2.environ["VISION_ADAPTER_CKPT_OFF"] = "1"
+            t1 = time.time()
+            rc2 = run_train(data_dir=pathlib.Path("/tmp/hf_stream"), cfg=cfg, max_steps=1, device="cuda", dtype="auto")
+            peak_off = _t.cuda.max_memory_allocated() / 2**30
+            line2 = f"[hf-dryrun] ckpt=OFF rc={rc2} peak={peak_off:.2f}GiB -> {'KEEP OFF' if peak_off < mem_cap else 'TOO HOT keep ON'} wall={(time.time()-t1)/60:.1f}min"
+            print(line2, flush=True)
+            with open("/tmp/hf_dryrun_report.txt", "a") as f:
+                f.write(line + "\n" + line2 + "\n")
+            _os2.environ.pop("VISION_ADAPTER_CKPT_OFF", None)
+        except Exception as e:
+            print(f"[hf-dryrun] ckpt OFF measure failed: {e}", flush=True)
+            try:
+                with open("/tmp/hf_dryrun_report.txt", "w") as f:
+                    f.write(line + "\n")
+            except Exception:
+                pass
+        # write combined already; don't overwrite below
+        assert peak < mem_cap, "HF MEMORY GATE FAIL — do not run train_hf"
+        if force_largest:
+            import os as _os3
+            _os3.environ.pop("FORCE_LARGEST_BUCKET", None)
+        return
     # Persist same report path as Volume dryrun so train_hf can gate on it
     try:
         os.makedirs("/tmp", exist_ok=True)
@@ -776,6 +811,9 @@ def _hf_dryrun_impl(mem_cap: float, offload: bool):  # noqa: C901
             f.write(line + "\n")
     except Exception:
         pass
+    if force_largest:
+        import os as _os4
+        _os4.environ.pop("FORCE_LARGEST_BUCKET", None)
     assert peak < mem_cap, "HF MEMORY GATE FAIL — do not run train_hf"
 
 
@@ -809,11 +847,11 @@ def train_hf_probe_l4():
         raise SystemExit(rc)
 
 
-@app.function(image=train_image_b300, gpu=B300_GPU, volumes={HF_CACHE: hf_vol},
+@app.function(image=train_image_b300, gpu=B300_GPU, volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
               timeout=3600, memory=f"{B300_CONTAINER_RAM_GB}GB")
 def train_hf_dryrun_b300():
-    """Phase 4 gate: HF streaming dryrun on B300 (all-in-VRAM, peak <250GiB)."""
-    _hf_dryrun_impl(B300_GPU_MEM_CAP_GIB, offload=False)
+    """Phase 4 gate: HF streaming dryrun on B300 (all-in-VRAM, peak <250GiB) — worst bucket 4901+ 59.4GiB + ON vs OFF."""
+    _hf_dryrun_impl(B300_GPU_MEM_CAP_GIB, offload=False, force_largest=True, compare_ckpt=True)
 
 
 @app.function(image=train_image_b300, gpu=B300_GPU, volumes={HF_CACHE: hf_vol},
