@@ -930,7 +930,7 @@ def test_heldout_alignment_l4():
 
 
 @app.function(image=train_image, gpu="L4", volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
-              timeout=1800, memory="64GB")
+              timeout=7200, memory="32GB")
 def test_heldout_60_l4():
     """Heldout 60 (10x6 buckets) avec vrais vis 4096, 20 ckpts evolution + avant/après. Filtre stream_order aux 6 shards."""
     import pathlib, json, random, time, torch
@@ -1061,7 +1061,14 @@ def test_heldout_60_l4():
         eta=(len(ckpts)-idx)*dt
         print(f"[{_el()}][{idx}/{len(ckpts)}] step {step:3d} loss {loss:.4f} g {gnorm:.2f} {dt:.1f}s eta {eta/60:.1f}min", flush=True)
         results.append((step, loss, gnorm))
-        # free proj to save VRAM before next iter
+        # incremental persist to survive timeout
+        try:
+            with open("/hf/hf_stream_cache/heldout60_evolution.json","w") as f:
+                json.dump(results, f)
+            import modal as _m3
+            _m3.Volume.from_name("vision-adapter-hf").commit()
+        except Exception:
+            pass
         del proj
         torch.cuda.empty_cache()
         # persist json incremental
