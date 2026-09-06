@@ -389,6 +389,15 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             rec["ema_loss"] = round(monitor.ema or rec["loss"],5)
             recs.append(rec)
             lf.write(json.dumps(rec)+"\n")
+            # save every 10 steps for probe (200) to avoid losing $ on interrupt; hero uses cfg.save_every 500
+            _save_every = 10 if steps <= 500 else cfg.save_every
+            if step % _save_every == 0:
+                try:
+                    ckpt = _cache_root / f"projector_step{step}.pt"
+                    _torch.save({"proj": proj.state_dict(), "step": step, "loss": rec["loss"]}, str(ckpt))
+                    print(f"[train] ckpt {ckpt.name} ({ckpt.stat().st_size/1e6:.1f}MB)", flush=True)
+                except Exception as e:
+                    print(f"[train] ckpt save failed step {step}: {e}", flush=True)
             if step % 5 == 0 or step==steps:
                 print(f"[train] stream step {step}/{steps} loss={rec['loss']:.4f} ema={rec['ema_loss']:.4f} gnorm={rec['gnorm']:.2f}", flush=True)
         try:
