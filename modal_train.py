@@ -832,6 +832,270 @@ def train_hf_dryrun_l4():
 
 
 @app.function(image=train_image, gpu="L4", volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
+              timeout=600, memory="64GB")
+def test_heldout_alignment_l4():
+    """Heldout 5 samples: user+image -> assistant with real vis 4096, compare step10 vs step200 projector."""
+    import pathlib, json, random, torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from vision_adapter.core import HourglassProjector, make_collate, visual_inject
+    from vision_adapter.data.stream import load_key_index, list_shards
+
+    # load index from persistent cache
+    idx_path = pathlib.Path("/hf/hf_stream_cache/key_index_cache.json")
+    with open(idx_path) as f:
+        data=json.load(f)
+    index=data["keys"]
+    all_shards=sorted(set(v["shard"] for v in index.values()))
+    shuffled=all_shards.copy()
+    random.Random(0).shuffle(shuffled)
+    probe_used=set(shuffled[:10])
+    heldout=[s for s in all_shards if s not in probe_used]
+    print(f"[heldout] probe 10 {sorted(probe_used)[:2]} heldout 91 first {heldout[:2]} index {len(index)}")
+
+    # load manifest rows (use hf_stream cache fetch)
+    from vision_adapter.data.stream import fetch_manifest
+    rows=fetch_manifest(cache_dir="/hf/hf_stream_cache", token=None)
+    print(f"[heldout] rows {len(rows)}")
+    # pick 5 heldout rows
+    heldout_rows=[]
+    for r in rows:
+        emb=r.get("emb","")
+        if emb in index and index[emb]["shard"] in heldout:
+            heldout_rows.append(r)
+            if len(heldout_rows)>=5:
+                break
+    print(f"[heldout] picked {len(heldout_rows)}")
+    for r in heldout_rows:
+        print(f"  {r['emb']} user={r['user'][:50]!r} assistant={r['assistant'][:50]!r}")
+
+    # load model
+    tok=AutoTokenizer.from_pretrained("Qwen/Qwen3.5-2B")
+    if tok.pad_token_id is None: tok.pad_token=tok.eos_token
+    print("[heldout] loading Qwen3.5-2B")
+    model=AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-2B", dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map="cuda")
+    for p in model.parameters(): p.requires_grad_(False)
+    model.train()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    cfg_llm=getattr(model.config,"text_config", model.config)
+    llm_dim=int(cfg_llm.hidden_size)
+
+    def load_proj(path):
+        sd=torch.load(path, map_location="cuda")
+        state=sd.get("proj", sd)
+        proj=HourglassProjector(4096, llm_dim).to("cuda", dtype=torch.bfloat16)
+        proj.load_state_dict(state)
+        return proj
+
+    p10=load_proj("/hf/hf_stream_cache/projector_step10.pt")
+    p200=load_proj("/hf/hf_stream_cache/projector_step200.pt")
+    print("[heldout] proj loaded step10 vs step200")
+
+    # build heldout plan for EmbStreamDataset (dict shard -> list[dict with _row])
+    from vision_adapter.data.stream import EmbStreamDataset
+    heldout_plan: dict[str, list[dict]] = {}
+    for r in heldout_rows:
+        emb=r["emb"]
+        loc=index[emb]
+        shard=loc["shard"]
+        row=loc["row"]
+        heldout_plan.setdefault(shard, []).append({**r, "_row": row})
+    print(f"[heldout] plan {heldout_plan}")
+
+    # fetch real vis via EmbStreamDataset
+    stream_order=shuffled
+    ds=EmbStreamDataset(heldout_plan, stream_order, rg_cache_dir="/hf/hf_stream_cache/rg_cache", vision_dim=4096)
+    # EmbStreamDataset is IterableDataset, no len()
+    print(f"[heldout] dataset plan {len(heldout_rows)} rows, fetching...")
+    # collate helper
+    coll=make_collate(tok, tok.pad_token_id, max_len=512, vision_dim=4096)
+    # compute heldout loss comparison (selective loss)
+    from vision_adapter.core import train_step_qwen
+    import torch as _t
+    heldout_batch_items=[]
+    for i, item in enumerate(ds):
+        if i>=5: break
+        heldout_batch_items.append(item)
+        print(f"\n--- heldout {i} n_vis={item['vis'].shape[0]} user={item['user'][:60]!r} GT={item['assistant'][:80]!r} ---")
+    heldout_batch=coll(heldout_batch_items)
+    for proj, name in [(p10,"step10"), (p200,"step200")]:
+        opt=_t.optim.SGD(proj.parameters(), lr=0)
+        out=train_step_qwen(model, proj, opt, heldout_batch, "cuda")
+        print(f"  {name} heldout batch loss {out['loss']:.4f} gnorm {out['gnorm']:.2f}")
+        for i, it in enumerate(heldout_batch_items):
+            single=coll([it])
+            out2=train_step_qwen(model, proj, opt, single, "cuda")
+            print(f"    sample {i} loss {out2['loss']:.3f} vis {it['vis'].shape[0]} n_vis {it['vis'].shape[0]}")
+
+    print("[heldout] done")
+
+
+@app.function(image=train_image, gpu="L4", volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
+              timeout=1800, memory="64GB")
+def test_heldout_60_l4():
+    """Heldout 60 (10x6 buckets) avec vrais vis 4096, 20 ckpts evolution + avant/après. Filtre stream_order aux 6 shards."""
+    import pathlib, json, random, time, torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from vision_adapter.core import HourglassProjector, make_collate, train_step_qwen
+    from vision_adapter.data.stream import EmbStreamDataset
+
+    _T0=time.time()
+    def _el(): return f"{(time.time()-_T0)/60:.1f}min"
+
+    # 1. index + shards
+    idx_path=pathlib.Path("/hf/hf_stream_cache/key_index_cache.json")
+    with open(idx_path) as f:
+        data=json.load(f)
+    index=data["keys"]
+    all_shards=sorted(set(v["shard"] for v in index.values()))
+    shuffled=all_shards.copy()
+    random.Random(0).shuffle(shuffled)
+    probe_used=set(shuffled[:10])
+    heldout=set(s for s in all_shards if s not in probe_used)
+    print(f"[{_el()}] index {len(index)} probe 10 heldout {len(heldout)}")
+
+    # 2. median n_vis per shard -> bucket (index v3 dict {shard,row,n_vis})
+    def _median(shard):
+        nvis=[v["n_vis"] for k,v in index.items() if v.get("shard")==shard and "n_vis" in v]
+        nvis.sort()
+        return nvis[len(nvis)//2] if nvis else 500
+    buckets=[(0,100),(101,500),(501,1000),(1001,2000),(2001,4900),(4901,99999)]
+    # group shards by bucket
+    bucketed={i:[] for i in range(len(buckets))}
+    for sf in all_shards:
+        if sf not in heldout: continue
+        med=_median(sf)
+        for i,(a,b) in enumerate(buckets):
+            if a<=med<=b:
+                bucketed[i].append((sf, med))
+                break
+    # pick smallest shard per bucket (by median, smallest in bucket)
+    picked=[]
+    for i in range(len(buckets)):
+        lst=sorted(bucketed[i], key=lambda x: x[1])
+        if not lst:
+            print(f"[{_el()}] bucket {buckets[i]} empty!")
+            continue
+        sf, med=lst[0]
+        picked.append((sf, med, buckets[i]))
+        print(f"[{_el()}] bucket {buckets[i]} -> {sf} median {med}")
+
+    # 3. manifest rows
+    from vision_adapter.data.stream import fetch_manifest
+    rows=fetch_manifest(cache_dir="/hf/hf_stream_cache", token=None)
+    print(f"[{_el()}] rows {len(rows)}")
+
+    # 4. plan 10 per picked shard =60
+    heldout_plan: dict[str, list[dict]] = {}
+    for sf, med, _ in picked:
+        cnt=0
+        for r in rows:
+            emb=r.get("emb","")
+            if emb in index and index[emb].get("shard")==sf:
+                row=index[emb].get("row", 0)
+                heldout_plan.setdefault(sf, []).append({**r, "_row": row})
+                cnt+=1
+                if cnt>=10: break
+        print(f"[{_el()}] shard {sf} med {med} -> {len(heldout_plan.get(sf,[]))} rows")
+    total=sum(len(v) for v in heldout_plan.values())
+    print(f"[{_el()}] plan {total} rows from {len(heldout_plan)} shards (10x6)")
+
+    # 5. stream only those 6 shards (fix bloat: filtrer stream_order)
+    stream_order=[sf for sf,_ ,_ in picked]
+    print(f"[{_el()}] stream_order filtered {stream_order}")
+
+    # 6. fetch real vis — cache 60 tensors to avoid re-downloading shards each run
+    cache_vis = pathlib.Path("/hf/hf_stream_cache/heldout60_vis.pt")
+    if cache_vis.is_file():
+        heldout_items = torch.load(str(cache_vis), map_location="cpu")
+        print(f"[{_el()}] loaded cached vis {len(heldout_items)} from {cache_vis} ({cache_vis.stat().st_size/1e6:.1f}MB)")
+    else:
+        ds=EmbStreamDataset(heldout_plan, stream_order, rg_cache_dir="/hf/hf_stream_cache/rg_cache", vision_dim=4096)
+        heldout_items=[]
+        for it in ds:
+            heldout_items.append(it)
+            if len(heldout_items)>=60: break
+            if len(heldout_items)%10==0:
+                print(f"[{_el()}] fetched {len(heldout_items)}/60 n_vis {it['vis'].shape[0]}")
+        print(f"[{_el()}] fetched {len(heldout_items)} real vis — caching to {cache_vis}")
+        torch.save(heldout_items, str(cache_vis))
+        import modal as _m2
+        _m2.Volume.from_name("vision-adapter-hf").commit()
+
+    # 7. load model
+    tok=AutoTokenizer.from_pretrained("Qwen/Qwen3.5-2B")
+    if tok.pad_token_id is None: tok.pad_token=tok.eos_token
+    print(f"[{_el()}] loading Qwen3.5-2B")
+    model=AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-2B", dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map="cuda")
+    for p in model.parameters(): p.requires_grad_(False)
+    model.train()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    cfg_llm=getattr(model.config,"text_config", model.config)
+    llm_dim=int(cfg_llm.hidden_size)
+    coll=make_collate(tok, tok.pad_token_id, max_len=512, vision_dim=4096)
+
+    # 8. eval 20 ckpts — batch 60 OOM on L4 22GB (5244 tokens each), chunk 5
+    ckpts=sorted(pathlib.Path("/hf/hf_stream_cache").glob("projector_step*.pt"), key=lambda p: int(p.stem.replace("projector_step","")))
+    print(f"[{_el()}] ckpts {len(ckpts)} chunk 5 for heldout 60")
+    results=[]
+    for idx, ckpt in enumerate(ckpts, 1):
+        step=int(ckpt.stem.replace("projector_step",""))
+        t1=time.time()
+        print(f"[{_el()}][{idx}/{len(ckpts)}] step {step:3d} {ckpt.name} ...", flush=True)
+        sd=torch.load(str(ckpt), map_location="cuda")
+        proj=HourglassProjector(4096, llm_dim).to("cuda", dtype=torch.bfloat16)
+        proj.load_state_dict(sd.get("proj", sd))
+        # chunk 60 into 12x5 to fit 22GB (large bucket 5244 tokens)
+        losses=[]
+        gns=[]
+        for c in range(0, len(heldout_items), 5):
+            chunk=heldout_items[c:c+5]
+            batch=coll(chunk)
+            opt=torch.optim.SGD(proj.parameters(), lr=0)
+            out=train_step_qwen(model, proj, opt, batch, "cuda")
+            losses.append(out["loss"])
+            gns.append(out["gnorm"])
+            print(f"  chunk {c//5+1}/{(len(heldout_items)+4)//5} loss {out['loss']:.3f}", flush=True)
+        loss=sum(losses)/len(losses)
+        gnorm=sum(gns)/len(gns)
+        dt=time.time()-t1
+        eta=(len(ckpts)-idx)*dt
+        print(f"[{_el()}][{idx}/{len(ckpts)}] step {step:3d} loss {loss:.4f} g {gnorm:.2f} {dt:.1f}s eta {eta/60:.1f}min", flush=True)
+        results.append((step, loss, gnorm))
+        # free proj to save VRAM before next iter
+        del proj
+        torch.cuda.empty_cache()
+        # persist json incremental
+        with open("/hf/hf_stream_cache/heldout60_evolution.json","w") as f:
+            json.dump(results, f)
+
+    # 9. per-sample before/after step10 vs step200
+    print(f"[{_el()}] per-sample step10 vs step200 ...", flush=True)
+    def per_sample(ckpt_path):
+        sd=torch.load(str(ckpt_path), map_location="cuda")
+        proj=HourglassProjector(4096, llm_dim).to("cuda", dtype=torch.bfloat16)
+        proj.load_state_dict(sd.get("proj", sd))
+        vals=[]
+        for i, it in enumerate(heldout_items, 1):
+            b=coll([it])
+            opt=torch.optim.SGD(proj.parameters(), lr=0)
+            out=train_step_qwen(model, proj, opt, b, "cuda")
+            vals.append(out["loss"])
+            print(f"  sample {i}/60 n_vis {it['vis'].shape[0]} loss {out['loss']:.3f}", flush=True)
+        return vals
+    vals10=per_sample(pathlib.Path("/hf/hf_stream_cache/projector_step10.pt"))
+    vals200=per_sample(pathlib.Path("/hf/hf_stream_cache/projector_step200.pt"))
+
+    # 10. save + persist
+    out_json={"results": results, "vals10": vals10, "vals200": vals200, "picked": picked, "n_vis": [it["vis"].shape[0] for it in heldout_items]}
+    with open("/hf/hf_stream_cache/heldout60.json","w") as f:
+        json.dump(out_json, f)
+    print(f"[{_el()}] saved /hf/hf_stream_cache/heldout60*.json")
+    import modal as _m
+    _m.Volume.from_name("vision-adapter-hf").commit()
+    print(f"[{_el()}] done 60 heldout 20 ckpts")
+
+
+@app.function(image=train_image, gpu="L4", volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
               timeout=3600, memory="64GB")
 def train_hf_probe_l4():
     """L4 Qwen2B probe 200 steps via HF streaming (probe_config bs16) — same network as hero."""
