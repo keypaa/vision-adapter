@@ -931,6 +931,78 @@ def test_heldout_alignment_l4():
 
 @app.function(image=train_image, gpu="L4", volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
               timeout=600, memory="32GB")
+def test_web_image_l4():
+    """Fetch 2 web images (chart + UI) and test generation with step200."""
+    import io, json, requests, torch
+    from pathlib import Path
+    from PIL import Image
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from vision_adapter.models.moonvit import load_moonvit_from_safetensors
+    from vision_adapter.models.preprocess import collate_images
+    from vision_adapter.core import HourglassProjector, make_collate, visual_inject
+
+    urls = [
+        "https://upload.wikimedia.org/wikipedia/commons/thumb/1/18/Islands_of_Four_Mountains.jpg/1024px-Islands_of_Four_Mountains.jpg",
+        "https://via.placeholder.com/1024x768.png?text=Test+Chart+123",
+    ]
+    # also try picsum
+    urls.append("https://picsum.photos/seed/visionadapter/1024/768")
+
+    # MoonViT
+    cfg=json.load(open(hf_hub_download(repo_id="keypa/MoonViT-V2-Standalone", repo_type="model", filename="vision_config.json")))
+    st=hf_hub_download(repo_id="keypa/MoonViT-V2-Standalone", repo_type="model", filename="moonvit_v2.safetensors")
+    import torch as _t
+    vit=load_moonvit_from_safetensors(st, cfg, device="cuda", dtype=_t.bfloat16)
+    print("[web] MoonViT loaded")
+    # Qwen
+    tok=AutoTokenizer.from_pretrained("Qwen/Qwen3.5-2B")
+    if tok.pad_token_id is None: tok.pad_token=tok.eos_token
+    model=AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-2B", dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map="cuda")
+    for p in model.parameters(): p.requires_grad_(False)
+    model.train()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    cfg_llm=getattr(model.config,"text_config", model.config)
+    llm_dim=int(cfg_llm.hidden_size)
+    coll=make_collate(tok, tok.pad_token_id, max_len=512, vision_dim=4096)
+    sd=torch.load("/hf/hf_stream_cache/projector_step200.pt", map_location="cuda")
+    proj=HourglassProjector(4096, llm_dim).to("cuda", dtype=torch.bfloat16)
+    proj.load_state_dict(sd.get("proj", sd))
+    print("[web] Qwen+proj200 loaded")
+
+    for url in urls:
+        try:
+            print(f"\n[web] fetching {url[:60]}")
+            r=requests.get(url, timeout=20)
+            img=Image.open(io.BytesIO(r.content)).convert("RGB")
+            print(f"[web] image {img.size}")
+            if max(img.size)>1024:
+                scale=1024/max(img.size)
+                img=img.resize((int(img.size[0]*scale), int(img.size[1]*scale)), Image.BICUBIC)
+                print(f"[web] downscaled {img.size}")
+            pack=collate_images([img])
+            print(f"[web] pack {pack['pixel_values'].shape} grid {pack['grid_thws'].tolist()}")
+            with torch.no_grad():
+                merged=vit(pack["pixel_values"].cuda().to(torch.bfloat16), pack["grid_thws"].cuda())
+                emb=merged[0].reshape(merged[0].shape[0], -1)
+                print(f"[web] emb {emb.shape} n_vis {emb.shape[0]}")
+                vis=emb.to(torch.float32)
+            for prompt in ["Describe the image.", "What is in the image?"]:
+                items=[{"vis": vis, "user": prompt, "assistant": "", "g": "test"}]
+                batch=coll(items)
+                with visual_inject(batch, proj, model):
+                    out_ids=model.generate(input_ids=batch["input_ids"].cuda(), attention_mask=batch["attention_mask"].cuda(), max_new_tokens=48, do_sample=False, pad_token_id=tok.pad_token_id)
+                    gen=tok.decode(out_ids[0][batch["input_ids"].shape[1]:], skip_special_tokens=True)
+                print(f"  prompt {prompt!r} -> {gen[:150]!r}")
+        except Exception as e:
+            import traceback
+            print(f"[web] failed {url} {e}")
+            traceback.print_exc()
+    print("[web] done")
+
+
+@app.function(image=train_image, gpu="L4", volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
+              timeout=600, memory="32GB")
 def test_unsloth_l4():
     """Unsloth 2560 image -> MoonViT 740 tokens -> Qwen + projector step10 vs step200 generation."""
     import io, json, requests, torch
