@@ -1047,6 +1047,7 @@ def test_unsloth_l4():
     cfg_llm=getattr(model.config,"text_config", model.config)
     llm_dim=int(cfg_llm.hidden_size)
     coll=make_collate(tok, tok.pad_token_id, max_len=512, vision_dim=4096)
+    from vision_adapter.core import embeds_for
 
     for ckpt_name in ["projector_step10.pt","projector_step200.pt","projector_final_200.pt"]:
         ckpt=Path(f"/hf/hf_stream_cache/{ckpt_name}")
@@ -1063,9 +1064,9 @@ def test_unsloth_l4():
             items=[{"vis": vis, "user": prompt, "assistant": "", "g": "test"}]
             batch=coll(items)
             print(f"prompt {prompt!r} n_vis {vis.shape[0]} input_ids {batch['input_ids'].shape}")
-            with visual_inject(batch, proj, model):
-                out_ids=model.generate(input_ids=batch["input_ids"].cuda(), attention_mask=batch["attention_mask"].cuda(), max_new_tokens=64, do_sample=False, pad_token_id=tok.pad_token_id)
-                gen=tok.decode(out_ids[0][batch["input_ids"].shape[1]:], skip_special_tokens=True)
+            inp=embeds_for(model, batch, proj, "cuda")
+            out_ids=model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=64, do_sample=False, pad_token_id=tok.pad_token_id)
+            gen=tok.decode(out_ids[0][batch["input_ids"].shape[1]:], skip_special_tokens=True)
             print(f"  gen: {gen[:200]!r}")
     print("[unsloth] done")
 
