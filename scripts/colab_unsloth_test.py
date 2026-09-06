@@ -22,7 +22,7 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from vision_adapter.models.moonvit import load_moonvit_from_safetensors
 from vision_adapter.models.preprocess import collate_images
-from vision_adapter.core import HourglassProjector, make_collate, visual_inject
+from vision_adapter.core import HourglassProjector, make_collate, embeds_for
 
 def main():
     ap = argparse.ArgumentParser()
@@ -95,13 +95,12 @@ def main():
     print(f"batch input_ids {batch['input_ids'].shape} n_vis {vis.shape[0]}")
 
     print(f"\nPrompt: {args.prompt!r}")
-    print("Generating...")
-    with visual_inject(batch, proj, model):
-        out_ids = model.generate(input_ids=batch["input_ids"].to(device), attention_mask=batch["attention_mask"].to(device), max_new_tokens=args.max_new, do_sample=False, pad_token_id=tok.pad_token_id)
-        gen = tok.decode(out_ids[0][batch["input_ids"].shape[1]:], skip_special_tokens=True)
+    print("Generating (Qwen embeds_for, not DeepSeek hook)...")
+    inp = embeds_for(model, batch, proj, str(device))
+    out_ids = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=args.max_new, do_sample=False, pad_token_id=tok.pad_token_id)
+    gen = tok.decode(out_ids[0][batch["input_ids"].shape[1]:], skip_special_tokens=True)
     print(f"\n=== {Path(args.ckpt).name} ===")
     print(f"Gen: {gen!r}")
-    # also show loss if you want to compare step10 vs step200
 
 if __name__ == "__main__":
     main()
