@@ -46,7 +46,15 @@ def main():
         print(f"downloading {args.url}")
         r = requests.get(args.url, timeout=30)
         img = Image.open(io.BytesIO(r.content)).convert("RGB")
-    print(f"image {img.size}")
+    print(f"image original {img.size}")
+    # T4 14GB OOM for 2560x1344 -> 17664 patches (96x184) needs 13.9GB attention -> downscale for Colab
+    if max(img.size) > 1024:
+        scale = 1024 / max(img.size)
+        new_w, new_h = int(img.size[0]*scale), int(img.size[1]*scale)
+        img = img.resize((new_w, new_h), Image.BICUBIC)
+        print(f"downscaled for T4 {img.size} (max 1024 to avoid 13.9GB OOM, 17664 patches -> ~3000 patches)")
+    else:
+        print(f"image {img.size}")
 
     # 2. MoonViT
     print("loading MoonViT keypa/MoonViT-V2-Standalone")
