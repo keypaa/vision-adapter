@@ -178,9 +178,13 @@ class visual_inject:
         vis, n_vis = self._vis, self._n_vis
 
         def _splice(module, args, output):
+            # During generate, subsequent forwards have seq_len=1 with past_key_values — skip splice (only first prompt needs vis)
+            if output.shape[1] < max(n_vis) + 2:
+                return output
             merged = output.clone()
             for i, nv in enumerate(n_vis):
-                merged[i, 1: 1 + nv] = vis[i, :nv]
+                if 1 + nv <= merged.shape[1]:
+                    merged[i, 1: 1 + nv] = vis[i, :nv]
             return merged
 
         self._handle = self._embed.register_forward_hook(_splice)
