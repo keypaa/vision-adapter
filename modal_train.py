@@ -930,6 +930,75 @@ def test_heldout_alignment_l4():
 
 
 @app.function(image=train_image, gpu="L4", volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
+              timeout=600, memory="32GB")
+def test_unsloth_l4():
+    """Unsloth 2560 image -> MoonViT 740 tokens -> Qwen + projector step10 vs step200 generation."""
+    import io, json, requests, torch
+    from pathlib import Path
+    from PIL import Image
+    from huggingface_hub import hf_hub_download
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from vision_adapter.models.moonvit import load_moonvit_from_safetensors
+    from vision_adapter.models.preprocess import collate_images
+    from vision_adapter.core import HourglassProjector, make_collate, visual_inject
+
+    url="https://unsloth.ai/cgi/image/unsloth_new_wb_logo_vnrA8AASj-jN5wy8UIYE-.png?format=raw"
+    print(f"[unsloth] downloading {url}")
+    r=requests.get(url, timeout=30)
+    img=Image.open(io.BytesIO(r.content)).convert("RGB")
+    print(f"[unsloth] original {img.size}")
+    if max(img.size)>1024:
+        scale=1024/max(img.size)
+        img=img.resize((int(img.size[0]*scale), int(img.size[1]*scale)), Image.BICUBIC)
+        print(f"[unsloth] downscaled {img.size}")
+    # MoonViT
+    print("[unsloth] loading MoonViT")
+    cfg=json.load(open(hf_hub_download(repo_id="keypa/MoonViT-V2-Standalone", repo_type="model", filename="vision_config.json")))
+    st=hf_hub_download(repo_id="keypa/MoonViT-V2-Standalone", repo_type="model", filename="moonvit_v2.safetensors")
+    vit=load_moonvit_from_safetensors(st, cfg, device="cuda", dtype=torch.bfloat16)
+    pack=collate_images([img])
+    print(f"[unsloth] pack {pack['pixel_values'].shape} grid {pack['grid_thws'].tolist()}")
+    with torch.no_grad():
+        merged=vit(pack["pixel_values"].cuda().to(torch.bfloat16), pack["grid_thws"].cuda())
+        emb=merged[0].reshape(merged[0].shape[0], -1)
+        print(f"[unsloth] emb {emb.shape} n_vis={emb.shape[0]}")
+        vis=emb.to(torch.float32)
+
+    # Qwen
+    print("[unsloth] loading Qwen3.5-2B")
+    tok=AutoTokenizer.from_pretrained("Qwen/Qwen3.5-2B")
+    if tok.pad_token_id is None: tok.pad_token=tok.eos_token
+    model=AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-2B", dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map="cuda")
+    for p in model.parameters(): p.requires_grad_(False)
+    model.train()
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    cfg_llm=getattr(model.config,"text_config", model.config)
+    llm_dim=int(cfg_llm.hidden_size)
+    coll=make_collate(tok, tok.pad_token_id, max_len=512, vision_dim=4096)
+
+    for ckpt_name in ["projector_step10.pt","projector_step200.pt","projector_final_200.pt"]:
+        ckpt=Path(f"/hf/hf_stream_cache/{ckpt_name}")
+        if not ckpt.is_file():
+            ckpt=Path(f"/hf/hf_stream_cache/projector_step200.pt")
+            if not ckpt.is_file():
+                print(f"[unsloth] skip {ckpt_name} not found")
+                continue
+        sd=torch.load(str(ckpt), map_location="cuda")
+        proj=HourglassProjector(4096, llm_dim).to("cuda", dtype=torch.bfloat16)
+        proj.load_state_dict(sd.get("proj", sd))
+        print(f"\n[unsloth] === {ckpt.name} ===")
+        for prompt in ["Describe the image.", "What is in the image?", "What does the image show?"]:
+            items=[{"vis": vis, "user": prompt, "assistant": "", "g": "test"}]
+            batch=coll(items)
+            print(f"prompt {prompt!r} n_vis {vis.shape[0]} input_ids {batch['input_ids'].shape}")
+            with visual_inject(batch, proj, model):
+                out_ids=model.generate(input_ids=batch["input_ids"].cuda(), attention_mask=batch["attention_mask"].cuda(), max_new_tokens=64, do_sample=False, pad_token_id=tok.pad_token_id)
+                gen=tok.decode(out_ids[0][batch["input_ids"].shape[1]:], skip_special_tokens=True)
+            print(f"  gen: {gen[:200]!r}")
+    print("[unsloth] done")
+
+
+@app.function(image=train_image, gpu="L4", volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
               timeout=7200, memory="32GB")
 def test_heldout_60_l4():
     """Heldout 60 (10x6 buckets) avec vrais vis 4096, 20 ckpts evolution + avant/après. Filtre stream_order aux 6 shards."""
