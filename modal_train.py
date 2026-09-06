@@ -786,6 +786,29 @@ def train_hf_dryrun():
     _hf_dryrun_impl(GPU_MEM_CAP_GIB, offload=True)
 
 
+@app.function(image=train_image, gpu="L4", volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
+              timeout=3600, memory="64GB")
+def train_hf_dryrun_l4():
+    """HF streaming dryrun on L4 (22GiB, same 1GiB/s hf_transfer + LRU 32GiB as hero)."""
+    _hf_dryrun_impl(22.0, offload=True)
+
+
+@app.function(image=train_image, gpu="L4", volumes={HF_CACHE: hf_vol}, secrets=[modal.Secret.from_name("huggingface-token")],
+              timeout=3600, memory="64GB")
+def train_hf_probe_l4():
+    """L4 Qwen2B probe 200 steps via HF streaming (probe_config bs16) — same network as hero."""
+    import pathlib
+
+    from vision_adapter.config import probe_config
+    from vision_adapter.train import run_train
+
+    cfg = probe_config()
+    rc = run_train(data_dir=pathlib.Path("/tmp/hf_stream"), cfg=cfg, max_steps=200, device="cuda", dtype="auto")
+    print(f"[probe-l4] rc={rc} done", flush=True)
+    if rc != 0:
+        raise SystemExit(rc)
+
+
 @app.function(image=train_image_b300, gpu=B300_GPU, volumes={HF_CACHE: hf_vol},
               timeout=3600, memory=f"{B300_CONTAINER_RAM_GB}GB")
 def train_hf_dryrun_b300():

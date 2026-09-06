@@ -91,6 +91,15 @@ which usually means LR too high or a corrupted embedding cache (rerun
 
 `HF_HUB_ENABLE_HF_TRANSFER=1` is the switch that activates the Rust accelerator when `hf_transfer` is installed (`pyproject.toml:[train]` optional dep). Without it, the trainer still works — just slower cold.
 
+### RemoteShard deep dive — the numbers that matter (`stream.py:74-181, 322-351`)
+
+* Constants: `FOOTER_BYTES=64KiB, FETCH_CHUNK=32MiB, N_STREAMS=8, MAX_RG_ROWS=128` — `emb_0000/0001` have ~9GiB single RG (`1360 rows`) → `assert biggest <=128` fails deliberately, excluded from plan.
+* `rg_span(md, rgi, columns=("key","n_vis"))` uses `dictionary_page_offset` else `data_page_offset` to `+ total_compressed_size`; `_prefetch_key_spans` fetches `key+n_vis` together via `rg_span` (old bug `rg_span(key)` outside `n_vis` → `OSError Cell6`).
+* `_fetch_range(url, start, end, timeout=120, retries=3)`: `IncompleteRead` retry fresh TCP `sleep 1.0×2^attempt`, other errors `0.5×2^attempt`. Disk cache `rg_{sha1(url:lo:hi)[:20]}.bin` hits skip fetch; `load_span` writes with `tmp+replace` then `_enforce_rg_cache_limit`.
+* Coalesce future per-row micro-Range: `_coalesce_ranges(gap=2MiB)` merges nearby `[lo,hi]` slices (deferred until `pack.py` logs `vis_off/len`).
+* `Key index v3` `{shard,row,n_vis}` per key, `v2` still loads compat (`stream.py:197-228 save/load_key_index`). Cache path `emb_cache/key_index_cache.json` or `data/cache/rg_cache`. 8-way parallel: `213s→~35s →2.8s cached`.
+* LRU: Modal `_enforce_lru_cache(4 shards ≈32GiB)` on B300 288GiB ephemeral (`stream.py:279` by mtime), Colab `_enforce_rg_cache_limit(12GiB)` for `rg_*.bin` (`stream.py:322`).
+
 ### Dropping `vision-adapter-data` 930 GiB
 
 On `feat/bucketed-hf-streaming` the training path no longer requires `modal.Volume.from_name("vision-adapter-data")` — HF streaming is the source of truth. To cut the `$0.85/day` over-`1TB` charge:
@@ -101,6 +110,44 @@ modal volume delete vision-adapter-data    # keep vision-adapter-hf (HF cache) i
 ```
 
 Honest limit: strict `4ms/file` cold over network is impossible (`1.6 GiB/s` needed). First batch of a fresh container pays `16s` for `2` shards (probe) or `13min` pipelined for `120k`. Keep the volume only as build-time staging for `pack.py` repack, not for training.
+
+**Volume delete order — do not delete until Gates 1-3 + HF 103 shards verified** (`REWORK_DATASET.md:5`):
+
+```bash
+modal volume ls vision-adapter-data     # 930.4GiB — DELETE LAST, after verify_hf_clean.py 103 BUCKETED OK
+modal volume ls vision-adapter-hf       # 250.5GiB HF cache 32GiB LRU ephemeral — KEEP as 64GiB warm cache or delete later (14× smaller, ~135GiB after shrink)
+modal volume ls vision-graft-data       # 45.2GiB — SAFE TO DELETE (obsolete graft experiment)
+# 6 other dead volumes: qwen3-cache, k3-cache, soren-*, minecraft-*, muon-output ~134.5GiB — SAFE TO DELETE
+# Total: 1.32TB →384.8GiB (8 vols) well under 1TB FREE, 384→~135GiB after shrinking hf cache
+```
+
+Costs: `9 vols 1.32TiB >1TB billed $0.85/day ~$25/mo` → `384.8GiB FREE`, `HF push 103×8.58GiB 883.8GiB via hf_transfer 1GiB/s 12min cold pipelined over 33h B300, warm 2.4ms/file 19ms/batch 0.2% vs Volume 6.7ms 53ms 0.5%` (bench `modal_speed_bench.py` same container CDN `ap-88OMhTU92X14QdIJgetZsa`).
+
+**Pack staging details** (`pack.py:33, 274-291`):
+
+* Function: `@app.function(timeout=36000, memory=16384, secrets=[huggingface-token→HF_TOKEN])` `pack_bucketed --only 41:103 etc`.
+* `stage_dir /var/tmp/emb_stage` not `/tmp` tmpfs — `~21GiB peak`, per-shard subdir `emb_XXXX.parquet.staged`.
+* Download: `direct FS shutil.copyfile /data/embeddings` `50-90MB/s` (keeps RPC `vol.read_file_into_fileobj 1MB/s 500s/888s tail` as fallback, `git checkout HEAD~1` reverts). Size-checked against `vol.listdir size` map + `IOError short read` retry loop `delay 0.5×2^attempt`.
+* Checkpoints surviving worker disappearance: `/data/.hf_nvis_cache` + `/data/.nvis_map_checkpoint.jsonl` + `/data/.bucketed_done` (Volume) else `/var/tmp/...`.
+
+### 3 dry-run gates (must PASS before `train_hf`)
+
+See `PIPELINE.md:4` table. `train_hf` checks `/tmp/hf_dryrun_report.txt` contains `PASS` else `SystemExit(2)`. Volume path still `modal_train.py:train_dryrun (EmbSFT)` with `dryrun_report.txt` on `/data`.
+
+### Auth & env vars — the full matrix
+
+| Var / Secret | Where | Purpose |
+|---|---|---|
+| `--hf-token` CLI | `backends/auth.py:get_hf_token(cli_token)` | highest priority |
+| `$HF_TOKEN` | env / Modal secret `huggingface-token` / `huggingface-keypa` | `dataset/cauldron/precompute/pack/stream` pulls + pushes g, needs **write** for `--push-to-hf` (`HfApi.whoami` check) |
+| `$HUGGING_FACE_HUB_TOKEN` | env fallback | same as above if `HF_TOKEN` absent |
+| `google.colab.userdata.get("HF_TOKEN")` | Colab Secrets | best-effort 4th fallback |
+| `HF_HUB_ENABLE_HF_TRANSFER=1` | env | enables Rust shard download (`pyproject.toml:[train] hf_transfer`) |
+| `HF_HOME=/hf`, `HF_HUB_CACHE=~/.cache/huggingface/hub` | env / `stream.py:237 _get_hf_shard_path` | HF shard lookup candidates |
+| `$MODAL_TASK_ID` / `$MODAL_ENVIRONMENT` | env `stream.py:231 _in_modal()` | detects Modal vs Colab (whole-shard vs Range) |
+| `$VISION_ADAPTER_GIT_SHA` / `$GIT_SHA` | env `config.py:44 get_git_sha()` | overrides `git rev-parse HEAD` when `.git` absent on Modal |
+
+`vision_adapter/backends/modal.py:25 VOLUME_NAME="vision-adapter-data"` default; `local.py:12 root=Path`.
 
 ## The absolute minimal watch loop
 

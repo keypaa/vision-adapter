@@ -211,13 +211,27 @@ recovery, and stop the un-finished pushes.
 
 ---
 
-## Phase 8 — Qwen3.5-2B grok probe on Modal (new)
+## Phase 8/9 — Probe vs Train split + streaming (gated before B300)
+
+> `vision_adapter/train.py:124-451 run_train` unifies three paths: `_smoke_train_with_fake_data` (fake fixture `len<=200`, 5 steps, `_tiny_qwen_for_smoke` hidden64), `_local_train_with_precomputed` (has `embeddings/*.pt` → Qwen `AutoModelForCausalLM device_map auto bf16/fp16/fp32` via `--dtype`), `_streaming_train` (HF `RemoteShard` cluster sampling, `sample_size=min(len(rows), max_steps*bs*2)`, `MAX_RG_ROWS=128` smoke excluded, `rg_cache_dir` + LRU). `probe` CLI is alias for `train --config colab`.
 
 **Goal:** same frozen-backbone adapter (frozen ViT → trainable projector), same
 production data plane, on a small text-only LLM (Qwen3.5-2B), to validate the
 recipe and timestamp the grok window cheaply before the B300 DeepSeek run.
 Conceptually a clone of `modal_train.py`, not a modification of it — DeepSeek
 carries FP8/MoE hacks the probe must not touch.
+
+### Probe vs Train — the split that prevents breaking the pipeline
+
+| Aspect | Probe (`vision_adapter/train.py:_streaming_train`, `grok_probe_qwen.py`) | Train (`modal_train.py:build_model`, `_train_impl`) |
+|---|---|---|
+| LLM | `Qwen/Qwen3.5-2B` `H2048 (2B) /2560 (4B)` | `deepseek-ai/DeepSeek-V4-Flash-0731` `H4096, FP8 e4m3 blocks + int8 experts` 155GiB quantized |
+| Injection | `inputs_embeds`-only overwrite `[1:1+n_vis]` (`core.py:127 embeds_for` clone+proj) — Qwen forbids ids+embeds together (spec) | `visual_inject` hook on `embed_tokens` output (`core.py:151` register_forward_hook, `tid2eid[input_ids]` still routed for MoE) |
+| Loss | selective `lm_head(text_hidden)` only where `shift_labels!=-100` tens tokens (`core.py:489`) — full `248k vocab ~80GiB at bs16` avoided | full sequence, chunked eager `budget 2**26` (`modal_train.py:352 _make_chunked_eager` avoids `46GiB` logits OOM) |
+| Precision | `bf16 Ampere+ (>=80) else fp32 on T4, fp16+scaler path` (`train.py:158 dtype_map`) | `bfloat16 dequant per GEMM` (`_fp8_linear_train`, `_dequant_expert_slice` via `kernels>=0.16 DeepGEMM`) |
+| Collate | `make_collate` BOS guard `if tok.bos_token_id is not None` (Qwen `None` vs DeepSeek `0`) (`core.py:86`) | same `make_collate` DeepSeek path BOS always present |
+
+Do not mix `inputs_embeds` injection into DeepSeek or `input_ids` into Qwen without reading `core.py:127/151`.
 
 ### Constraints decided
 

@@ -293,13 +293,20 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     collate = make_collate(tok, tok.pad_token_id, max_len=cfg.max_seq_len, vision_dim=cfg.vision_dim)
     monitor = ProbeMonitor()
     # Build streaming plan (ensure cache dirs exist before index save)
-    (data_dir / "cache").mkdir(parents=True, exist_ok=True)
-    (data_dir / "cache" / "rg_cache").mkdir(parents=True, exist_ok=True)
+    # Persistent cache on Modal via HF_CACHE (/hf) to avoid 224s rebuild each ephemeral /tmp run
+    _cache_root = Path("/hf/hf_stream_cache") if (Path("/hf").is_dir() and os.environ.get("MODAL_TASK_ID")) else data_dir / "cache"
+    _cache_root.mkdir(parents=True, exist_ok=True)
+    (_cache_root / "rg_cache").mkdir(parents=True, exist_ok=True)
+    # keep ephemeral symlink for backward compat
+    try:
+        (data_dir / "cache").mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
     stream_order = _list_shards(token=tok_hf)
     EXCLUDED = {"data/emb_0000.parquet", "data/emb_0001.parquet"}
     stream_order = [s for s in stream_order if s not in EXCLUDED]
     random.Random(0).shuffle(stream_order)
-    index = _build_index(stream_order, cache_dir=str(data_dir / "cache"))
+    index = _build_index(stream_order, cache_dir=str(_cache_root))
     sample_size = min(len(rows), (max_steps or 5) * cfg.batch_size * 2)
     plan = _build_plan(rows, index, sample_size=sample_size, seed=0, excluded_shards=EXCLUDED)
     n_planned = sum(len(v) for v in plan.values())
@@ -329,16 +336,18 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         if _is_modal():
             # Warm first shard in background (if not already cached)
             first_sf = next((s for s in stream_order if s in plan), None)
-            if first_sf and _get_path(first_sf, cache_dir=str(data_dir / "cache" / "rg_cache")) is None:
+            _rg_dir = str(_cache_root / "rg_cache")
+            if first_sf and _get_path(first_sf, cache_dir=_rg_dir) is None:
                 _prefetch_exec = _TPE(max_workers=1)
-                _first_shard_fut = _prefetch_exec.submit(_dl_shard, first_sf, str(data_dir / "cache" / "rg_cache"))
+                _first_shard_fut = _prefetch_exec.submit(_dl_shard, first_sf, _rg_dir)
                 print(f"[train] daemon prefetching first shard {first_sf} ...", flush=True)
     except Exception:
         _prefetch_exec = None
         _first_shard_fut = None
     # Batch iterator
     def _batch_iter():
-        ds = _EmbDS(plan, stream_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"), vision_dim=cfg.vision_dim)
+        _rg = str(_cache_root / "rg_cache") if "_cache_root" in locals() else str(data_dir / "cache" / "rg_cache")
+        ds = _EmbDS(plan, stream_order, rg_cache_dir=_rg, vision_dim=cfg.vision_dim)
         loader = _torch.utils.data.DataLoader(ds, batch_size=cfg.batch_size, drop_last=True, collate_fn=collate, num_workers=0)
         yield from loader
         # epoch wrap
@@ -420,16 +429,14 @@ def run_train(
             raise
 
     manifest_path = dd / "train_manifest.jsonl"
-    if not manifest_path.exists():
-        print(f"[train] manifest not found at {manifest_path} — run `python -m vision_adapter dataset --out {dd} [--dry-run]` first", flush=True)
-        return 2
-
-    # Prefer fake smoke when manifest is the dry-run fixture (fast proof without 2B download)
-    rows, header = load_manifest(manifest_path)
-    is_fake_fixture = header is not None and any("fake" in r.get("emb", "") for r in rows[:10])
-    if is_fake_fixture or len(rows) <= 200:
-        print(f"[train] detected {'fake fixture' if is_fake_fixture else 'small manifest'} ({len(rows)} rows) — running tiny smoke (no 2B download)", flush=True)
-        return _smoke_train_with_fake_data(dd, cfg, max_steps, dev)
+    if manifest_path.exists():
+        rows, header = load_manifest(manifest_path)
+        is_fake_fixture = header is not None and any("fake" in r.get("emb", "") for r in rows[:10])
+        if is_fake_fixture or len(rows) <= 200:
+            print(f"[train] detected {'fake fixture' if is_fake_fixture else 'small manifest'} ({len(rows)} rows) — running tiny smoke (no 2B download)", flush=True)
+            return _smoke_train_with_fake_data(dd, cfg, max_steps, dev)
+    else:
+        print(f"[train] no local manifest at {manifest_path} — will fetch from HF (keypa/vision-adapter-manifests)", flush=True)
 
     # Real data: native HF streaming (no grok shell-out).
     # Uses vision_adapter/data/stream.py (RemoteShard cluster sampling) so

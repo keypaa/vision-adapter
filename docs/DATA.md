@@ -164,11 +164,44 @@ slack because small `140-patch` and huge `19600-patch` land in one `patch_cap`.
 * Remaining Phases 2–3 (`hf_transfer` whole-shard on Modal, micro-Range on Colab) and
   Phase 4 (`modal volume delete`) are next — see `gossamer-launching-minnow.md`.
 
-Header-first manifest format (see `vision_adapter/manifest.py`):
-line 0 is `{"type":"manifest_header","manifest_version":1,"git_sha":...,"seeds":{...},"upstream":{...},"shard_set_hash":...,"row_count":N}`.
-The `ORDER BY image` fix makes the agentic 54k selection deterministic across
-rebuilds even if parquet write order drifts.
+## ManifestHeader v1 — full schema (`vision_adapter/manifest.py:60`)
 
-Embedding filename convention: `sha1(relative_image_path)[:20].pt`, where the
-relative path is relative to the `images/` root (`agentic/foo.png`). Identical
-on Modal and Colab by construction.
+`write_manifest_with_header` is atomic (`tmp+replace`), line 0 header + N data rows, tolerates legacy files without header (`read_manifest_header` best-effort). Pinned by `vision_adapter/config.py:file_sha256` + `shard_set_hash`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `type` | `"manifest_header"` | discriminates from data rows |
+| `manifest_version` | `1` | `MANIFEST_VERSION` constant |
+| `git_sha` | hex | `get_git_sha()` — `$VISION_ADAPTER_GIT_SHA` or `$GIT_SHA` env overrides `git rev-parse HEAD` (Modal has no `.git`) |
+| `created_at` | `YYYY-MM-DDTHH:MM:SSZ` | UTC `time.gmtime()` |
+| `seeds` | `{python,numpy,torch: int}` | always `0` unless caller passes; `dataset.py:290` sets `{0,0,0}` |
+| `upstream` | `{agentic_source, cauldron_source, [upstream_pin]}` | defaults `0xSero/glm-vision-sft-mix@refs/convert/parquet`, `HuggingFaceM4/the_cauldron`; `upstream_pin` suffix appended when `--upstream-pin` given |
+| `shard_set_hash` | `hex[:16]` or `null` | `sha256(sorted shard filenames))[:16]`, order-independent, `null` before packing |
+| `row_count` | int | `len(rows)` |
+| `tags` | `{limit,total,mix,agentic_slice,provenance_note}` | e.g. `{"limit":20000,"total":20000,"mix":"45,45,10","agentic_slice":9000,"provenance_note":"ORDER BY image"}` — `50,30,10` with sum≠100 hard-fails `SystemExit(2)` (`dataset.py:15 _parse_mix`) |
+
+### `sha1[:20]` invariant — the only join key
+
+Embedding filename = `sha1(relative_image_path)[:20].pt` where *relative* = after `images/` root (`agentic/waveui_000123.png`, `cauldron/chartqa-0000001-0.png`, `embeddings/<sha>.pt` in manifest `emb` ≡ parquet `key`). Defined in `models/precompute.py:13 _emb_key` (splits on `/images/`), `data/pack.py:155 make_row: tensor.view(uint8).tobytes()`, `data/dataset.py:42,223`. Identical on Modal and Colab by construction — same `images/` prefix gives same hash whether mounted at `/data/images/...` or `/content/drive/MyDrive/...`. Do not change the `20` — shard lookup + manifest both depend on it.
+
+### `ORDER BY image` determinism
+
+`dataset.py:216 filtered.sort(key=image)` before `[:n_agentic]` + `write_manifest_with_header`. Without `ORDER BY`, the Sero 54k slice (`45%×120k`) is nondeterministic: parquet write order drifts between rebuilds and `random.seed(0)` cannot save you. Coverage dry-run verifies six prefixes (`waveui` 24,978 … `guiact-web-multi` 16,704) — builder fail-closes `IndexError` if `max_index >= upstream_size`.
+
+## Shard size table — bucketed (`103 shards ×1360 = 138987 rows`, `883.8GiB`, `8.58GiB avg`)
+
+| N shards | Example | Size | Bucket | Notes |
+|---|---|---|---|---|
+| 17 | `emb_0002` | `0.4GiB` | `0-100` tiny | `11094 rows 8.1%` — `~0.07MiB` transient |
+| ~92 | median | `8.58GiB avg` | `101-500` dominant | `90961 66.8%` — homogeneous `≈2.4k tokens/batch ±10%` after bucketing |
+| 4 | `emb_0091/0092` | `37-59.4GiB` | `4901+` large | `4822 3.5%` — `MAX_PATCHES` overflow `max 16653` |
+
+Source: `pack.py:SHARD_ROWS=1360, compression=None, SCHEMA key/n_vis/vis_bytes (vis_bytes=bf16→tobytes), per-shard file_sha256, shard_name emb_XXXX.parquet` — verified `verify_hf_clean.py --full → 103 BUCKETED OK`.
+
+## `n_vis` histogram source — why HF Range is 60× faster than Volume
+
+Histogram `136267 rows (101 shards post smoke) 8-way parallel 2026-08-30` is *not* from `138987×torch.load` (would be `5h, 930GiB`). It is `stream.py:378 build_key_index` 8-way `n_vis`-only Range (`rg_span(key,n_vis)`) — `251s cold / 29s warm →2.8s cached, 100% hit 138971/138987`, `60× faster`. Same `HF n_vis == Volume n_vis` (`pack.py:96`) so sort is identical. `/data/.hf_nvis_cache/key_index_cache.json` survives worker disappearance.
+
+## 6-bucket logic (`pack.py:82 _bucket_id`, `stream.py:478`)
+
+Buckets `0-100 /101-500 /501-1000 /1001-2000 /2001-4900 /4901+` from `DATA.md` histogram `8.1%/66.8%/9.4%/4.8%/7.4%/3.5% (min20 max16653 avg836)`. `pack.py:bucketed_embedding_order(names, pt_dir)` sorts by `(_bucket_id(n_vis), name)` when `pt_dir` given else `sorted(names)` fallback for tests. `stream.py:build_epoch_plan(bucket_by_n_vis=True)` buckets shards by median `n_vis`, `rng.shuffle` within bucket, sorts rows within shard by `n_vis` so `bs8` is size-homogeneous (`66.8% 101-500` majority no longer pays `4900`'s `46GiB eager 39k tokens`). Greedy pack in input order would leave 10-20% fragmentation.

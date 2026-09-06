@@ -83,12 +83,25 @@ We have the same objective at batch 8 — watch `samples_seen` for the equivalen
 | `loss` never collapses by ~epoch 1.5 | either: (a) embedding cache corrupted (rerun `precompute`), or (b) LR too low → try 7e-4 |
 | `it_s` ~ 0.1 | expected. CPU offloading of a 155 GiB MoE is PCIe-bound. Baseten used 8 GPUs; we don't. |
 
-## On-disk artefacts you can diff between runs
+## On-disk artefacts you can diff between runs — file locations (source of confusion)
+
+| Path | When | Written by |
+|---|---|---|
+| `./data/logs/train_log.jsonl` (local) / `/data/logs/train_log.jsonl` (Modal Volume) | Volume training `modal_train.py:train` | line 0 `config_header` (`vision_adapter/config.py:216` `manifest_sha256/manifest_rows/git_sha/run_id`), last `run_end` (`wall_min, final_loss, peak_gib, step_ms`) correlated by `run_id` to `runs.jsonl` |
+| `./data/probe_log.jsonl` or `./data/cache/probe_log.jsonl` under `data_dir` | HF streaming `vision_adapter/train.py:_streaming_train` / `_local_train_with_precomputed` | same `config_header` but `data_dir/cache/rg_cache` with `vision_adapter/data/stream.py` daemon; `probe_curves.png` sibling |
+| `./data/runs.jsonl` / `/data/logs/runs.jsonl` | best-effort at `run_end` (`vision_adapter/registry.py:registry_entry` `run_id, git_sha, manifest_sha256, seed, device, dtype, step_ms, peak_gib, wall_min, final_loss`) | `append_registry` atomic append |
+| `./data/dryrun_report.txt` | Volume | `train_dryrun` `mem_alloc/peak/budget PASS/FAIL + step Xs (Y it/s)` after 4 timed steps |
+| `/tmp/hf_dryrun_report.txt` | HF | `train_hf_dryrun_b300` `rc=0 peak vs 70/250GiB` — `train_hf` aborts if missing or no `PASS` (`modal_train.py:801`) |
+| `./data/checkpoints/projector_step*.safetensors` / `projector_final.safetensors` + `latest.pt` | every `save_every` (200 prod, 500 probe) / 20 steps | `vision_adapter/registry.py` viewable |
+
+`probe_log.jsonl` vs `train_log.jsonl` naming: probe (Qwen) writes `probe_log.jsonl` in `data_dir`, train (DeepSeek) writes `train_log.jsonl` — both have same `type:train` lines (`step, loss, gnorm, lr, samples_seen, tokens, step_ms, ts`).
 
 ```
-./data/logs/train_log.jsonl             # the stream (line 0 = config_header)
+./data/logs/train_log.jsonl             # Volume stream (line 0 = config_header)
+./data/probe_log.jsonl                  # HF streaming probe (same header)
 ./data/runs.jsonl                       # registry: one JSON row per run (vision_adapter/registry.py)
-./data/dryrun_report.txt                # one-line peak-memory verdict
+./data/dryrun_report.txt                # Volume one-line peak verdict
+/tmp/hf_dryrun_report.txt               # HF one-line peak verdict (gated)
 ./data/checkpoints/projector_step*.safetensors
 ./data/checkpoints/projector_final.safetensors
 ```

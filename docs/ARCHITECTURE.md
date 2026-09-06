@@ -77,6 +77,39 @@ loop in the same memory budget.** The whole point of the split is that the
 vision tower is exercised once (offline) and the LLM only ever sees 4096-dim
 cached tensors.
 
+## 3a. TrainConfig — single source of truth (`vision_adapter/config.py:120`)
+
+All training constants live in one frozen dataclass. Every field is validated in `__post_init__` and logged verbatim in `config_header` JSONL line 0.
+
+| Field | Default | Meaning |
+|---|---|---|
+| `vision_dim` | `4096` | MoonViT 2×2 merge flatten (must match `VISION_DIM` in `stream.py:35`) |
+| `lr` | `5e-4` | AdamW peak LR |
+| `warmup_steps` | `100` | linear warmup before cosine decay to 10% |
+| `grad_clip` | `1.0` | global grad-norm clip |
+| `max_seq_len` | `4096` | text + vision tokens per example (answer has priority) |
+| `epochs` | `2` | passes over 120k |
+| `batch_size` | `8` | per-device |
+| `samples_per_baseten_grok` | `57600` | `900×64` — grok reference |
+| `log_every` | `1` | log period (probe overrides 20) |
+| `val_every` | `250` | held-out probe |
+| `save_every` | `200` | `projector_step*.safetensors` (probe 500) |
+| `chart_every` | `50` | `render_curves` PNG refresh |
+| `status_every` | `20` | console heartbeat |
+| `plateau_window` | `300` | grok plateau detector |
+| `plateau_check_every` | `50` | plateau banner cadence |
+| `plateau_rel_tol` | `0.02` | flat-loss tolerance |
+| `ema_beta` | `0.98` | EMA for loss monitors |
+| `spike_factor / spike_window / spike_min_history` | `2.0 / 100 / 20` | dual spike detector (loss+gnorm) |
+| `gpu_mem_cap_gib` | `70.0` | A100 gate (B300 250) |
+| `sys_ram_cap_gib` | `400.0` | informational cap |
+
+**Presets** (`config.py:189-209`): `default_config()` = production `bs8, log1, save200`; `probe_config()` = L4/Modal probe `bs16, log20, save500`; `colab_probe_config()` = T4 free-tier `bs8, log20, save500`. Override via `TrainConfig(lr=7e-4)` or `dataclasses.replace`.
+
+## 3b. Preprocess navIT contract (`vision_adapter/models/preprocess.py:7-16`)
+
+`MAX_PATCHES=65536, MAX_SIDE=7168 (512×14), PAD_TO=28, PATCH=14, _MEAN/_STD=[0.5,0.5,0.5]` — `_resize_size()` scales by `min(1, sqrt(65536/patches), 7168/w, 7168/h)` then BICUBIC, pads `right/bottom` with zeros to `PAD_TO`, normalises `(x/255-0.5)/0.5`, unfolds `14×14` patches row-major `gh*gw` → `pixel_values [N,3,14,14] + grid_thws [1,gh,gw]`. Post-MoonViT: `view(t, h//2,2,w//2,2,-1).mean→[n_merged,4,1024] flat 4096`. Same function on Modal and Colab — do not diverge.
+
 ## 4. Load / persist contracts
 
 * **MoonViT weights** —

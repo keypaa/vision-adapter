@@ -32,11 +32,7 @@ python3 -c "from huggingface_hub import whoami; print(whoami())"
 # or export HF_TOKEN (or pass --hf-token) — see note below
 ```
 
-> **HF auth:** every staged command accepts `--hf-token HF_xxx` or env
-> `HF_TOKEN` / `HUGGING_FACE_HUB_TOKEN`. Anonymous works for pulls but is
-> slower (lower rate limits, `Warning: unauthenticated`). For `—push-to-hf`
-> you need a **write** token — the CLI checks `whoami` and refuses a
-> read-only token with `read-only — create a write token`.
+> **HF auth (4-level chain, `backends/auth.py:15`):** `--hf-token HF_xxx` > `$HF_TOKEN` > `$HUGGING_FACE_HUB_TOKEN` > `google.colab.userdata.get("HF_TOKEN")` → exported to both envs via `set_hf_token_env` so `huggingface_hub/datasets` pick it up. Anonymous works for pulls but is slower (lower rate limits, `Warning: unauthenticated`). For `—push-to-hf` you need a **write** token — the CLI checks `HfApi.whoami()` and refuses a read-only token with `read-only — create a write token`. On Modal the secret is `huggingface-token` → `$HF_TOKEN`. `$VISION_ADAPTER_GIT_SHA`/`$GIT_SHA` overrides `git SHA` when `.git` absent. `HF_HUB_ENABLE_HF_TRANSFER=1` needs `pip install -e .[train]` (`hf_transfer` dep) for Rust 1GiB/s else Range fallback.
 
 ---
 
@@ -168,48 +164,61 @@ modal volume ls vision-adapter-data embeddings | wc -l   # Modal: should approac
 
 ---
 
-## Step 3 — Pack embeddings into shards  (< 5 min, resumable)
+## Step 3 — Pack embeddings into shards  (< 5 min local, ~3h for 103 via HF, resumable)
 
-Packs the `.pt` embeddings into ~100 parquet shards (`SHARD_ROWS=1360`,
-`compression=None`, per-shard `sha256`) via `vision_adapter/data/pack.py`.
+Packs the `.pt` embeddings into `103 shards SHARD_ROWS=1360, compression=None, 883.8GiB total 8.58GiB avg 0.4→59.4GiB` (`vision_adapter/data/pack.py` schema `key/n_vis/vis_bytes` bf16→tobytes, per-shard `sha256`, `shard emb_XXXX.parquet`).
 
 ```bash
 python -m vision_adapter pack --data-dir ./data
 # HF-only push (no local volume copy):
 python -m vision_adapter pack --data-dir ./data --hf-only --hf-token $HF_TOKEN
-# single-shard range:
+# single-shard range / resume:
 python -m vision_adapter pack --data-dir ./data --only 0:2
+python -m vision_adapter pack --data-dir ./data --only 41:103  # resume after kill at 41 (888s stall)
+# bucketed repack (fixes 500× swing, 6-bucket 0-100/…/4901+):
+python -m vision_adapter pack --data-dir ./data --bucketed --hf-only --hf-token $HF_TOKEN  # HF n_vis 4min vs Volume 5h 60×
+# Modal bucketed (production, direct FS 50-92MB/s 42s/3.8GB vs RPC 1MB/s 500s):
+modal run vision_adapter/data/pack.py::pack_bucketed --detach          # all 103
+modal run vision_adapter/data/pack.py::pack_bucketed -- --only 101:103  # 2 shards ~44s
 ```
 
-Local by default; add `--push-to-hf` + `--hf-token` to publish.
+Flags: `--only i[:j]` shard range, `--hf-only` skip `/data/shards` volume copy (`resume_action hf_only`), `--bucketed` sort `(_bucket_id(n_vis), name)` then homogeneity check via HF `n_vis` Range (`98/103 BUCKETED`), `--stage-dir /var/tmp/emb_stage` not `/tmp` tmpfs (~21GiB peak). Modal function `pack_bucketed` `timeout 36000 (10h) memory 16384` direct FS fallback `git checkout HEAD~1` for RPC revert. `dataset --mix 45,45,10` hard-fails `SystemExit(2)` if sum≠100.
 
 Verify:
 
 ```bash
 ls ./data/shards | head
 python -c "import pyarrow.parquet as pq; print(pq.read_table('./data/shards/emb_0000.parquet').num_rows)"
+python -c "from vision_adapter.config import file_sha256; print(file_sha256('./data/shards/emb_0000.parquet'))"
+# bucketed verify (no download, 152s 8 workers):
+python /tmp/opencode/verify_hf_clean.py --full  # 103 BUCKETED OK 98/103 95%
 ```
 
 ---
 
-## Step 4 — Training (A100-80GB)
+## Step 4 — Training (A100-80GB, or Colab T4 probe)
 
-**Dry-run memory gate first** — it builds the full LLM + projector, runs one
-forward/backward on a batch of 8 and asserts peak VRAM < 70 GiB:
+**Dry-run gates first — must PASS before full train** (3 gates, see `PIPELINE.md:4`):
 
 ```bash
-modal run modal_train.py::train_dryrun
+modal run modal_train.py::train_dryrun            # Volume A100: peak <70GiB → PASS → /data/dryrun_report.txt
+modal run modal_train.py::train_hf_dryrun          # HF A100: peak <70GiB → /tmp/hf_dryrun_report.txt
+modal run modal_train.py::train_hf_dryrun_b300     # HF B300: peak <250GiB all-in-VRAM → PASS then train_hf
 # local staged validation (CPU-safe, no GPU):
-python -m vision_adapter train --data-dir ./data --dryrun
+python -m vision_adapter train --data-dir ./data --dryrun            # validates manifest+config+backend no kernels
+python -m vision_adapter train --data-dir ./data --dryrun --config probe  # bs16
 ```
 
 Expected tail:
 
 ```
 [dryrun] loss=… n_trainable=67.1M | mem_alloc=…GiB peak=…GiB budget=70GiB -> PASS
+[hf-dryrun] rc=0 mem_alloc=… peak=… budget=70GiB -> PASS
 ```
 
-(The `MEMORY GATE: PASS` text was shorthand; the script prints `-> PASS`/`-> FAIL` followed by an explicit assertion.)
+(`train_hf` aborts `SystemExit(2)` if `/tmp/hf_dryrun_report.txt` missing or not `PASS` — same discipline as Volume.)
+
+**Probe vs Train** (`GROK_PROBE.md` vs `modal_train.py`): Probe Qwen3.5-2B `H2048, inputs_embeds-only [1:1+n_vis], selective lm_head loss tens tokens (248k vocab ~80GiB avoided)` vs Train DeepSeek-V4 `H4096, visual_inject hook keeping input_ids for MoE hash gate, FP8/FP4 via kernels>=0.16`. `vision_adapter/train.py:run_train` auto-selects local `embeddings/*.pt` → `_local_train_with_precomputed` else HF streaming cluster-sampled `EmbStreamDataset` (`MAX_RG_ROWS=128`, smoke `emb_0000/0001 ~9GiB excluded`). `python -m vision_adapter probe` is alias for `train --config colab`.
 
 **Then start training.** 2 epochs × (120 000 / 8) ≈ **30 000 steps** (for a
 `20k` probe it's ~`5k` steps). Grokking is sample-bound, not step-bound: watch
@@ -219,15 +228,17 @@ the full JSON telemetry stream lands in `/data/logs/train_log.jsonl`
 (see `docs/TELEMETRY.md`):
 
 ```bash
-modal run modal_train.py::train
+modal run modal_train.py::train                 # Volume A100 fallback
+modal run modal_train.py::train_hf              # HF streaming B300 (gated on train_hf_dryrun_b300)
+modal run modal_train.py::train_hf_a100         # HF streaming A100 (gated on train_hf_dryrun)
 # staged local (any GPU):
 python -m vision_adapter train --data-dir ./data --config probe --max-steps 200
+python -m vision_adapter train --data-dir ./data --max-steps 200 --dtype auto/bf16/fp16/fp32  # T4 fp32 else bf16
 python -m vision_adapter probe --data-dir ./data --max-steps 200 --hf-token $HF_TOKEN
 ```
 
 Checkpoints land in `/data/checkpoints/projector_step*.safetensors` and
-`latest.pt` every 20 steps (loss-tracked). For probe runs: `probe_log.jsonl` +
-`probe_curves.png` + `runs.jsonl`.
+`latest.pt` every 20 steps (loss-tracked). For probe runs: `probe_log.jsonl` (HF streaming) or `train_log.jsonl` (Volume) + `probe_curves.png`/`train_curves.png` + `runs.jsonl` (see `TELEMETRY.md` file locations).
 
 To fetch the trained adapter locally after the run:
 
@@ -263,18 +274,24 @@ the alignment layer.
 
 ---
 
-## Troubleshooting
+## Troubleshooting — expanded (`OPERATIONS.md:22`)
 
 | Symptom | Fix |
 |---|---|
-| `MEMORY GATE FAIL` on dryrun | batch_size 8 too big for your Modal A100 SKU → lower `batch_size` in `vision_adapter/config.py` (`TrainConfig`) |
+| `MEMORY GATE FAIL` on dryrun | batch_size 8 too big for your Modal A100 (70GiB) or B300 (250GiB) SKU → lower `batch_size` in `vision_adapter/config.py` (`TrainConfig`) or `max_seq_len 4096` |
+| `hf-dryrun` abort `SystemExit(2) PASS not found` | you skipped `train_hf_dryrun` — run `modal run modal_train.py::train_hf_dryrun_b300` first then `train_hf` checks `/tmp/hf_dryrun_report.txt` |
 | loss stays ~7 after step 12 000 | grokking may not happen this run; try `LR = 7e-4` and rerun; see `docs/TELEMETRY.md` |
 | Colab precompute synced but trainer sees no images | `embeddings/` must be at Volume root: `modal volume put vision-adapter-data ./embeddings/. /embeddings/` |
 | Out of RAM in ETL | Cauldron pulls whole configs; raise `memory=` on the `dataset` stage (Modal) |
-| Colab session died | just re-run the precompute cell; `_already_done()` skips everything already cached |
-| `KeyError` in aguvis join | upstream re-indexed; re-run `python -m vision_adapter dataset --dry-run` |
+| Colab session died | just re-run the precompute cell; `_already_done()` skips everything already cached (sha1[:20] key) |
+| `KeyError` in aguvis join | upstream re-indexed; re-run `python -m vision_adapter dataset --dry-run` (fail-closed `IndexError` verifies 6 prefixes) |
+| `IncompleteRead` mid-Range | HF CDN truncated mid-chunk — `stream.py:50 _fetch_range timeout120 fresh TCP 1.0×2^attempt` auto-retries 3 times |
+| `Worker disappeared` after shard 57 888s tail | Volume RPC throttle `1MB/s` (vs direct FS `50-90MB/s`) — `pack.py:274` already uses `shutil.copyfile /data/...` with RPC fallback; resume `pack_bucketed only=57:103` and checkpoint survives at `/data/.bucketed_done` |
+| `short read expected != bytes` | stream closed clean but short — `pack.py:283,296` size check vs `vol.listdir size` map + retry loop `0.5×2^attempt` |
+| `read at X outside span [lo,hi)` | old bug `rg_span(key)` outside `n_vis span` — fixed `stream.py:335` to `columns=("key","n_vis")` |
+| `Volume 1MB/s` still after pack fix | check container started before fix — `git checkout HEAD~1` restores RPC; new image uses direct FS `92MB/s 42s/3.8GB` |
 
-If in doubt, re-run the failing step — every stage is idempotent.
+If in doubt, re-run the failing step — every stage is idempotent. Pack `bucketed` keeps `/data/.hf_nvis_cache` + `/data/.nvis_map_checkpoint.jsonl` so rebuild after kill resumes not restarts.
 
 ## Colab local GPU notes
 

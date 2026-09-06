@@ -4,14 +4,24 @@ The Vision-Adapter project publishes **three** Hugging Face repos. One is a
 model repo; two are dataset repos. Everything is opt-in per repo via the
 `repo_ns` (namespace) and `public` flags in `vision_adapter/data/pack.py`.
 
-## Repos at a glance
+## Repos at a glance — code truth (`stream.py:29, pack.py:15, GROK_PROBE.md:61`)
 
-| Repo | Type | Visibility | What it holds |
-|---|---|---|---|
-| `keypa/MoonViT-V2-Standalone` | **model** | public | 401 M-param BF16 MoonViT-V2 weights, `vision_config.json`, Kimi's own `mm_projector`, and the runtime code (`moonvit.py`, `preprocess.py`, etc.) |
-| `keypa/vision-adapter-data` | dataset | public by default | `train_manifest.jsonl` (header-first) + `train_manifest_val.jsonl` + `cauldron_manifest.jsonl` + `shards/emb_*.parquet` (the post-ETL mix; images themselves link back to source via the manifest rows; shards carry per-shard `sha256`) |
+| Repo | Type | Visibility | What it holds | Code ref |
+|---|---|---|---|---|
+| `keypa/MoonViT-V2-Standalone` | **model** | public | 401 M-param BF16 MoonViT-V2 weights, `vision_config.json`, Kimi's own `mm_projector`, and runtime code (`moonvit.py`, `preprocess.py`, etc.) | `ARCHITECTURE.md` |
+| `keypa/vision-adapter-manifests` | dataset | public by default | `train_manifest.jsonl` header-first `v1 git_sha,seeds,upstream,shard_set_hash,row_count,tags` + `train_manifest_val.jsonl` + `cauldron_manifest.jsonl` | `stream.py:30 MANIFEST_REPO`, `vision_adapter/manifest.py:60` |
+| `keypa/vision-adapter-embeddings` | dataset | public by default | `data/emb_XXXX.parquet` `103×1360=138987 rows 883.8GiB 8.58GiB avg` (`key=embeddings/<sha1[:20]>.pt, n_vis, vis_bytes` bf16→tobytes, `compression=None`, per-shard `sha256`) | `stream.py:29 EMB_REPO`, `pack.py:15` |
+| `keypa/vision-adapter-grok-probe` | dataset | public | probe pushes `latest.safetensors+latest.opt.pt+probe_log.jsonl+probe_curves.png` each `500 steps` (Colab crash resilience) | `GROK_PROBE.md:61` |
 
-The processed image bytes (≈ 25 GB) are deliberately **not** rehosted — they reconstruct deterministically from the upstream sources via `python -m vision_adapter dataset --out ./data` (local or `--backend modal`). If you want a dataset with the actual image payloads, publish the images via the source datasets' native flow; the manifests are what you share for training.
+`keypa/vision-adapter-data` (old name in legacy docs) ≡ manifests + embeddings above split into two repos for separate cards/provenance.
+
+Auth for pushes: `--push-to-hf --hf-repo <ns/repo> --hf-token <write-token>` → `HfApi.whoami()` write check before `upload_file`; pull `hf_hub_download` / `snapshot_download` works anonymous but slower (lower rate limits). Shard path `data/emb_XXXX.parquet` not `shards/`.
+
+The processed image bytes (≈ 25 GB original PNG/JPEG) are deliberately **not** rehosted under `vision-adapter-embeddings` — they reconstruct deterministically via `python -m vision_adapter dataset --out ./data` (positional join 6 prefixes + navIT resize). If you want image payloads, publish via source datasets' native flow; manifests + parquet shards are what you share for training.
+
+Shard verify (no download, 152s 8 workers): `python /tmp/opencode/verify_hf_clean.py --full → 103 BUCKETED OK 98/103 95%`.
+
+Revisions pinned at publish: `vision_adapter/data/dataset.py:208 revision=upstream_pin` + `vision_adapter/models/precompute.py:42` `--revision <commit-sha>` for MoonViT (not branch).
 
 ### How consumers use it
 
