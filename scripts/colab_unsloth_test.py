@@ -12,8 +12,10 @@ Run in Colab (Runtime -> T4 GPU):
 
 For step10 vs step200 comparison, run twice.
 """
-import argparse, io, json, requests
+import argparse, io, json, requests, sys
 from pathlib import Path
+# Colab: repo not installed as package, add parent to sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from PIL import Image
 from huggingface_hub import hf_hub_download
