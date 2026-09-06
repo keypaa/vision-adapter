@@ -130,6 +130,10 @@ Costs: `9 vols 1.32TiB >1TB billed $0.85/day ~$25/mo` → `384.8GiB FREE`, `HF p
 * Download: `direct FS shutil.copyfile /data/embeddings` `50-90MB/s` (keeps RPC `vol.read_file_into_fileobj 1MB/s 500s/888s tail` as fallback, `git checkout HEAD~1` reverts). Size-checked against `vol.listdir size` map + `IOError short read` retry loop `delay 0.5×2^attempt`.
 * Checkpoints surviving worker disappearance: `/data/.hf_nvis_cache` + `/data/.nvis_map_checkpoint.jsonl` + `/data/.bucketed_done` (Volume) else `/var/tmp/...`.
 
+### Ephemeral `/tmp` warning — persist or lose it
+
+On Modal ` /tmp`, `/tmp/hf_stream`, `/tmp/hf_stream/cache` are **ephemeral per-container** (container stop = wiped). `train_hf_probe_l4` once wrote `probe_log.jsonl`/`probe_curves.png`/`runs.jsonl` + `key_index_cache.json` to `/tmp/hf_stream` and lost `38min $0.38` on stop. Fix `a870696` + `441ec95`: cache is now `/hf/hf_stream_cache` (HF vol persistent `+ vol.commit()`), probe artifacts copied to `/hf/hf_stream_cache/probe_l4_200_*` for `modal volume get vision-adapter-hf hf_stream_cache/probe_l4_200_probe_log.jsonl ./probe_log.jsonl`. **Rule: anything that goes to `/tmp` is lost — persist to `/hf` or `/data` and `vol.commit()` before exit.**
+
 ### 3 dry-run gates (must PASS before `train_hf`)
 
 See `PIPELINE.md:4` table. `train_hf` checks `/tmp/hf_dryrun_report.txt` contains `PASS` else `SystemExit(2)`. Volume path still `modal_train.py:train_dryrun (EmbSFT)` with `dryrun_report.txt` on `/data`.
