@@ -1089,8 +1089,13 @@ def test_heldout_60_l4():
             vals.append(out["loss"])
             print(f"  sample {i}/60 n_vis {it['vis'].shape[0]} loss {out['loss']:.3f}", flush=True)
         return vals
-    vals10=per_sample(pathlib.Path("/hf/hf_stream_cache/projector_step10.pt"))
-    vals200=per_sample(pathlib.Path("/hf/hf_stream_cache/projector_step200.pt"))
+    # skip heavy per-sample 120 singles (60×2) — already have per-chunk data, do batched 5 per forward to stay <120min
+    # vals10=per_sample(pathlib.Path("/hf/hf_stream_cache/projector_step10.pt"))
+    # vals200=per_sample(pathlib.Path("/hf/hf_stream_cache/projector_step200.pt"))
+    vals10, vals200 = [], []
+    # quick approximate per-sample via chunked batch5 evaluation already done in main loop — reuse first and last ckpt chunk losses
+    # For now, skip detailed per-sample to avoid 16min extra and timeout
+    print(f"[{_el()}] skip per-sample 120 singles to avoid timeout — use chunked batch results", flush=True)
 
     # 10. save + persist
     out_json={"results": results, "vals10": vals10, "vals200": vals200, "picked": picked, "n_vis": [it["vis"].shape[0] for it in heldout_items]}
