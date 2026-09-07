@@ -1063,11 +1063,20 @@ def test_unsloth_l4():
         for prompt in ["Describe the image.", "What is in the image?", "What does the image show?"]:
             items=[{"vis": vis, "user": prompt, "assistant": "", "g": "test"}]
             batch=coll(items)
-            print(f"prompt {prompt!r} n_vis {vis.shape[0]} input_ids {batch['input_ids'].shape}")
+            # for generation, remove trailing EOS that coll adds for empty assistant (otherwise model sees EOS and stops)
+            # coll with assistant="" still adds EOS at end -> strip it for prompt
+            if batch["input_ids"][0, -1].item() == tok.eos_token_id:
+                batch["input_ids"] = batch["input_ids"][:, :-1]
+                batch["attention_mask"] = batch["attention_mask"][:, :-1]
+                batch["labels"] = batch["labels"][:, :-1]
+            print(f"prompt {prompt!r} n_vis {vis.shape[0]} input_ids {batch['input_ids'].shape} (EOS stripped)")
             inp=embeds_for(model, batch, proj, "cuda")
             out_ids=model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=64, do_sample=False, pad_token_id=tok.pad_token_id)
-            gen=tok.decode(out_ids[0][batch["input_ids"].shape[1]:], skip_special_tokens=True)
-            print(f"  gen: {gen[:200]!r}")
+            # out_ids includes prompt input_ids length, but we passed inputs_embeds, so need to decode from generated part
+            # model.generate with inputs_embeds returns out_ids that include prompt's input_ids? For embeds, it still returns input_ids + generated
+            # Use batch input_ids length for slicing
+            gen = tok.decode(out_ids[0][batch["input_ids"].shape[1]:], skip_special_tokens=True)
+            print(f"  gen: {gen[:300]!r}")
     print("[unsloth] done")
 
 
