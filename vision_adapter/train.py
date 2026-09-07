@@ -281,9 +281,16 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     for pa in model.parameters():
         pa.requires_grad_(False)
     model.train()
-    if os.environ.get("VISION_ADAPTER_CKPT_OFF") == "1":
+    # PRO 6000 96GB Blackwell → disable grad ckpt to save 25-40% recompute (Qwen 2B fits easily, was bottleneck on T4/L4)
+    _is_big_gpu = False
+    try:
+        if dev=="cuda":
+            _is_big_gpu = _torch.cuda.get_device_properties(0).total_memory > 80*2**30
+    except Exception:
+        pass
+    if os.environ.get("VISION_ADAPTER_CKPT_OFF") == "1" or _is_big_gpu:
         model.gradient_checkpointing_disable()
-        print("[train] ckpt OFF (B300 ON vs OFF comparison, FlexAttention TODO)", flush=True)
+        print(f"[train] ckpt OFF (big GPU {_is_big_gpu} 96GB -> 25-40% faster, no recompute)", flush=True)
     else:
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     cfg_llm = getattr(model.config, "text_config", model.config)
