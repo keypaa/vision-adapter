@@ -479,6 +479,12 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                     _torch.save({"proj": proj.state_dict(), "step": step, "loss": rec["loss"]}, str(ckpt))
                     print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] [train] ckpt {ckpt.name} ({ckpt.stat().st_size/1e6:.1f}MB) | {_stats_str()}", flush=True)
                     _maybe_push_ckpt(ckpt)
+                    # push the growing log too (200Ko, cheap) — crash-proof curves up to last save
+                    try:
+                        lf.flush()
+                        _maybe_push_ckpt(log_path)
+                    except Exception:
+                        pass
                 except Exception as e:
                     print(f"[{time.strftime('%H:%M:%S')}] [train] ckpt save failed step {step}: {e} | {_stats_str()}", flush=True)
             if step % 5 == 0 or step==steps:
@@ -495,10 +501,17 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             _torch.save({"proj": proj.state_dict(), "step": steps, "cfg": cfg.to_dict(), "final_loss": recs[-1]["loss"] if recs else None}, str(final_path))
             print(f"[train] saved final projector {final_path} ({final_path.stat().st_size/1e6:.1f}MB)", flush=True)
             _maybe_push_ckpt(final_path)
-            # also push log + curves so an interrupted session stays resumable from HF alone
+            # also push log + curves + manifest + runs + nohup stdout so HF alone
+            # tells the full story of the run (crash-proof even if session dies)
             try:
                 _maybe_push_ckpt(log_path)
                 _maybe_push_ckpt(curves_path)
+                _maybe_push_ckpt(data_dir / "runs.jsonl")
+                mf = data_dir / "train_manifest.jsonl"
+                if mf.is_file():
+                    _maybe_push_ckpt(mf)
+                for console_log in sorted(data_dir.glob("train_*.log")):
+                    _maybe_push_ckpt(console_log)
             except Exception:
                 pass
             # also mirror to data_dir for local fetches
