@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
-"""Beautiful probe graphs with plotly, linear scales, no matplotlib."""
+"""Beautiful probe graphs with plotly, linear scales, no matplotlib.
+
+Usage:
+    python scripts/plot_probe.py [--input path/to/probe_log.jsonl] [--output path/to/out.html]
+    Defaults to logs/probe_l4_200_probe_log.jsonl -> logs/probe_beautiful.html
+"""
+import argparse
 import json
 from pathlib import Path
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-# find latest probe log
-candidates = [
-    Path("logs/probe_l4_200_probe_log.jsonl"),
-    Path("data/probe_log.jsonl"),
-    Path("logs/heldout60_evolution.json"),
-]
-probe_path = next((p for p in candidates if p.exists()), None)
-if probe_path is None:
-    # try molab 1000
-    probe_path = Path("checkpoints/molab_1000/probe_log.jsonl") if Path("checkpoints/molab_1000/probe_log.jsonl").exists() else None
+ap = argparse.ArgumentParser()
+ap.add_argument("--input", default="logs/probe_l4_200_probe_log.jsonl")
+ap.add_argument("--output", default=None, help="defaults to logs/<input-stem>_beautiful.html")
+args = ap.parse_args()
 
-if probe_path is None:
-    import glob
-    logs = sorted(Path("logs").glob("probe*.jsonl"))
-    probe_path = logs[-1] if logs else None
-
-if probe_path is None or not probe_path.exists():
-    print(f"no probe log found, tried {candidates}")
+probe_path = Path(args.input)
+if not probe_path.exists():
+    print(f"input not found: {probe_path}")
     raise SystemExit(1)
 
 print(f"using {probe_path} {probe_path.stat().st_size/1024:.1f}KB")
@@ -79,19 +75,18 @@ fig.update_layout(height=900, width=1100, title_text=f"Vision Adapter Probe — 
 # Add annotation for samples
 fig.add_annotation(text=f"samples_seen {samples[0]} → {samples[-1]} ({samples[-1]/1000:.1f}k)", xref="paper", yref="paper", x=0.5, y=1.08, showarrow=False, font=dict(size=12, color="#5f6368"))
 
-out_html = Path("logs/probe_beautiful.html")
+out_html = Path(args.output) if args.output else Path("logs") / (probe_path.stem + "_beautiful.html")
+out_html.parent.mkdir(parents=True, exist_ok=True)
 fig.write_html(str(out_html))
 print(f"wrote {out_html} {out_html.stat().st_size/1024:.1f}KB")
 
 # also try to write png if kaleido available
 try:
-    out_png = Path("logs/probe_beautiful.png")
+    out_png = out_html.with_suffix(".png")
     fig.write_image(str(out_png), width=1100, height=900, scale=2)
     print(f"wrote {out_png} {out_png.stat().st_size/1024:.1f}KB")
 except Exception as e:
     print(f"png export skipped (need kaleido): {e}")
-    # fallback: try to save as static via plotly
     pass
 
-# Also create a simple standalone html with no log scale
-print("done — open logs/probe_beautiful.html in Marimo or browser")
+print(f"done — open {out_html} in Marimo or browser")
