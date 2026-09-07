@@ -2,7 +2,7 @@
 name = "vision-adapter"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["torch", "pyarrow", "pillow"]
+dependencies = ["torch", "pyarrow", "pillow", "accelerate"]
 
 [project.optional-dependencies]
 train = ["transformers", "safetensors", "accelerate", "sentencepiece", "huggingface_hub", "datasets", "hf_transfer"]
