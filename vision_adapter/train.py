@@ -96,6 +96,20 @@ def _maybe_push_ckpt(local_path: Path) -> None:
         print(f"[train] HF push failed for {local_path.name} ({e}) — local copy kept", flush=True)
 
 
+def _ensure_expandable_segments() -> bool:
+    """Default PYTORCH_CUDA_ALLOC_CONF to expandable_segments (fragmentation relief).
+
+    Must run before the first CUDA allocation (i.e. model load). Never
+    overrides an explicit user setting. Returns True when it set the default.
+    """
+    import os
+
+    if "PYTORCH_CUDA_ALLOC_CONF" in os.environ:
+        return False
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+    return True
+
+
 def _tiny_qwen_for_smoke(vocab: int = 1024, hidden: int = 64, layers: int = 4):
     """Random-weight Qwen-shaped backbone, fp32 CPU/GPU — mirrors test_probe fixture.
     Last layer is full_attention so the projector receives grads (see test_probe notes)."""
@@ -466,7 +480,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             if not out["finite"]:
                 print(f"[train][WARN] non-finite at {step}, skipping", flush=True)
                 continue
-            rec = {"type":"train","step":step,"loss":round(out["loss"],5),"gnorm":round(out["gnorm"],4),"lr":float(opt.param_groups[0]["lr"]),"tokens":out["tokens"],"samples_seen":step*cfg.batch_size,"step_ms":out["step_ms"],"ts": round(time.time(),1)}
+            rec = {"type":"train","step":step,"loss":round(out["loss"],5),"gnorm":round(out["gnorm"],4),"lr":float(opt.param_groups[0]["lr"]),"tokens":out["tokens"],"L":out.get("L"),"bl2":out.get("bl2"),"ckpt_on":out.get("ckpt_on", False),"samples_seen":step*cfg.batch_size,"step_ms":out["step_ms"],"ts": round(time.time(),1)}
             monitor.update(step, rec["loss"], rec["samples_seen"])
             rec["ema_loss"] = round(monitor.ema or rec["loss"],5)
             recs.append(rec)
@@ -557,6 +571,8 @@ def run_train(
     Returns 0 on success, 1 if caller should delegate (e.g. no fake fixture, need HF path).
     """
     dd = Path(data_dir)
+    if _ensure_expandable_segments():
+        print("[train] PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (fragmentation relief)", flush=True)
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     # Only gate on GPU when we actually need CUDA kernels; smoke fallback runs on CPU
     # but warn — real training will need a card.

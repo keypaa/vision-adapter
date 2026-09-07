@@ -489,51 +489,152 @@ def render_train_curves(records, out_path: str, grok_lo: int = 0, grok_hi: int =
     return True
 
 
-def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=None) -> dict:
+# ---------------------------------------------------------------------------
+# Adaptive grad checkpointing — OOM guard for worst-bucket batches
+# ---------------------------------------------------------------------------
+# The collate pads to max(n_vis) with no cap, so a worst-bucket batch can hit
+# L≈16k while normal batches sit at L≈1-2k. Attention memory scales with B·L²
+# (full-attn layers) plus per-layer linear-attn workspace, both driven by the
+# PADDED shape — not by the mask sum (one L=5k row + padding costs ~25× a
+# uniform L=1k batch at equal mask sum). Gate on shape, never on the sum.
+DEFAULT_L_MAX = 2500
+DEFAULT_COST_MAX = 50_000_000  # B=8 × 2500² (production batch)
+
+
+def _resolve_ckpt_budget(adaptive_ckpt) -> tuple[int, int] | None:
+    """Resolve the adaptive-ckpt budget: None disables, "auto" reads env."""
+    import os
+
+    if adaptive_ckpt is None:
+        return None
+    if adaptive_ckpt == "auto":
+        try:
+            l_max = int(os.environ.get("VISION_ADAPTER_L_MAX", DEFAULT_L_MAX))
+        except ValueError:
+            l_max = DEFAULT_L_MAX
+        try:
+            cost_max = int(os.environ.get("VISION_ADAPTER_COST_MAX", DEFAULT_COST_MAX))
+        except ValueError:
+            cost_max = DEFAULT_COST_MAX
+        return (l_max, cost_max)
+    l_max, cost_max = adaptive_ckpt
+    return (int(l_max), int(cost_max))
+
+
+def ckpt_needed_for_batch(batch, l_max: int = DEFAULT_L_MAX,
+                          cost_max: int = DEFAULT_COST_MAX) -> bool:
+    """True when this batch's padded shape exceeds the ckpt budget."""
+    B, L = batch["input_ids"].shape[:2]
+    if L > l_max:
+        return True
+    return B * L * L > cost_max
+
+
+_MISSING = object()
+
+
+def _ckpt_func():
+    import functools
+
+    from torch.utils.checkpoint import checkpoint
+
+    return functools.partial(checkpoint, use_reentrant=False)
+
+
+def _set_ckpt_flags(model, enabled: bool):
+    """Flip per-layer ckpt state directly (no enable()/disable() hooks).
+
+    Replicates what transformers' _set_gradient_checkpointing does (bool +
+    func object per layer) WITHOUT enable_input_require_grads(), whose
+    embedding hooks pile up on every enable() call. Our inputs_embeds already
+    require grad (see embeds_for), so the hooks are unnecessary. Returns the
+    previous states for restore.
+    """
+    func = _ckpt_func() if enabled else None
+    prev = []
+    for m in model.modules():
+        if hasattr(m, "gradient_checkpointing"):
+            had = hasattr(m, "_gradient_checkpointing_func")
+            prev.append((m, bool(m.gradient_checkpointing),
+                         m._gradient_checkpointing_func if had else _MISSING))
+            m.gradient_checkpointing = enabled
+            if enabled:
+                m._gradient_checkpointing_func = func
+            elif had:
+                delattr(m, "_gradient_checkpointing_func")
+    return prev
+
+
+def _restore_ckpt_flags(prev) -> None:
+    for m, was, func in prev:
+        m.gradient_checkpointing = was
+        if func is _MISSING:
+            if hasattr(m, "_gradient_checkpointing_func"):
+                delattr(m, "_gradient_checkpointing_func")
+        else:
+            m._gradient_checkpointing_func = func
+
+
+def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=None,
+                    adaptive_ckpt="auto") -> dict:
     """One fwd/bwd/clip/step for the Qwen probe (selective lm_head loss).
 
     Shared between grok_probe_qwen and modal_probe; modal_train keeps its own
     _one_step that goes through visual_inject (hash-MoE hook).
+
+    adaptive_ckpt: "auto" (env-tuned budget, default), (l_max, cost_max) to
+    force, or None to disable. Big batches flip ckpt ON for that step only —
+    recompute is exact, so gradients match ckpt-OFF; small batches keep the
+    fast no-recompute path.
     """
     import torch.nn.functional as F
     t0 = time.time()
-    amp_dtype = None
-    if device == "cuda" and next(model.parameters()).dtype == torch.float32:
-        amp_dtype = torch.float16
-    inp = embeds_for(model, batch, proj, device)
-    labels = inp.pop("labels")
-    base = model.model
-    with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-        out = base(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"])
-        hidden = out.last_hidden_state
-        shift_labels = labels[:, 1:]
-        mask = shift_labels != -100
-        pos = mask.nonzero(as_tuple=False)
-        h_sel = hidden[:, :-1][pos[:, 0], pos[:, 1]]
-        y_sel = shift_labels[pos[:, 0], pos[:, 1]]
-        logits_sel = model.lm_head(h_sel).float()
-    loss = F.cross_entropy(logits_sel, y_sel)
+    budget = _resolve_ckpt_budget(adaptive_ckpt)
+    ckpt_on = bool(budget) and ckpt_needed_for_batch(batch, *budget)
+    prev = _set_ckpt_flags(model, ckpt_on) if budget is not None else None
+    try:
+        amp_dtype = None
+        if device == "cuda" and next(model.parameters()).dtype == torch.float32:
+            amp_dtype = torch.float16
+        inp = embeds_for(model, batch, proj, device)
+        labels = inp.pop("labels")
+        base = model.model
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+            out = base(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"])
+            hidden = out.last_hidden_state
+            shift_labels = labels[:, 1:]
+            mask = shift_labels != -100
+            pos = mask.nonzero(as_tuple=False)
+            h_sel = hidden[:, :-1][pos[:, 0], pos[:, 1]]
+            y_sel = shift_labels[pos[:, 0], pos[:, 1]]
+            logits_sel = model.lm_head(h_sel).float()
+        loss = F.cross_entropy(logits_sel, y_sel)
 
-    params = list(proj.parameters())
-    if scaler is not None:
-        scaled_loss = scaler.scale(loss)
-        opt.zero_grad(set_to_none=True)
-        scaled_loss.backward()
-        scaler.unscale_(opt)
-        gnorm = float(nn.utils.clip_grad_norm_(params, clip))
-        step_skipped = math.isnan(gnorm) or math.isinf(gnorm)
-        if not step_skipped:
-            scaler.step(opt)
-        scaler.update()
-        finite = not step_skipped
-    else:
-        finite = bool(torch.isfinite(loss))
-        opt.zero_grad(set_to_none=True)
-        loss.backward()
-        gnorm = float("nan") if not finite else float(nn.utils.clip_grad_norm_(params, clip))
-        if finite:
-            opt.step()
-    return {"loss": float(loss.item()), "finite": finite, "gnorm": gnorm,
-            "tokens": int(batch["attention_mask"].sum()),
-            "batch_size": int(batch["input_ids"].shape[0]),
-            "step_ms": round((time.time() - t0) * 1000, 1)}
+        params = list(proj.parameters())
+        if scaler is not None:
+            scaled_loss = scaler.scale(loss)
+            opt.zero_grad(set_to_none=True)
+            scaled_loss.backward()
+            scaler.unscale_(opt)
+            gnorm = float(nn.utils.clip_grad_norm_(params, clip))
+            step_skipped = math.isnan(gnorm) or math.isinf(gnorm)
+            if not step_skipped:
+                scaler.step(opt)
+            scaler.update()
+            finite = not step_skipped
+        else:
+            finite = bool(torch.isfinite(loss))
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            gnorm = float("nan") if not finite else float(nn.utils.clip_grad_norm_(params, clip))
+            if finite:
+                opt.step()
+        B, L = batch["input_ids"].shape[:2]
+        return {"loss": float(loss.item()), "finite": finite, "gnorm": gnorm,
+                "tokens": int(batch["attention_mask"].sum()),
+                "batch_size": int(B), "L": int(L), "bl2": int(B * L * L),
+                "ckpt_on": bool(ckpt_on),
+                "step_ms": round((time.time() - t0) * 1000, 1)}
+    finally:
+        if prev is not None:
+            _restore_ckpt_flags(prev)
