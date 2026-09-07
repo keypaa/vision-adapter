@@ -54,6 +54,48 @@ def _stats_str() -> str:
         return f"RAM {ram:.0f}% CPU {cpu:.0f}%"
 
 
+def _hf_ckpt_push_cfg() -> tuple[bool, str | None]:
+    """Push-to-HF gate for checkpoints: env VISION_ADAPTER_PUSH_HF=1 + VISION_ADAPTER_HF_CKPT_REPO.
+
+    Best-effort only — never crash training on hub errors (ephemeral Molab sessions
+    must survive network/token issues; local file is the source of truth).
+    """
+    import os
+
+    if os.environ.get("VISION_ADAPTER_PUSH_HF") != "1":
+        return False, None
+    repo = os.environ.get("VISION_ADAPTER_HF_CKPT_REPO") or None
+    if not repo:
+        return False, None
+    return True, repo
+
+
+def _push_file_to_hf(local_path: Path, repo_id: str) -> None:
+    """Upload one file to a HF model repo (create if missing). Raises on failure."""
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    api.create_repo(repo_id, repo_type="model", exist_ok=True)
+    api.upload_file(
+        path_or_fileobj=str(local_path),
+        path_in_repo=local_path.name,
+        repo_id=repo_id,
+        repo_type="model",
+        commit_message=f"ckpt {local_path.name}",
+    )
+
+
+def _maybe_push_ckpt(local_path: Path) -> None:
+    enabled, repo = _hf_ckpt_push_cfg()
+    if not enabled or not repo:
+        return
+    try:
+        _push_file_to_hf(local_path, repo)
+        print(f"[train] pushed {local_path.name} -> hf:{repo}", flush=True)
+    except Exception as e:  # noqa: BLE001 — hub push must never kill a 6h run
+        print(f"[train] HF push failed for {local_path.name} ({e}) — local copy kept", flush=True)
+
+
 def _tiny_qwen_for_smoke(vocab: int = 1024, hidden: int = 64, layers: int = 4):
     """Random-weight Qwen-shaped backbone, fp32 CPU/GPU — mirrors test_probe fixture.
     Last layer is full_attention so the projector receives grads (see test_probe notes)."""
@@ -436,6 +478,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                     ckpt = _cache_root / f"projector_step{step}.pt"
                     _torch.save({"proj": proj.state_dict(), "step": step, "loss": rec["loss"]}, str(ckpt))
                     print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] [train] ckpt {ckpt.name} ({ckpt.stat().st_size/1e6:.1f}MB) | {_stats_str()}", flush=True)
+                    _maybe_push_ckpt(ckpt)
                 except Exception as e:
                     print(f"[{time.strftime('%H:%M:%S')}] [train] ckpt save failed step {step}: {e} | {_stats_str()}", flush=True)
             if step % 5 == 0 or step==steps:
@@ -451,6 +494,13 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             final_path = _cache_root / f"projector_final_{steps}.pt"
             _torch.save({"proj": proj.state_dict(), "step": steps, "cfg": cfg.to_dict(), "final_loss": recs[-1]["loss"] if recs else None}, str(final_path))
             print(f"[train] saved final projector {final_path} ({final_path.stat().st_size/1e6:.1f}MB)", flush=True)
+            _maybe_push_ckpt(final_path)
+            # also push log + curves so an interrupted session stays resumable from HF alone
+            try:
+                _maybe_push_ckpt(log_path)
+                _maybe_push_ckpt(curves_path)
+            except Exception:
+                pass
             # also mirror to data_dir for local fetches
             try:
                 import shutil as _sh

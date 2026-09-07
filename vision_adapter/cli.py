@@ -107,6 +107,16 @@ def train_cmd(args: argparse.Namespace) -> int:
         require_gpu("train")
     from vision_adapter.config import colab_probe_config, config_header, default_config, probe_big_config, probe_config
 
+    # Opt-in HF checkpoint push (for long Molab runs: session loss-proof).
+    # Env is the contract read by train._maybe_push_ckpt; flags are sugar.
+    import os as _os
+
+    if getattr(args, "push_to_hf", False):
+        _os.environ["VISION_ADAPTER_PUSH_HF"] = "1"
+        print("[train] HF checkpoint push: ON", flush=True)
+    if getattr(args, "hf_ckpt_repo", None):
+        _os.environ["VISION_ADAPTER_HF_CKPT_REPO"] = args.hf_ckpt_repo
+        print(f"[train] HF checkpoint repo: {args.hf_ckpt_repo}", flush=True)
     cfg_name = getattr(args, "config", "default")
     cfg_fn = {"default": default_config, "probe": probe_config, "probe_big": probe_big_config, "colab": colab_probe_config}.get(cfg_name, default_config)
     cfg = cfg_fn()
@@ -253,6 +263,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch-size", type=int, default=None, help="override batch size (e.g. 48 for PRO 6000 ckpt OFF)")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32 with true AMP; T4: use bf16 or fp32")
+    p.add_argument("--push-to-hf", dest="push_to_hf", action="store_true", help="push ckpts + log to HF model repo on save (needs --hf-ckpt-repo + write token)")
+    p.add_argument("--hf-ckpt-repo", dest="hf_ckpt_repo", default=None, help="HF model repo for ckpts, e.g. keypa/vision-adapter-checkpoints")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
@@ -268,6 +280,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=None, help="max training steps")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32")
+    p.add_argument("--push-to-hf", dest="push_to_hf", action="store_true", help="push ckpts + log to HF model repo on save")
+    p.add_argument("--hf-ckpt-repo", dest="hf_ckpt_repo", default=None, help="HF model repo for ckpts, e.g. keypa/vision-adapter-checkpoints")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
