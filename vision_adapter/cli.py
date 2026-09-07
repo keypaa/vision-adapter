@@ -264,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32 with true AMP; T4: use bf16 or fp32")
     p.add_argument("--push-to-hf", dest="push_to_hf", action="store_true", help="push ckpts + log to HF model repo on save (needs --hf-ckpt-repo + write token)")
-    p.add_argument("--hf-ckpt-repo", dest="hf_ckpt_repo", default=None, help="HF model repo for ckpts, e.g. keypa/vision-adapter-checkpoints")
+    p.add_argument("--hf-ckpt-repo", dest="hf_ckpt_repo", default=None, help="HF model repo for ckpts, e.g. keypa/vision-adapter-probe-checkpoints")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
@@ -281,7 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32")
     p.add_argument("--push-to-hf", dest="push_to_hf", action="store_true", help="push ckpts + log to HF model repo on save")
-    p.add_argument("--hf-ckpt-repo", dest="hf_ckpt_repo", default=None, help="HF model repo for ckpts, e.g. keypa/vision-adapter-checkpoints")
+    p.add_argument("--hf-ckpt-repo", dest="hf_ckpt_repo", default=None, help="HF model repo for ckpts, e.g. keypa/vision-adapter-probe-checkpoints")
     p.add_argument(
         "--backend",
         choices=["local", "modal"],
