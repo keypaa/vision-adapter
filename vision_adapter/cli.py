@@ -105,10 +105,10 @@ def train_cmd(args: argparse.Namespace) -> int:
         from vision_adapter.backends.gpu import require_gpu
 
         require_gpu("train")
-    from vision_adapter.config import colab_probe_config, config_header, default_config, probe_config
+    from vision_adapter.config import colab_probe_config, config_header, default_config, probe_big_config, probe_config
 
     cfg_name = getattr(args, "config", "default")
-    cfg_fn = {"default": default_config, "probe": probe_config, "colab": colab_probe_config}.get(cfg_name, default_config)
+    cfg_fn = {"default": default_config, "probe": probe_config, "probe_big": probe_big_config, "colab": colab_probe_config}.get(cfg_name, default_config)
     cfg = cfg_fn()
     backend_name = getattr(args, "backend", "local")
     data_dir = Path(getattr(args, "data_dir", "data"))

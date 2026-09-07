@@ -202,6 +202,13 @@ def probe_config(**overrides: Any) -> TrainConfig:
     return TrainConfig(**base)
 
 
+def probe_big_config(**overrides: Any) -> TrainConfig:
+    """PRO 6000 96GB: batch 96 to saturate VRAM (740 tokens ×96 =71k tokens/batch ~60GB)."""
+    base: dict[str, Any] = dict(batch_size=96, save_every=500, log_every=20)
+    base.update(overrides)
+    return TrainConfig(**base)
+
+
 def colab_probe_config(**overrides: Any) -> TrainConfig:
     """Colab free-tier probe: batch 8, save 500 (matches grok_probe_qwen.py)."""
     base: dict[str, Any] = dict(batch_size=8, save_every=500, log_every=20)
@@ -251,6 +258,7 @@ __all__ = [
     "TrainConfig",
     "default_config",
     "probe_config",
+    "probe_big_config",
     "colab_probe_config",
     "get_git_sha",
     "manifest_sha256",
