@@ -43,8 +43,13 @@ def _auth_headers() -> dict[str, str]:
 def _remote_size(url: str) -> int:
     import urllib.request
 
+    t0 = time.time()
     req = urllib.request.Request(url, method="HEAD", headers=_auth_headers())
-    return int(urllib.request.urlopen(req).headers["Content-Length"])
+    size = int(urllib.request.urlopen(req, timeout=30).headers["Content-Length"])
+    dt = time.time() - t0
+    if dt > 5:
+        print(f"[stream] HEAD slow: {Path(url).name} {size/2**30:.1f}GiB in {dt:.0f}s", flush=True)
+    return size
 
 
 def _fetch_range(url: str, start: int, end: int, retries: int = 3) -> bytes:  # noqa: C901
@@ -97,6 +102,7 @@ class RemoteShard(io.RawIOBase):
     def load_span(self, lo: int, hi: int) -> None:
         if self._span is not None and self._span[0] == lo:
             return
+        print(f"[stream] load_span {Path(self.url).name} {(hi-lo)/2**20:.0f}MiB @{lo}", flush=True)
         if self.disk_cache:
             cf = self._cache_file(lo, hi)
             if os.path.exists(cf):
@@ -613,9 +619,12 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                     next_shard_fut = None
                 continue
             url = f"https://huggingface.co/datasets/{EMB_REPO}/resolve/main/{sf}"
+            t_sf = time.time()
             rs = RemoteShard(url, _remote_size(url), disk_cache=self.rg_cache_dir)
             pf = pq.ParquetFile(rs)
             md = pf.metadata
+            print(f"[stream] {Path(sf).name} metadata: {md.num_row_groups} RGs, "
+                  f"{md.num_rows} rows ({time.time()-t_sf:.1f}s)", flush=True)
             biggest = shard_row_group_size(md)
             assert biggest <= self.MAX_RG_ROWS, (
                 f"{sf}: row group {biggest} rows (~9 GiB) not streamable — exclude smoke shards"
