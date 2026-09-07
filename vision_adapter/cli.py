@@ -241,9 +241,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--data-dir", default="data", help="data directory")
     p.add_argument(
         "--config",
-        choices=["probe", "colab", "default"],
+        choices=["probe", "probe_big", "colab", "default"],
         default="default",
-        help="train config preset",
+        help="train config preset (probe_big=96 PRO 6000)",
     )
     p.add_argument("--max-steps", type=int, default=None, help="max training steps")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
