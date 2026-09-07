@@ -13,12 +13,41 @@ is intentionally backend-agnostic: it takes DataBackend and a TrainConfig.
 from __future__ import annotations
 
 from pathlib import Path
-
+import time
 import torch
 
 from vision_adapter.backends.gpu import require_gpu
 from vision_adapter.config import TrainConfig, config_header, get_git_sha
 from vision_adapter.manifest import load_manifest
+
+def _stats_str() -> str:
+    """GPU util %, VRAM %, RAM %, CPU % — best effort, never crash training."""
+    try:
+        import psutil
+        ram = psutil.virtual_memory().percent
+        cpu = psutil.cpu_percent(interval=None)
+    except Exception:
+        ram, cpu = 0, 0
+    try:
+        if torch.cuda.is_available():
+            props = torch.cuda.get_device_properties(0)
+            total = props.total_memory
+            alloc = torch.cuda.memory_allocated(0)
+            vram_pct = alloc / total * 100 if total else 0
+            vram_gb = alloc / 2**30
+            # GPU util via nvidia-smi
+            util = 0
+            try:
+                import subprocess
+                out = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"], timeout=1, stderr=subprocess.DEVNULL)
+                util = int(out.decode().strip().split("\n")[0])
+            except Exception:
+                util = 0
+            return f"GPU {util:3d}% VRAM {vram_gb:.1f}GB {vram_pct:.0f}% RAM {ram:.0f}% CPU {cpu:.0f}%"
+        else:
+            return f"RAM {ram:.0f}% CPU {cpu:.0f}%"
+    except Exception:
+        return f"RAM {ram:.0f}% CPU {cpu:.0f}%"
 
 
 def _tiny_qwen_for_smoke(vocab: int = 1024, hidden: int = 64, layers: int = 4):
@@ -402,11 +431,11 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 try:
                     ckpt = _cache_root / f"projector_step{step}.pt"
                     _torch.save({"proj": proj.state_dict(), "step": step, "loss": rec["loss"]}, str(ckpt))
-                    print(f"[train] ckpt {ckpt.name} ({ckpt.stat().st_size/1e6:.1f}MB)", flush=True)
+                    print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] [train] ckpt {ckpt.name} ({ckpt.stat().st_size/1e6:.1f}MB) | {_stats_str()}", flush=True)
                 except Exception as e:
-                    print(f"[train] ckpt save failed step {step}: {e}", flush=True)
+                    print(f"[{time.strftime('%H:%M:%S')}] [train] ckpt save failed step {step}: {e} | {_stats_str()}", flush=True)
             if step % 5 == 0 or step==steps:
-                print(f"[train] stream step {step}/{steps} loss={rec['loss']:.4f} ema={rec['ema_loss']:.4f} gnorm={rec['gnorm']:.2f}", flush=True)
+                print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] [train] stream step {step}/{steps} loss={rec['loss']:.4f} ema={rec['ema_loss']:.4f} gnorm={rec['gnorm']:.2f} | {_stats_str()}", flush=True)
         try:
             render_curves(recs, str(curves_path))
         except Exception:
