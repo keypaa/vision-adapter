@@ -21,7 +21,7 @@ from vision_adapter.config import TrainConfig, config_header, get_git_sha
 from vision_adapter.manifest import load_manifest
 
 def _stats_str() -> str:
-    """GPU util %, VRAM %, RAM %, CPU % — best effort, never crash training."""
+    """GPU util %, VRAM total via nvidia-smi (global), RAM %, CPU % — never crash."""
     try:
         import psutil
         ram = psutil.virtual_memory().percent
@@ -30,18 +30,22 @@ def _stats_str() -> str:
         ram, cpu = 0, 0
     try:
         if torch.cuda.is_available():
-            props = torch.cuda.get_device_properties(0)
-            total = props.total_memory
-            alloc = torch.cuda.memory_allocated(0)
-            vram_pct = alloc / total * 100 if total else 0
-            vram_gb = alloc / 2**30
-            # GPU util via nvidia-smi
-            util = 0
+            # Use nvidia-smi for true total VRAM used (torch.cuda.memory_allocated is per-process and shows 3.7GB vs 92.9GB nvidia-smi)
+            vram_used = vram_total = util = 0
             try:
                 import subprocess
-                out = subprocess.check_output(["nvidia-smi", "--query-gpu=utilization.gpu", "--format=csv,noheader,nounits"], timeout=1, stderr=subprocess.DEVNULL)
-                util = int(out.decode().strip().split("\n")[0])
+                out = subprocess.check_output(["nvidia-smi", "--query-gpu=memory.used,memory.total,utilization.gpu", "--format=csv,noheader,nounits"], timeout=1, stderr=subprocess.DEVNULL)
+                u, t, ug = out.decode().strip().split(", ")
+                vram_used = int(u); vram_total = int(t); util = int(ug)
+                vram_gb = vram_used/1024
+                vram_pct = vram_used / vram_total * 100 if vram_total else 0
             except Exception:
+                # fallback to torch
+                props = torch.cuda.get_device_properties(0)
+                vram_total = props.total_memory/1024**2
+                vram_used = torch.cuda.memory_allocated(0)/1024**2
+                vram_gb = vram_used/1024
+                vram_pct = vram_used / vram_total * 100 if vram_total else 0
                 util = 0
             return f"GPU {util:3d}% VRAM {vram_gb:.1f}GB {vram_pct:.0f}% RAM {ram:.0f}% CPU {cpu:.0f}%"
         else:
