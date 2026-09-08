@@ -73,5 +73,65 @@ shapes (B=16, L in {2k, 5.4k, 8k, 9.6k}) × patterns
 
 - **Option 0 (try first): `pip install flash-linear-attention causal-conv1d`.**
   Zero modeling changes; swaps all 18 linear layers to fused kernels.
-  Risk: sm100/s
-...[truncated 3075 chars]
+  Risk: sm100/sm101 wheels (may need source build on Molab).
+- **Option 1 (recommended flex path): runtime monkeypatch** of
+  `Qwen3_5Attention.forward` → `flex_attention_forward` + stock
+  causal+padding BlockMask (~40 lines, no fork, GQA-safe, dropout 0.0).
+  Config flag `attn_implementation="flex_attention"` HARD-FAILS on Qwen3.5
+  (ValueError, verified) — do not pursue.
+  Ship threshold: ≥3× full-layer time AND ≤0.5% loss drift over 200 steps.
+- **Option 2: flash_attention_2/3** (padding-skip without flex). Only if
+  Option 1 stalls on head_dim=256. FA2 has no sm100 kernel — needs FA3/FA4.
+- Rejected: SDPA+custom mask or compile-alone (mask zeroes, doesn't skip);
+  doc-packing (needs position_ids + label surgery — revisit only if needed).
+
+### 3.3 Risks (R2, condensed)
+
+- R1: config-flag road closed (see above).
+- R2: flex covers 6/24 layers max — micro-bench apportionment decides.
+- R3: head_dim=256 through flex Triton kernels — must bench fwd+bwd+recompute.
+- R4: no custom mask_mod needed (causal+padding is complete).
+- R6: hoist ONE BlockMask per batch (don't rebuild per layer/recompute).
+- R7: flex compiles internally; never bench step 0; no max-autotune first try.
+- R8: SDPA likely on math fallback (15–30GiB/layer) — confirm via profiler.
+- R10: "utan" unknown — get exact term before chasing.
+
+### 3.4 Validation protocol (before any 6h run)
+
+1. Unit: flex-vs-eager, 2-layer sliced backbone, fwd allclose 1e-2 (bf16),
+   bwd grads 3e-2; ckpt-ON vs OFF equality at 1e-5 (fp32 shadow).
+2. Short-run: 200 real steps, same seed/order, EMA drift ≤0.5%.
+3. Soak: 1h worst-bucket, p99 within 15% of bench, VRAM flat.
+Kill: flex <1.5× full-layer time or any divergence → keep bucketing+ckpt.
+
+### 3.5 DeepSeek V4 Flash 0731 portability
+
+Transfers: BlockMask pattern, bench harness, tolerances, method.
+Does NOT transfer: patch point (MLA + hash-MoE + FP8 need score_mod-level
+integration), positions. Hero = second integration project.
+
+## 4. Order of battle
+
+| # | Task | Where | Depends on | Owners |
+|---|------|-------|-----------|--------|
+| 1 | Probe 4000 + grok check + heldout-60 | Molab | — | run tonight |
+| 2 | Micro-bench apportionment | Molab | — (parallel w/ 1) | script, then run |
+| 3 | Option 0 and/or 1 + validation §3.4 | Molab+local | 2 | implement, bench, decide |
+| 4 | Smoke-fallback fix | local | — | small, anytime |
+| 5 | W&B decision | — | 3 runs to compare | defer |
+| 6 | val_every wiring + mid-run evals | local | 1 | after 4000 |
+| 7 | Hero (DeepSeek/B300) config | B300 | 1, 3 | needs L/bl2 stats |
+
+ETA flavor: 4000 tonight (~7h) → bench+Flex over following sessions →
+hero only when 1+3 green.
+
+## 5. Open questions
+
+- W&B: yes once ≥2 runs to compare; no before.
+- Post-SFT RL needs a NEW dataset (preference pairs or prompts+reward),
+  possibly reusing our images — after everything is clean.
+- Full dataset not needed for grok proof (64k of 116k suffices), but hero
+  wants full-bucket coverage (esp. 4901+).
+- Yesterday's Molab stall (main-thread spin, empty cache, no conns) never
+  reproduced on fresh session — filed as environmental (stale container),
+  not code. Reopen if it recurs WITH the new stage logs (§0).
