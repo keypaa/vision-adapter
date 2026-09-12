@@ -183,6 +183,44 @@ def _resolve_resume(ckpt_plan: dict, cli_max_steps: int | None, cli_seed: int = 
             "start_pos_rows": int(ckpt_plan.get("step", 0)) * int(ckpt_plan.get("batch_size", 16))}
 
 
+PLAN_META_KEYS = ("manifest_sha256", "seed", "sample_size", "stream_order_hash", "max_steps")
+
+
+def _diff_plan_meta(current: dict, ckpt_plan: dict) -> list[str]:
+    """Return plan-meta keys whose values differ (warn-only on resume)."""
+    diffs: list[str] = []
+    for k in PLAN_META_KEYS:
+        if current.get(k) != ckpt_plan.get(k):
+            diffs.append(k)
+    return diffs
+
+
+def _resume_batch_size_mismatch(cfg_batch_size: int, ckpt_plan: dict) -> bool:
+    """True when cfg batch_size disagrees with the ckpt plan (must abort)."""
+    try:
+        if "batch_size" not in ckpt_plan:
+            return False
+        return int(ckpt_plan.get("batch_size")) != int(cfg_batch_size)
+    except (TypeError, ValueError):
+        return False
+
+
+def _list_local_step_ckpts_desc(data_dir: Path | str) -> list[Path]:
+    """All local projector_step*.pt sorted by step desc (latest first)."""
+    import os
+
+    dd = Path(data_dir)
+    cache_root = Path("/hf/hf_stream_cache") if (Path("/hf").is_dir() and os.environ.get("MODAL_TASK_ID")) else dd / "cache"
+    seen: dict[str, Path] = {}
+    for d in (cache_root, dd):
+        if not d.is_dir():
+            continue
+        for p in d.glob("projector_step*.pt"):
+            if _ckpt_step_number(p.name) >= 0:
+                seen.setdefault(p.name, p)
+    return sorted(seen.values(), key=lambda p: _ckpt_step_number(p.name), reverse=True)
+
+
 def _open_resume_log(log_path, run_id):
     """Append to the existing run log, preserving run_id."""
     fh = open(log_path, "a", buffering=1)
@@ -587,6 +625,9 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         _merged_plan = dict(resume_ckpt.get("plan", {}) or {})
         _merged_plan.setdefault("step", resume_ckpt.get("step", 0))
         _resume_info = _resolve_resume(_merged_plan, cli_max_steps=max_steps)
+        if _resume_batch_size_mismatch(cfg.batch_size, _merged_plan):
+            print(f"[train] resume batch_size mismatch: cfg batch_size={cfg.batch_size} != ckpt batch_size={_merged_plan.get('batch_size')} — aborting (position would corrupt)", flush=True)
+            return 1
         try:
             proj.load_state_dict(resume_ckpt["proj"])
         except Exception as e:  # noqa: BLE001 — shape/dtype mismatch must surface clearly
@@ -714,6 +755,24 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     else:
         steps = max_steps or 5
         start_step = 1
+    if _resume_info is not None and isinstance(resume_ckpt, dict):
+        try:
+            import hashlib as _phash
+
+            from vision_adapter.config import manifest_sha256 as _pmhash
+
+            _cur_meta = {
+                "manifest_sha256": _pmhash(local_manifest),
+                "seed": _plan_seed,
+                "sample_size": sample_size,
+                "stream_order_hash": _phash.sha1(json.dumps(list(stream_order)).encode()).hexdigest(),
+                "max_steps": steps,
+            }
+            _diffs = _diff_plan_meta(_cur_meta, resume_ckpt.get("plan", {}) or {})
+            if _diffs:
+                print(f"[train][WARN] resume plan mismatch on {', '.join(_diffs)} — continuing with ckpt-pinned extent (dataset is static)", flush=True)
+        except Exception:
+            pass
     recs: list[dict] = []
     t0 = time.time()
     import os as _os
@@ -773,7 +832,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                         cfg.to_dict(),
                         run_id,
                     )
-                    _torch.save(_payload, str(ckpt))
+                    _torch.save(_payload, str(ckpt) + ".tmp")
+                    _os.replace(str(ckpt) + ".tmp", str(ckpt))
                     print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] [train] ckpt {ckpt.name} ({ckpt.stat().st_size/1e6:.1f}MB) | {_stats_str()}", flush=True)
                     last_save_ts = time.time()
                     _maybe_push_ckpt(ckpt)
@@ -849,10 +909,26 @@ def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device:
     try:
         import torch as _t
 
-        resume_ckpt = _t.load(str(ckpt_path), map_location="cpu")
+        resume_ckpt = _t.load(str(ckpt_path), map_location="cpu", weights_only=False)
     except Exception as e:  # noqa: BLE001 — corrupt ckpt must not start a fresh run silently
-        print(f"[train] resume load failed for {ckpt_path} ({e})", flush=True)
-        return 1
+        if resume_step is not None:
+            print(f"[train] resume load failed for {ckpt_path} ({e})", flush=True)
+            return 1
+        _recovered = False
+        for _cand in _list_local_step_ckpts_desc(dd):
+            if _cand == ckpt_path:
+                continue
+            try:
+                resume_ckpt = _t.load(str(_cand), map_location="cpu", weights_only=False)
+                print(f"[train] resume load failed for {ckpt_path} ({e}) — fallback to {_cand}", flush=True)
+                ckpt_path = _cand
+                _recovered = True
+                break
+            except Exception:
+                continue
+        if not _recovered:
+            print(f"[train] resume load failed for {ckpt_path} ({e})", flush=True)
+            return 1
     print(f"[train] resume local from {ckpt_path} (step {resume_ckpt.get('step')})", flush=True)
     # Resume always takes the streaming restore path (smoke/local-emb never
     # write full-state step ckpts, so there is nothing to restore there).
@@ -894,10 +970,32 @@ def _run_resume_hf(dd: Path, cfg: TrainConfig, max_steps: int | None, device: st
     try:
         import torch as _t
 
-        resume_ckpt = _t.load(str(ckpt_path), map_location="cpu")
+        resume_ckpt = _t.load(str(ckpt_path), map_location="cpu", weights_only=False)
     except Exception as e:  # noqa: BLE001 — corrupt ckpt must not start a fresh run silently
-        print(f"[train] resume load failed for {ckpt_path} ({e})", flush=True)
-        return 1
+        if resume_step is not None:
+            print(f"[train] resume load failed for {ckpt_path} ({e})", flush=True)
+            return 1
+        _recovered = False
+        try:
+            _names = [f for f in _list_hf_ckpt_files(repo) if f.startswith("projector_step") and f.endswith(".pt")]
+        except Exception:
+            _names = []
+        _failed_name = ckpt_path.name
+        for _nm in sorted(_names, key=_ckpt_step_number, reverse=True):
+            if _nm == _failed_name:
+                continue
+            try:
+                _cand_path = _download_ckpt(repo, _ckpt_step_number(_nm), dest)
+                resume_ckpt = _t.load(str(_cand_path), map_location="cpu", weights_only=False)
+                print(f"[train] resume load failed for {ckpt_path} ({e}) — fallback to {_cand_path}", flush=True)
+                ckpt_path = _cand_path
+                _recovered = True
+                break
+            except Exception:
+                continue
+        if not _recovered:
+            print(f"[train] resume load failed for {ckpt_path} ({e})", flush=True)
+            return 1
     print(f"[train] resume hf from {ckpt_path} (step {resume_ckpt.get('step')})", flush=True)
     # Resume always takes the streaming restore path (smoke/local-emb never
     # write full-state step ckpts, so there is nothing to restore there).

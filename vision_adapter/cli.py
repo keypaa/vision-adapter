@@ -293,6 +293,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="data backend",
     )
     p.add_argument("--dryrun", action="store_true", help="dry run")
+    p.add_argument("--resume", choices=("off", "local", "hf"), default="off", help="resume from a step ckpt (local disk or HF), continuing at K+1 with the same run_id")
+    p.add_argument("--resume-step", type=int, default=None, help="resume from this step ckpt (default: latest projector_step*.pt)")
     p.set_defaults(func=train_cmd)
 
     return ap

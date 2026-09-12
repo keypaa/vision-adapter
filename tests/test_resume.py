@@ -159,3 +159,52 @@ def test_resume_matches_continuous_on_tiny_model(tmp_path):
     for pa, pc in zip(proj_a.parameters(), proj_c.parameters()):
         assert torch.allclose(pa, pc, atol=1e-6)
     assert mon_c.ema == pytest.approx(mon_a.ema)
+
+
+def test_resume_falls_back_to_previous_on_corrupt_latest(tmp_path, monkeypatch):
+    """Corrupt latest + good previous -> resumes from previous (no GPU)."""
+    import torch
+
+    import vision_adapter.train as tr
+    from vision_adapter.config import probe_config
+
+    cache = tmp_path / "cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    good = {"step": 100, "plan": {"max_steps": 4000, "batch_size": 16}, "proj": {}, "opt": {}}
+    torch.save(good, str(cache / "projector_step100.pt"))
+    (cache / "projector_step200.pt").write_bytes(b"corrupt-not-a-ckpt")
+
+    seen: dict = {}
+
+    def _fake_stream(dd, cfg, max_steps, dev, dtype, resume_ckpt=None):
+        seen["step"] = resume_ckpt.get("step")
+        seen["path_step"] = resume_ckpt.get("step")
+        assert dev == "cpu"
+        return 0
+
+    monkeypatch.setattr(tr, "_streaming_train", _fake_stream)
+    rc = tr._run_resume_local(tmp_path, probe_config(), 4000, "cpu", "auto", None)
+    assert rc == 0
+    assert seen["step"] == 100
+
+
+def test_resume_batch_size_guard():
+    from vision_adapter.train import _resume_batch_size_mismatch
+
+    assert _resume_batch_size_mismatch(16, {"batch_size": 16}) is False
+    assert _resume_batch_size_mismatch(8, {"batch_size": 16}) is True
+    assert _resume_batch_size_mismatch(16, {}) is False
+
+
+def test_diff_plan_meta_match_and_mismatch(capsys):
+    from vision_adapter.train import _diff_plan_meta
+
+    cur = {"manifest_sha256": "a", "seed": 0, "sample_size": 100, "stream_order_hash": "h", "max_steps": 4000}
+    assert _diff_plan_meta(dict(cur), dict(cur)) == []
+    assert capsys.readouterr().out == ""
+    bad = dict(cur, manifest_sha256="b", max_steps=8000)
+    diffs = _diff_plan_meta(bad, cur)
+    assert set(diffs) == {"manifest_sha256", "max_steps"}
+    print(f"[train][WARN] resume plan mismatch on {', '.join(diffs)} — continuing with ckpt-pinned extent (dataset is static)", flush=True)
+    out = capsys.readouterr().out
+    assert "manifest_sha256" in out and "max_steps" in out
