@@ -194,10 +194,12 @@ def default_config(**overrides: Any) -> TrainConfig:
 def probe_config(**overrides: Any) -> TrainConfig:
     """L4 / Colab probe preset: batch 16, sparser logging.
 
-    Mirrors modal_probe.py: DEFAULT_BS=16, SAVE_EVERY=500, STATUS_EVERY=20,
-    CHART_EVERY=50. Any field can still be overridden via kwargs.
+    Mirrors modal_probe.py: DEFAULT_BS=16, STATUS_EVERY=20, CHART_EVERY=50.
+    save_every=100 (≈8.5min, 50MB each → ~2GB for a 4000-step run): cheap
+    on HF, tightens the crash-loss window. Any field can still be overridden
+    via kwargs.
     """
-    base: dict[str, Any] = dict(batch_size=16, save_every=500, log_every=20)
+    base: dict[str, Any] = dict(batch_size=16, save_every=100, log_every=20)
     base.update(overrides)
     return TrainConfig(**base)
 
