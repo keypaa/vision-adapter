@@ -135,3 +135,41 @@ hero only when 1+3 green.
 - Yesterday's Molab stall (main-thread spin, empty cache, no conns) never
   reproduced on fresh session — filed as environmental (stale container),
   not code. Reopen if it recurs WITH the new stage logs (§0).
+
+## 6. Training resume (done 2026-09-12)
+
+- [x] Full-state step ckpts: projector + AdamW + scaler + `ProbeMonitor` +
+  RNG + plan/cfg + `run_id` (`build_ckpt_payload`, `CKPT_KEYS`)
+- [x] `--resume local`: latest (or K) `projector_step*.pt` from disk
+- [x] `--resume hf`: download step ckpt from the HF ckpt repo, same restore path
+- [x] Equivalence gate:
+  `tests/test_resume.py::test_resume_matches_continuous_on_tiny_model`
+  (5 continuous vs 3 + ckpt-restore-2 steps, equal projector weights on CPU,
+  restored through the real `build_ckpt_payload` / `_resolve_resume` /
+  proj+opt+monitor+RNG path with a `torch.save` round-trip)
+
+Interrupt + resume is **statistically equivalent** to an uninterrupted run
+(same seed/order, restored optimizer + LR schedule + data position) — not
+bit-identical (floating-point reduction order and wall-clock logging differ).
+
+### Flags (`python -m vision_adapter train ...`)
+
+| Flag | Values | Meaning |
+|------|--------|---------|
+| `--resume` | `off` (default) \| `local` \| `hf` | `local`: restore latest (or `--resume-step` K) `projector_step*.pt` from `<data-dir>/cache` (then `<data-dir>`); `hf`: download from the ckpt repo, then the identical restore path |
+| `--resume-step` | int, or omit | Resume from step K (default: latest). Continues at K+1 |
+| `--hf-ckpt-repo` | `owner/repo` | HF model repo for ckpts (or `VISION_ADAPTER_HF_CKPT_REPO` env). Required for `--resume hf` and `--push-to-hf` |
+| `--max-steps` | int | Ignored on resume for the training extent: the ckpt `plan` pins the original `max_steps`/seed/sample (new CLI values do not extend or fork the run) |
+
+Required env:
+
+- `--resume hf` / pushes: `HF_TOKEN` (read for download, write for push) +
+  repo via `--hf-ckpt-repo` or `VISION_ADAPTER_HF_CKPT_REPO`; pushing
+  additionally needs `VISION_ADAPTER_PUSH_HF=1`.
+- `--resume local`: no env; needs a `projector_step*.pt` under
+  `<data-dir>/cache` or `<data-dir>`, else exits 1 (never silently restarts).
+
+Restore semantics: projector + AdamW + scaler + `ProbeMonitor` + RNG states
+restored; data resumes at `start_pos_rows = K * batch_size`; LR recomputed
+from the original total via `lr_at`; `probe_log.jsonl` appended under the
+SAME `run_id`.
