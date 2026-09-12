@@ -209,6 +209,19 @@ def test_bl2_separates_killer_from_safe_at_equal_mask_sum():
     assert ratio_bl2 > 10 * ratio_sum
 
 
+def test_save_due_step_gate_and_time_gate():
+    from vision_adapter.train import _save_due
+
+    # step gate: fires on multiples, regardless of time
+    assert _save_due(100, 100, 0.0, 60.0) is True
+    assert _save_due(50, 100, 0.0, 60.0) is False
+    # time gate: 10min without save forces a save mid-block (monster steps)
+    assert _save_due(50, 100, 0.0, 600.0) is True
+    assert _save_due(50, 100, 0.0, 599.9) is False
+    # custom interval
+    assert _save_due(50, 100, 0.0, 300.0, max_interval_s=300) is True
+
+
 def test_expandable_segments_defaulted_but_never_overridden(monkeypatch):
     import os
 

@@ -96,6 +96,18 @@ def _maybe_push_ckpt(local_path: Path) -> None:
         print(f"[train] HF push failed for {local_path.name} ({e}) — local copy kept", flush=True)
 
 
+PUSH_MAX_INTERVAL_S = 600  #(env VISION_ADAPTER_PUSH_INTERVAL_S): max 10min without a save+push
+
+
+def _save_due(step: int, save_every: int, last_save_ts: float, now: float,
+              max_interval_s: float = PUSH_MAX_INTERVAL_S) -> bool:
+    """Step-gated save OR time-gated save (monster steps can take 60s+ each —
+    without the time gate, 100 steps could mean 100min without a save)."""
+    if step % save_every == 0:
+        return True
+    return (now - last_save_ts) >= max_interval_s
+
+
 def _ensure_expandable_segments() -> bool:
     """Default PYTORCH_CUDA_ALLOC_CONF to expandable_segments (fragmentation relief).
 
@@ -471,6 +483,12 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     steps = max_steps or 5
     recs: list[dict] = []
     t0 = time.time()
+    import os as _os
+    try:
+        _push_interval = float(_os.environ.get("VISION_ADAPTER_PUSH_INTERVAL_S", PUSH_MAX_INTERVAL_S))
+    except ValueError:
+        _push_interval = float(PUSH_MAX_INTERVAL_S)
+    last_save_ts = t0
     with open(log_path, "a", buffering=1) as lf:
         for step in range(1, steps+1):
             for g in opt.param_groups:
@@ -487,11 +505,12 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             lf.write(json.dumps(rec)+"\n")
             # save every 10 steps for probe (200) to avoid losing $ on interrupt; hero uses cfg.save_every 500
             _save_every = 10 if steps <= 500 else cfg.save_every
-            if step % _save_every == 0:
+            if _save_due(step, _save_every, last_save_ts, time.time(), _push_interval):
                 try:
                     ckpt = _cache_root / f"projector_step{step}.pt"
                     _torch.save({"proj": proj.state_dict(), "step": step, "loss": rec["loss"]}, str(ckpt))
                     print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] [train] ckpt {ckpt.name} ({ckpt.stat().st_size/1e6:.1f}MB) | {_stats_str()}", flush=True)
+                    last_save_ts = time.time()
                     _maybe_push_ckpt(ckpt)
                     # push the growing log too (200Ko, cheap) — crash-proof curves up to last save
                     try:
