@@ -108,6 +108,39 @@ def _save_due(step: int, save_every: int, last_save_ts: float, now: float,
     return (now - last_save_ts) >= max_interval_s
 
 
+CKPT_KEYS = ("proj", "opt", "scaler", "step", "samples_seen",
+             "monitor", "rng", "plan", "cfg")
+
+
+def _collect_rng_state() -> dict:
+    import random
+
+    import torch
+
+    state: dict = {"python": random.getstate(), "torch": torch.get_rng_state()}
+    if torch.cuda.is_available():
+        try:
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        except Exception:
+            pass
+    try:
+        import numpy as np
+
+        state["numpy"] = np.random.get_state()
+    except Exception:
+        pass
+    return state
+
+
+def build_ckpt_payload(proj_state, opt_state, scaler_state, step: int,
+                       samples_seen: int, monitor_state: dict,
+                       rng_state: dict, plan_meta: dict, cfg_dict: dict) -> dict:
+    return {"proj": proj_state, "opt": opt_state, "scaler": scaler_state,
+            "step": step, "samples_seen": samples_seen,
+            "monitor": monitor_state, "rng": rng_state,
+            "plan": plan_meta, "cfg": cfg_dict}
+
+
 def _ensure_expandable_segments() -> bool:
     """Default PYTORCH_CUDA_ALLOC_CONF to expandable_segments (fragmentation relief).
 
@@ -526,7 +559,32 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             if _save_due(step, _save_every, last_save_ts, time.time(), _push_interval):
                 try:
                     ckpt = _cache_root / f"projector_step{step}.pt"
-                    _torch.save({"proj": proj.state_dict(), "step": step, "loss": rec["loss"]}, str(ckpt))
+                    import hashlib as _hashlib
+
+                    from vision_adapter.config import manifest_sha256 as _mhash
+
+                    _order_hash = _hashlib.sha1(
+                        json.dumps(list(stream_order)).encode()
+                    ).hexdigest()
+                    _plan_meta = {
+                        "manifest_sha256": _mhash(local_manifest),
+                        "seed": 0,
+                        "sample_size": sample_size,
+                        "batch_size": cfg.batch_size,
+                        "stream_order_hash": _order_hash,
+                    }
+                    _payload = build_ckpt_payload(
+                        proj.state_dict(),
+                        opt.state_dict(),
+                        scaler.state_dict() if scaler is not None else None,
+                        step,
+                        step * cfg.batch_size,
+                        monitor.to_dict(),
+                        _collect_rng_state(),
+                        _plan_meta,
+                        cfg.to_dict(),
+                    )
+                    _torch.save(_payload, str(ckpt))
                     print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] [train] ckpt {ckpt.name} ({ckpt.stat().st_size/1e6:.1f}MB) | {_stats_str()}", flush=True)
                     last_save_ts = time.time()
                     _maybe_push_ckpt(ckpt)
