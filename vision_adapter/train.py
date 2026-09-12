@@ -299,6 +299,24 @@ def _find_local_ckpt(data_dir: Path | str, step: int | None = None) -> Path:
     return best
 
 
+def _cuda_mem_snapshot() -> dict | None:
+    """Current CUDA allocator state in GiB, or None without CUDA.
+
+    Diagnostic for baseline creep: logged per 20 steps so a leak shows as a
+    rising alloc_gb across identical small-bucket batches.
+    """
+    import torch as _torch
+
+    if not _torch.cuda.is_available():
+        return None
+    try:
+        alloc = _torch.cuda.memory_allocated(0) / 2**30
+        reserved = _torch.cuda.memory_reserved(0) / 2**30
+        return {"alloc_gb": round(alloc, 2), "reserved_gb": round(reserved, 2)}
+    except Exception:
+        return None
+
+
 def _ensure_expandable_segments() -> bool:
     """Default PYTORCH_CUDA_ALLOC_CONF to expandable_segments (fragmentation relief).
 
@@ -780,6 +798,12 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         _push_interval = float(_os.environ.get("VISION_ADAPTER_PUSH_INTERVAL_S", PUSH_MAX_INTERVAL_S))
     except ValueError:
         _push_interval = float(PUSH_MAX_INTERVAL_S)
+    try:
+        # Diagnostic only: periodically torch.cuda.empty_cache() to tell allocator
+        # retention apart from a real tensor leak. 0 = off (production default).
+        _empty_cache_every = int(_os.environ.get("VISION_ADAPTER_EMPTY_CACHE_EVERY", "0"))
+    except ValueError:
+        _empty_cache_every = 0
     last_save_ts = t0
     if _resume_info is not None:
         _resume_fh, run_id = _open_resume_log(log_path, run_id)
@@ -796,6 +820,19 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 print(f"[train][WARN] non-finite at {step}, skipping", flush=True)
                 continue
             rec = {"type":"train","step":step,"loss":round(out["loss"],5),"gnorm":round(out["gnorm"],4),"lr":float(opt.param_groups[0]["lr"]),"tokens":out["tokens"],"L":out.get("L"),"bl2":out.get("bl2"),"ckpt_on":out.get("ckpt_on", False),"samples_seen":step*cfg.batch_size,"step_ms":out["step_ms"],"ts": round(time.time(),1)}
+            if step % 20 == 0:
+                _mem = _cuda_mem_snapshot()
+                if _mem is not None:
+                    rec["mem_alloc_gb"] = _mem["alloc_gb"]
+                    rec["mem_reserved_gb"] = _mem["reserved_gb"]
+                if _empty_cache_every and step % _empty_cache_every == 0:
+                    try:
+                        import torch as _torch2
+                        if _torch2.cuda.is_available():
+                            _torch2.cuda.empty_cache()
+                            rec["emptied_cache"] = True
+                    except Exception:
+                        pass
             monitor.update(step, rec["loss"], rec["samples_seen"])
             rec["ema_loss"] = round(monitor.ema or rec["loss"],5)
             recs.append(rec)

@@ -222,6 +222,19 @@ def test_save_due_step_gate_and_time_gate():
     assert _save_due(50, 100, 0.0, 300.0, max_interval_s=300) is True
 
 
+def test_cuda_mem_snapshot_none_without_cuda_or_dict_with_keys(monkeypatch):
+    import torch
+
+    from vision_adapter.train import _cuda_mem_snapshot
+
+    if not torch.cuda.is_available():
+        assert _cuda_mem_snapshot() is None
+    else:
+        snap = _cuda_mem_snapshot()
+        assert set(snap) == {"alloc_gb", "reserved_gb"}
+        assert snap["alloc_gb"] >= 0 and snap["reserved_gb"] >= snap["alloc_gb"]
+
+
 def test_expandable_segments_defaulted_but_never_overridden(monkeypatch):
     import os
 
