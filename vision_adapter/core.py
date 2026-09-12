@@ -622,6 +622,17 @@ def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=N
     t0 = time.time()
     budget = _resolve_ckpt_budget(adaptive_ckpt)
     ckpt_on = bool(budget) and ckpt_needed_for_batch(batch, *budget)
+    cache_emptied = False
+    if ckpt_on and device == "cuda":
+        # Monster batch: drop the allocator cache first for maximum contiguous
+        # room. Normal batches (ckpt OFF) never pay this.
+        try:
+            import torch as _torch2
+            if _torch2.cuda.is_available():
+                _torch2.cuda.empty_cache()
+                cache_emptied = True
+        except Exception:
+            pass
     prev = _set_ckpt_flags(model, ckpt_on) if budget is not None else None
     try:
         amp_dtype = None
@@ -665,6 +676,7 @@ def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=N
                 "tokens": int(batch["attention_mask"].sum()),
                 "batch_size": int(B), "L": int(L), "bl2": int(B * L * L),
                 "ckpt_on": bool(ckpt_on),
+                "cache_emptied": bool(cache_emptied),
                 "step_ms": round((time.time() - t0) * 1000, 1)}
     finally:
         if prev is not None:

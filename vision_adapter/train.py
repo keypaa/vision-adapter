@@ -299,6 +299,24 @@ def _find_local_ckpt(data_dir: Path | str, step: int | None = None) -> Path:
     return best
 
 
+def _cuda_mem_snapshot() -> dict | None:
+    """Current CUDA allocator state in GiB, or None without CUDA.
+
+    Diagnostic for baseline creep: logged per 20 steps so a leak shows as a
+    rising alloc_gb across identical small-bucket batches.
+    """
+    import torch as _torch
+
+    if not _torch.cuda.is_available():
+        return None
+    try:
+        alloc = _torch.cuda.memory_allocated(0) / 2**30
+        reserved = _torch.cuda.memory_reserved(0) / 2**30
+        return {"alloc_gb": round(alloc, 2), "reserved_gb": round(reserved, 2)}
+    except Exception:
+        return None
+
+
 def _ensure_expandable_segments() -> bool:
     """Default PYTORCH_CUDA_ALLOC_CONF to expandable_segments (fragmentation relief).
 
@@ -796,6 +814,13 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 print(f"[train][WARN] non-finite at {step}, skipping", flush=True)
                 continue
             rec = {"type":"train","step":step,"loss":round(out["loss"],5),"gnorm":round(out["gnorm"],4),"lr":float(opt.param_groups[0]["lr"]),"tokens":out["tokens"],"L":out.get("L"),"bl2":out.get("bl2"),"ckpt_on":out.get("ckpt_on", False),"samples_seen":step*cfg.batch_size,"step_ms":out["step_ms"],"ts": round(time.time(),1)}
+            if step % 20 == 0:
+                _mem = _cuda_mem_snapshot()
+                if _mem is not None:
+                    rec["mem_alloc_gb"] = _mem["alloc_gb"]
+                    rec["mem_reserved_gb"] = _mem["reserved_gb"]
+            if out.get("cache_emptied"):
+                rec["cache_emptied"] = True
             monitor.update(step, rec["loss"], rec["samples_seen"])
             rec["ema_loss"] = round(monitor.ema or rec["loss"],5)
             recs.append(rec)
@@ -804,6 +829,15 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             _save_every = 10 if steps <= 500 else cfg.save_every
             if _save_due(step, _save_every, last_save_ts, time.time(), _push_interval):
                 try:
+                    # Periodic cache release: allocator retention ramps ~7GB/100
+                    # steps on varying batch shapes; drop it at each save point
+                    # (seconds, amortized over 100 steps).
+                    try:
+                        import torch as _torch3
+                        if _torch3.cuda.is_available():
+                            _torch3.cuda.empty_cache()
+                    except Exception:
+                        pass
                     ckpt = _cache_root / f"projector_step{step}.pt"
                     import hashlib as _hashlib
 
