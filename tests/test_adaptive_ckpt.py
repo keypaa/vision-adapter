@@ -235,6 +235,18 @@ def test_cuda_mem_snapshot_none_without_cuda_or_dict_with_keys(monkeypatch):
         assert snap["alloc_gb"] >= 0 and snap["reserved_gb"] >= snap["alloc_gb"]
 
 
+def test_cache_emptied_flag_reported_without_cuda():
+    torch.manual_seed(4)
+    model = _tiny_qwen()
+    proj = HourglassProjector(4096, 32)
+    batch = _batch([5, 8, 3])
+    opt = torch.optim.AdamW(proj.parameters(), lr=1e-3)
+    out = train_step_qwen(model, proj, opt, batch, "cpu", adaptive_ckpt=(1, 1))
+    assert out["finite"]
+    assert out["ckpt_on"] is True
+    assert out["cache_emptied"] is False  # no CUDA here; True only on GPU
+
+
 def test_expandable_segments_defaulted_but_never_overridden(monkeypatch):
     import os
 

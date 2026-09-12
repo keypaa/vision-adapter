@@ -798,12 +798,6 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         _push_interval = float(_os.environ.get("VISION_ADAPTER_PUSH_INTERVAL_S", PUSH_MAX_INTERVAL_S))
     except ValueError:
         _push_interval = float(PUSH_MAX_INTERVAL_S)
-    try:
-        # Diagnostic only: periodically torch.cuda.empty_cache() to tell allocator
-        # retention apart from a real tensor leak. 0 = off (production default).
-        _empty_cache_every = int(_os.environ.get("VISION_ADAPTER_EMPTY_CACHE_EVERY", "0"))
-    except ValueError:
-        _empty_cache_every = 0
     last_save_ts = t0
     if _resume_info is not None:
         _resume_fh, run_id = _open_resume_log(log_path, run_id)
@@ -825,14 +819,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 if _mem is not None:
                     rec["mem_alloc_gb"] = _mem["alloc_gb"]
                     rec["mem_reserved_gb"] = _mem["reserved_gb"]
-                if _empty_cache_every and step % _empty_cache_every == 0:
-                    try:
-                        import torch as _torch2
-                        if _torch2.cuda.is_available():
-                            _torch2.cuda.empty_cache()
-                            rec["emptied_cache"] = True
-                    except Exception:
-                        pass
+            if out.get("cache_emptied"):
+                rec["cache_emptied"] = True
             monitor.update(step, rec["loss"], rec["samples_seen"])
             rec["ema_loss"] = round(monitor.ema or rec["loss"],5)
             recs.append(rec)
@@ -841,6 +829,15 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             _save_every = 10 if steps <= 500 else cfg.save_every
             if _save_due(step, _save_every, last_save_ts, time.time(), _push_interval):
                 try:
+                    # Periodic cache release: allocator retention ramps ~7GB/100
+                    # steps on varying batch shapes; drop it at each save point
+                    # (seconds, amortized over 100 steps).
+                    try:
+                        import torch as _torch3
+                        if _torch3.cuda.is_available():
+                            _torch3.cuda.empty_cache()
+                    except Exception:
+                        pass
                     ckpt = _cache_root / f"projector_step{step}.pt"
                     import hashlib as _hashlib
 
