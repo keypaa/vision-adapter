@@ -41,38 +41,88 @@ def _auth_headers() -> dict[str, str]:
 
 
 def _remote_size(url: str) -> int:
+    import urllib.error
     import urllib.request
 
     t0 = time.time()
-    req = urllib.request.Request(url, method="HEAD", headers=_auth_headers())
-    size = int(urllib.request.urlopen(req, timeout=30).headers["Content-Length"])
+    last_err = None
+    for attempt in range(1 + _RATE_LIMIT_RETRIES):
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers=_auth_headers())
+            size = int(urllib.request.urlopen(req, timeout=30).headers["Content-Length"])
+            break
+        except urllib.error.HTTPError as e:
+            last_err = e
+            if getattr(e, "code", None) == 429 and attempt < _RATE_LIMIT_RETRIES:
+                time.sleep(_retry_after_s(getattr(e, "headers", None)))
+                continue
+            raise
+    else:
+        raise last_err  # type: ignore[misc]
     dt = time.time() - t0
     if dt > 5:
         print(f"[stream] HEAD slow: {Path(url).name} {size/2**30:.1f}GiB in {dt:.0f}s", flush=True)
     return size
 
 
+_RATE_LIMIT_RETRIES = 8
+_RATE_LIMIT_DEFAULT_S = 30.0
+_RATE_LIMIT_MAX_S = 300.0
+
+
+def _retry_after_s(headers, default: float = _RATE_LIMIT_DEFAULT_S) -> float:
+    """Parse Retry-After (seconds) with safe default + cap. Never raises."""
+    try:
+        if headers is not None:
+            v = headers.get("Retry-After", None)
+            if v is not None:
+                return min(max(float(str(v).strip()), 0.0), _RATE_LIMIT_MAX_S)
+    except Exception:
+        pass
+    return default
+
+
 def _fetch_range(url: str, start: int, end: int, retries: int = 3) -> bytes:  # noqa: C901
+    import random
+    import urllib.error
     import urllib.request
     from http.client import IncompleteRead
 
     headers = dict(_auth_headers())
     headers["Range"] = f"bytes={start}-{end}"
     last_err = None
-    for attempt in range(retries):
+    attempt = 0
+    rate_limited = 0
+    while True:
         try:
             req = urllib.request.Request(url, headers=headers)
             return urllib.request.urlopen(req, timeout=120).read()
+        except urllib.error.HTTPError as e:
+            # 429 storms (parallel Range/index builds) get their own budget with
+            # server-honoring backoff — the generic 3-attempt budget can't survive them.
+            last_err = e
+            if getattr(e, "code", None) == 429:
+                if rate_limited >= _RATE_LIMIT_RETRIES:
+                    break  # honored the server 8x over minutes — give up loudly
+                rate_limited += 1
+                time.sleep(_retry_after_s(getattr(e, "headers", None)) + random.uniform(0, 5))
+                continue
+            if attempt >= retries - 1:
+                break
+            time.sleep(0.5 * (2**attempt))
         except IncompleteRead as e:
             # HF CDN truncated mid-chunk (common under chunked Range) — retry fresh TCP
             last_err = e
             # Discard partial, retry with backoff; avoid tight loop on 20MiB+ truncations
-            if attempt < retries - 1:
-                time.sleep(1.0 * (2**attempt))
+            if attempt >= retries - 1:
+                break
+            time.sleep(1.0 * (2**attempt))
         except Exception as e:
             last_err = e
-            if attempt < retries - 1:
-                time.sleep(0.5 * (2**attempt))
+            if attempt >= retries - 1:
+                break
+            time.sleep(0.5 * (2**attempt))
+        attempt += 1
     raise last_err  # type: ignore[misc]
 
 
@@ -655,8 +705,8 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                         probe.disk_cache = self.rg_cache_dir  # type: ignore[attr-defined]
                         n_cf = probe._cache_file(n_lo, n_hi)
                         if not (os.path.exists(n_cf) and os.path.getsize(n_cf) == n_hi - n_lo):
-                            def _bg(url=url, n_lo=n_lo, n_hi=n_hi, cache=self.rg_cache_dir, n_rgi=n_rgi, sf=sf):
-                                rs2 = RemoteShard(url, _remote_size(url), disk_cache=cache)
+                            def _bg(url=url, n_lo=n_lo, n_hi=n_hi, cache=self.rg_cache_dir, n_rgi=n_rgi, sf=sf, size=rs.size):
+                                rs2 = RemoteShard(url, size, disk_cache=cache)
                                 t0 = time.time()
                                 rs2.load_span(n_lo, n_hi)
                                 dt = time.time() - t0
