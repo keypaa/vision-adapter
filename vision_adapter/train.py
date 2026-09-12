@@ -85,6 +85,35 @@ def _push_file_to_hf(local_path: Path, repo_id: str) -> None:
     )
 
 
+def _list_hf_ckpt_files(repo_id: str) -> list[str]:
+    from huggingface_hub import HfApi
+
+    return HfApi().list_repo_files(repo_id, repo_type="model")
+
+
+def _download_ckpt(repo_id: str, step: int | None, dest_dir: Path) -> Path:
+    from huggingface_hub import hf_hub_download
+
+    names = [f for f in _list_hf_ckpt_files(repo_id)
+             if f.startswith("projector_step") and f.endswith(".pt")]
+    if not names:
+        raise FileNotFoundError(f"no step ckpts in hf:{repo_id}")
+    if step is None:
+        def _n(nm: str) -> int:
+            try:
+                return int(nm.removeprefix("projector_step").removesuffix(".pt"))
+            except ValueError:
+                return -1
+        filename = max(names, key=_n)
+    else:
+        filename = f"projector_step{step}.pt"
+        if filename not in names:
+            raise FileNotFoundError(f"{filename} not in hf:{repo_id}")
+    local = hf_hub_download(repo_id, filename, repo_type="model",
+                            local_dir=str(dest_dir))
+    return Path(local)
+
+
 def _maybe_push_ckpt(local_path: Path) -> None:
     enabled, repo = _hf_ckpt_push_cfg()
     if not enabled or not repo:
@@ -844,6 +873,51 @@ def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device:
         return 1
 
 
+def _run_resume_hf(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None) -> int:
+    """Download latest (or K) step ckpt from the HF ckpt repo, then continue via the identical Task 2 restore path."""
+    import os
+
+    repo = os.environ.get("VISION_ADAPTER_HF_CKPT_REPO") or None
+    if not repo:
+        print("[train] --resume hf needs VISION_ADAPTER_HF_CKPT_REPO (or --hf-ckpt-repo)", flush=True)
+        return 1
+    dest = dd / "cache"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        ckpt_path = _download_ckpt(repo, resume_step, dest)
+    except FileNotFoundError as e:
+        print(f"[train] resume requested but {e}", flush=True)
+        return 1
+    try:
+        import torch as _t
+
+        resume_ckpt = _t.load(str(ckpt_path), map_location="cpu")
+    except Exception as e:  # noqa: BLE001 — corrupt ckpt must not start a fresh run silently
+        print(f"[train] resume load failed for {ckpt_path} ({e})", flush=True)
+        return 1
+    print(f"[train] resume hf from {ckpt_path} (step {resume_ckpt.get('step')})", flush=True)
+    # Resume always takes the streaming restore path (smoke/local-emb never
+    # write full-state step ckpts, so there is nothing to restore there).
+    _resume_dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if _resume_dev == "cuda":
+        try:
+            require_gpu("train")
+        except SystemExit as e:
+            print(str(e), flush=True)
+            raise
+    try:
+        return _streaming_train(dd, cfg, max_steps, _resume_dev, dtype, resume_ckpt=resume_ckpt)
+    except Exception as e:
+        import traceback
+        print(f"[train] streaming resume failed ({type(e).__name__}: {e})", flush=True)
+        traceback.print_exc()
+        print("[train] NOT falling back to smoke: partial ckpts/log preserved, exiting 1", flush=True)
+        return 1
+
+
 def run_train(
     data_dir: Path | str,
     cfg: TrainConfig,
@@ -870,8 +944,7 @@ def run_train(
         print(f"[train] unknown --resume {resume!r} (expected off|local|hf)", flush=True)
         return 1
     if resume == "hf":
-        print("[train] --resume hf not yet implemented (Task 3) — use --resume local", flush=True)
-        return 1
+        return _run_resume_hf(dd, cfg, max_steps, device, dtype, resume_step)
     if resume == "local":
         return _run_resume_local(dd, cfg, max_steps, device, dtype, resume_step)
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")

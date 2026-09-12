@@ -28,6 +28,23 @@ def test_resume_plan_pins_original_totals():
     assert r["start_pos_rows"] == r["resume_step"] * 16
 
 
+def test_download_ckpt_picks_latest_or_exact(tmp_path, monkeypatch):
+    import vision_adapter.train as tr
+
+    files = ["projector_step100.pt", "projector_step200.pt", "probe_log.jsonl"]
+    monkeypatch.setattr(tr, "_list_hf_ckpt_files", lambda repo: files)
+    def _fake_dl(repo_id, filename, **kw):
+        p = tmp_path / filename
+        p.write_bytes(b"ckpt-bytes")
+        return str(p)
+    monkeypatch.setattr("huggingface_hub.hf_hub_download", _fake_dl)
+
+    got = tr._download_ckpt("keypa/x", None, tmp_path)
+    assert got.name == "projector_step200.pt"  # latest when step None
+    got = tr._download_ckpt("keypa/x", 100, tmp_path)
+    assert got.name == "projector_step100.pt"
+
+
 def test_resume_reuses_run_id_and_appends(tmp_path):
     from vision_adapter.train import _open_resume_log
 
