@@ -183,6 +183,8 @@ def train_cmd(args: argparse.Namespace) -> int:
         max_steps=max_steps,
         device="cuda" if not dryrun else None,
         dtype=getattr(args, "dtype", "auto"),
+        resume=getattr(args, "resume", "off"),
+        resume_step=getattr(args, "resume_step", None),
     )
 
 
@@ -272,6 +274,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="data backend",
     )
     p.add_argument("--dryrun", action="store_true", help="dry run (validate without GPU)")
+    p.add_argument("--resume", choices=("off", "local", "hf"), default="off", help="resume from a step ckpt (local disk or HF), continuing at K+1 with the same run_id")
+    p.add_argument("--resume-step", type=int, default=None, help="resume from this step ckpt (default: latest projector_step*.pt)")
     p.set_defaults(func=train_cmd)
 
     # probe (alias for train --config colab)

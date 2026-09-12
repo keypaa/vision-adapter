@@ -109,7 +109,7 @@ def _save_due(step: int, save_every: int, last_save_ts: float, now: float,
 
 
 CKPT_KEYS = ("proj", "opt", "scaler", "step", "samples_seen",
-             "monitor", "rng", "plan", "cfg")
+             "monitor", "rng", "plan", "cfg", "run_id")
 
 
 def _collect_rng_state() -> dict:
@@ -134,11 +134,102 @@ def _collect_rng_state() -> dict:
 
 def build_ckpt_payload(proj_state, opt_state, scaler_state, step: int,
                        samples_seen: int, monitor_state: dict,
-                       rng_state: dict, plan_meta: dict, cfg_dict: dict) -> dict:
+                       rng_state: dict, plan_meta: dict, cfg_dict: dict,
+                       run_id: str | None = None) -> dict:
     return {"proj": proj_state, "opt": opt_state, "scaler": scaler_state,
             "step": step, "samples_seen": samples_seen,
             "monitor": monitor_state, "rng": rng_state,
-            "plan": plan_meta, "cfg": cfg_dict}
+            "plan": plan_meta, "cfg": cfg_dict, "run_id": run_id}
+
+
+def _resolve_resume(ckpt_plan: dict, cli_max_steps: int | None, cli_seed: int = 0) -> dict:
+    """Pin training extent from ckpt metadata, never from new CLI values."""
+    total = int(ckpt_plan["max_steps"]) if "max_steps" in ckpt_plan else None
+    if total is None:  # backward compat: old ckpts without max_steps
+        total = int(cli_max_steps or 0)
+    return {"total_steps": total, "seed": int(ckpt_plan.get("seed", cli_seed)),
+            "sample_size": int(ckpt_plan.get("sample_size", 0)),
+            "batch_size": int(ckpt_plan.get("batch_size", 16)),
+            "resume_step": int(ckpt_plan.get("step", 0)),
+            "start_pos_rows": int(ckpt_plan.get("step", 0)) * int(ckpt_plan.get("batch_size", 16))}
+
+
+def _open_resume_log(log_path, run_id):
+    """Append to the existing run log, preserving run_id."""
+    fh = open(log_path, "a", buffering=1)
+    return fh, run_id
+
+
+def _restore_rng_state(rng_state: dict | None) -> None:
+    """Best-effort RNG restore (python/torch/cuda/numpy, per key)."""
+    if not rng_state:
+        return
+    try:
+        import random
+
+        if "python" in rng_state:
+            random.setstate(rng_state["python"])
+    except Exception:
+        pass
+    try:
+        import torch as _t
+
+        if "torch" in rng_state:
+            _t.set_rng_state(rng_state["torch"])
+        if "cuda" in rng_state and _t.cuda.is_available():
+            try:
+                _t.cuda.set_rng_state_all(rng_state["cuda"])
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        import numpy as _np
+
+        if "numpy" in rng_state:
+            _np.random.set_state(rng_state["numpy"])
+    except Exception:
+        pass
+
+
+def _ckpt_step_number(name: str) -> int:
+    try:
+        return int(name.removeprefix("projector_step").removesuffix(".pt"))
+    except ValueError:
+        return -1
+
+
+def _find_local_ckpt(data_dir: Path | str, step: int | None = None) -> Path:
+    """Locate a local step ckpt (latest when step is None, else exact).
+
+    Searches the streaming cache root first, then data_dir itself.
+    Raises FileNotFoundError when nothing matches.
+    """
+    import os
+
+    dd = Path(data_dir)
+    cache_root = Path("/hf/hf_stream_cache") if (Path("/hf").is_dir() and os.environ.get("MODAL_TASK_ID")) else dd / "cache"
+    search_dirs = [cache_root, dd]
+    if step is not None:
+        filename = f"projector_step{step}.pt"
+        for d in search_dirs:
+            cand = d / filename
+            if cand.is_file():
+                return cand
+        raise FileNotFoundError(f"{filename} not found in {[str(d) for d in search_dirs]}")
+    best: Path | None = None
+    best_n = -1
+    for d in search_dirs:
+        if not d.is_dir():
+            continue
+        for p in d.glob("projector_step*.pt"):
+            n = _ckpt_step_number(p.name)
+            if n > best_n:
+                best_n = n
+                best = p
+    if best is None:
+        raise FileNotFoundError(f"no projector_step*.pt in {[str(d) for d in search_dirs]}")
+    return best
 
 
 def _ensure_expandable_segments() -> bool:
@@ -374,8 +465,14 @@ def _persist_fetched_manifest(data_dir: Path, rows: list[dict]) -> Path:
     return out
 
 
-def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str, dtype_arg: str = "auto") -> int:  # noqa: C901
-    """Native HF streaming train — cluster-sampled RemoteShard, no grok import."""
+def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str, dtype_arg: str = "auto", resume_ckpt: dict | None = None) -> int:  # noqa: C901
+    """Native HF streaming train — cluster-sampled RemoteShard, no grok import.
+
+    When resume_ckpt is given, continue at ckpt["step"]+1 with restored
+    opt/monitor, LR pinned to the ORIGINAL total steps, data skipped via
+    start_pos, and the log appended under the SAME run_id (statistical
+    equivalence with the uninterrupted curve, not bit-identical).
+    """
     import json
     import time
     import os
@@ -455,6 +552,35 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     scaler = _torch.amp.GradScaler("cuda", enabled=(dev=="cuda" and dtype==_torch.float16), init_scale=1.0, growth_interval=10**9) if dev=="cuda" else None
     collate = make_collate(tok, tok.pad_token_id, max_len=cfg.max_seq_len, vision_dim=cfg.vision_dim)
     monitor = ProbeMonitor()
+    # --resume local: pin extent from ckpt, restore weights/opt/monitor/RNG.
+    _resume_info: dict | None = None
+    if resume_ckpt is not None:
+        _merged_plan = dict(resume_ckpt.get("plan", {}) or {})
+        _merged_plan.setdefault("step", resume_ckpt.get("step", 0))
+        _resume_info = _resolve_resume(_merged_plan, cli_max_steps=max_steps)
+        try:
+            proj.load_state_dict(resume_ckpt["proj"])
+        except Exception as e:  # noqa: BLE001 — shape/dtype mismatch must surface clearly
+            print(f"[train] resume proj restore failed ({e})", flush=True)
+            raise
+        try:
+            opt.load_state_dict(resume_ckpt["opt"])
+        except Exception as e:  # noqa: BLE001
+            print(f"[train] resume opt restore failed ({e})", flush=True)
+            raise
+        try:
+            if scaler is not None and resume_ckpt.get("scaler") is not None:
+                scaler.load_state_dict(resume_ckpt["scaler"])
+        except Exception as e:  # noqa: BLE001 — scaler restore is best-effort
+            print(f"[train] resume scaler restore skipped ({e})", flush=True)
+        try:
+            monitor.load_state_dict(resume_ckpt.get("monitor", {}) or {})
+        except Exception as e:  # noqa: BLE001
+            print(f"[train] resume monitor restore failed ({e})", flush=True)
+            raise
+        _restore_rng_state(resume_ckpt.get("rng"))
+        print(f"[train] resume from step {resume_ckpt.get('step')} -> {int(_resume_info['resume_step']) + 1}..{int(_resume_info['total_steps'])} "
+              f"start_pos_rows={int(_resume_info['start_pos_rows'])} run_id={resume_ckpt.get('run_id')}", flush=True)
     # Build streaming plan (ensure cache dirs exist before index save)
     # Persistent cache on Modal via HF_CACHE (/hf) to avoid 224s rebuild each ephemeral /tmp run
     _cache_root = Path("/hf/hf_stream_cache") if (Path("/hf").is_dir() and os.environ.get("MODAL_TASK_ID")) else data_dir / "cache"
@@ -475,22 +601,39 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     else:
         random.Random(0).shuffle(stream_order)
     index = _build_index(stream_order, cache_dir=str(_cache_root))
-    sample_size = min(len(rows), (max_steps or 5) * cfg.batch_size * 2)
-    plan = _build_plan(rows, index, sample_size=sample_size, seed=0, excluded_shards=EXCLUDED)
+    if _resume_info is not None and int(_resume_info.get("sample_size", 0)) > 0:
+        sample_size = int(_resume_info["sample_size"])
+        _plan_seed = int(_resume_info.get("seed", 0))
+    else:
+        sample_size = min(len(rows), (max_steps or 5) * cfg.batch_size * 2)
+        _plan_seed = 0
+    plan = _build_plan(rows, index, sample_size=sample_size, seed=_plan_seed, excluded_shards=EXCLUDED)
     n_planned = sum(len(v) for v in plan.values())
     print(f"[train] streaming plan: {n_planned} rows from {len(plan)} shards", flush=True)
     # Logging
     log_path = data_dir / "probe_log.jsonl"
     curves_path = data_dir / "probe_curves.png"
-    try:
-        hdr = config_header(cfg, manifest_path=str(local_manifest) if local_manifest.is_file() else None, extra={"run":"train-stream","device":dev,"dtype":str(dtype),"sample_size":sample_size})
-        run_id = hdr.get("run_id")
-        with open(log_path, "w", buffering=1) as lf:
-            lf.write(json.dumps(hdr)+"\n")
-    except Exception as e:
-        print(f"[train] header failed: {e}", flush=True)
-        run_id = None
-        open(log_path,"w").close()
+    if _resume_info is not None:
+        run_id = resume_ckpt.get("run_id") if isinstance(resume_ckpt, dict) else None
+        if not run_id:
+            # backward compat: old ckpts without run_id — recover from existing log header
+            try:
+                with open(log_path) as _lf:
+                    _first = _lf.readline().strip()
+                    run_id = json.loads(_first).get("run_id") if _first else None
+            except Exception:
+                run_id = None
+        print(f"[train] resume appending to {log_path} run_id={run_id}", flush=True)
+    else:
+        try:
+            hdr = config_header(cfg, manifest_path=str(local_manifest) if local_manifest.is_file() else None, extra={"run":"train-stream","device":dev,"dtype":str(dtype),"sample_size":sample_size})
+            run_id = hdr.get("run_id")
+            with open(log_path, "w", buffering=1) as lf:
+                lf.write(json.dumps(hdr)+"\n")
+        except Exception as e:
+            print(f"[train] header failed: {e}", flush=True)
+            run_id = None
+            open(log_path,"w").close()
     # Phase 2 daemon: prefetch shard i+1 via hf_transfer while GPU trains shard i (1GiB/s, pipelined)
     # EmbStreamDataset already has shard-level prefetch + LRU 4 shards; this top-level daemon warms the first shard
     # before the loop so the first batch never stalls (12min cold pipelined over 33h).
@@ -513,13 +656,18 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         _prefetch_exec = None
         _first_shard_fut = None
     # Batch iterator
+    _start_pos = int(_resume_info["start_pos_rows"]) if _resume_info is not None else 0
+
     def _batch_iter():
         _rg = str(_cache_root / "rg_cache") if "_cache_root" in locals() else str(data_dir / "cache" / "rg_cache")
-        ds = _EmbDS(plan, stream_order, rg_cache_dir=_rg, vision_dim=cfg.vision_dim)
+        ds = _EmbDS(plan, stream_order, start_pos=_start_pos, rg_cache_dir=_rg, vision_dim=cfg.vision_dim)
         loader = _torch.utils.data.DataLoader(ds, batch_size=cfg.batch_size, drop_last=True, collate_fn=collate, num_workers=0)
         yield from loader
         # epoch wrap
         while True:
+            # NOTE: ds2 keeps start_pos=0 on purpose — _start_pos is a one-time
+            # skip into the interrupted epoch for data continuity; later epochs
+            # replay fully while samples_seen bookkeeping continues via step.
             ds2 = _EmbDS(plan, stream_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"), vision_dim=cfg.vision_dim)
             loader2 = _torch.utils.data.DataLoader(ds2, batch_size=cfg.batch_size, drop_last=True, collate_fn=collate, num_workers=0)
             yield from loader2
@@ -531,7 +679,12 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             print("[train] first shard prefetch ready", flush=True)
         except Exception:
             pass
-    steps = max_steps or 5
+    if _resume_info is not None:
+        steps = int(_resume_info["total_steps"])
+        start_step = int(_resume_info["resume_step"]) + 1
+    else:
+        steps = max_steps or 5
+        start_step = 1
     recs: list[dict] = []
     t0 = time.time()
     import os as _os
@@ -540,8 +693,13 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     except ValueError:
         _push_interval = float(PUSH_MAX_INTERVAL_S)
     last_save_ts = t0
-    with open(log_path, "a", buffering=1) as lf:
-        for step in range(1, steps+1):
+    if _resume_info is not None:
+        _resume_fh, run_id = _open_resume_log(log_path, run_id)
+        _log_ctx = _resume_fh
+    else:
+        _log_ctx = open(log_path, "a", buffering=1)
+    with _log_ctx as lf:
+        for step in range(start_step, steps+1):
             for g in opt.param_groups:
                 g["lr"] = lr_at(step, steps, cfg.lr, cfg.warmup_steps)
             batch = next(it)
@@ -572,6 +730,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                         "sample_size": sample_size,
                         "batch_size": cfg.batch_size,
                         "stream_order_hash": _order_hash,
+                        "max_steps": steps,
                     }
                     _payload = build_ckpt_payload(
                         proj.state_dict(),
@@ -583,6 +742,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                         _collect_rng_state(),
                         _plan_meta,
                         cfg.to_dict(),
+                        run_id,
                     )
                     _torch.save(_payload, str(ckpt))
                     print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] [train] ckpt {ckpt.name} ({ckpt.stat().st_size/1e6:.1f}MB) | {_stats_str()}", flush=True)
@@ -650,6 +810,40 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             pass
     return 0
 
+def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None) -> int:
+    """Load latest (or K) local step ckpt and continue via the streaming restore path."""
+    try:
+        ckpt_path = _find_local_ckpt(dd, resume_step)
+    except FileNotFoundError as e:
+        print(f"[train] resume requested but {e}", flush=True)
+        return 1
+    try:
+        import torch as _t
+
+        resume_ckpt = _t.load(str(ckpt_path), map_location="cpu")
+    except Exception as e:  # noqa: BLE001 — corrupt ckpt must not start a fresh run silently
+        print(f"[train] resume load failed for {ckpt_path} ({e})", flush=True)
+        return 1
+    print(f"[train] resume local from {ckpt_path} (step {resume_ckpt.get('step')})", flush=True)
+    # Resume always takes the streaming restore path (smoke/local-emb never
+    # write full-state step ckpts, so there is nothing to restore there).
+    _resume_dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if _resume_dev == "cuda":
+        try:
+            require_gpu("train")
+        except SystemExit as e:
+            print(str(e), flush=True)
+            raise
+    try:
+        return _streaming_train(dd, cfg, max_steps, _resume_dev, dtype, resume_ckpt=resume_ckpt)
+    except Exception as e:
+        import traceback
+        print(f"[train] streaming resume failed ({type(e).__name__}: {e})", flush=True)
+        traceback.print_exc()
+        print("[train] NOT falling back to smoke: partial ckpts/log preserved, exiting 1", flush=True)
+        return 1
+
+
 def run_train(
     data_dir: Path | str,
     cfg: TrainConfig,
@@ -657,17 +851,29 @@ def run_train(
     max_steps: int | None = None,
     device: str | None = None,
     dtype: str = "auto",
+    resume: str = "off",
+    resume_step: int | None = None,
 ) -> int:
     """Entry point for `cli train` non-dryrun.
 
     - Validates data_dir + manifest (header-first)
     - require_gpu("train") if device == "cuda" (any GPU)
     - Chooses path: fake-smoke (tiny) vs HF streaming (grok_probe) vs error with guidance
+    - When resume == "local", loads latest (or K) projector_step*.pt and
+      continues at step K+1 with restored opt/monitor (same run_id, appended log).
     Returns 0 on success, 1 if caller should delegate (e.g. no fake fixture, need HF path).
     """
     dd = Path(data_dir)
     if _ensure_expandable_segments():
         print("[train] PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True (fragmentation relief)", flush=True)
+    if resume not in ("off", "local", "hf"):
+        print(f"[train] unknown --resume {resume!r} (expected off|local|hf)", flush=True)
+        return 1
+    if resume == "hf":
+        print("[train] --resume hf not yet implemented (Task 3) — use --resume local", flush=True)
+        return 1
+    if resume == "local":
+        return _run_resume_local(dd, cfg, max_steps, device, dtype, resume_step)
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     # Only gate on GPU when we actually need CUDA kernels; smoke fallback runs on CPU
     # but warn — real training will need a card.
