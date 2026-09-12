@@ -295,6 +295,7 @@ class ProbeMonitor:
             "history": list(self.history),
             "ema_history": list(self.ema_history),
             "last_banner_step": self.last_banner_step,
+            "last_banner": self.last_banner_step,
             "last_alert_step": self.last_alert_step,
             "n_alerts": self.n_alerts,
             "n_banners": self.n_banners,
