@@ -327,6 +327,20 @@ def _local_train_with_precomputed(data_dir: Path, cfg: TrainConfig, max_steps: i
     return 0
 
 
+def _persist_fetched_manifest(data_dir: Path, rows: list[dict]) -> Path:
+    """Write HF-fetched rows to data_dir/train_manifest.jsonl (header-first).
+
+    Without this, rows live only in memory and every later stage that reads
+    the local manifest (smoke fallback, local train, final push) crashes or
+    silently skips. Atomic tmp+replace; never raises (logs and returns path).
+    """
+    from vision_adapter.manifest import write_manifest_with_header
+
+    out = Path(data_dir) / "train_manifest.jsonl"
+    write_manifest_with_header(out, rows)
+    return out
+
+
 def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str, dtype_arg: str = "auto") -> int:  # noqa: C901
     """Native HF streaming train — cluster-sampled RemoteShard, no grok import."""
     import json
@@ -361,6 +375,10 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             return _smoke_train_with_fake_data(data_dir, cfg, max_steps, device)
     else:
         rows = _fetch_manifest(cache_dir=str(data_dir / "cache"), token=tok_hf)
+        try:
+            _persist_fetched_manifest(data_dir, rows)
+        except Exception as e:  # noqa: BLE001 — persistence is best-effort, training must not die here
+            print(f"[train] manifest persist failed ({e}) — continuing with in-memory rows", flush=True)
     # Device / dtype (mirror grok logic: bf16 Ampere+, else fp32/fp16 via autocast; --dtype overrides)
     dev = device if device in ("cuda","cpu") and (device!="cuda" or _torch.cuda.is_available()) else "cpu"
     if dev == "cuda":
