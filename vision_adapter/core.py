@@ -287,6 +287,37 @@ class ProbeMonitor:
                 self.n_banners += 1
         return self.ema
 
+    def to_dict(self) -> dict:
+        """Minimal resumable snapshot of the monitor stream state."""
+        return {
+            "ema": self.ema,
+            "prev_ema": self.prev_ema,
+            "history": list(self.history),
+            "ema_history": list(self.ema_history),
+            "last_banner_step": self.last_banner_step,
+            "last_banner": self.last_banner_step,
+            "last_alert_step": self.last_alert_step,
+            "n_alerts": self.n_alerts,
+            "n_banners": self.n_banners,
+            "collapse_step": self.collapse_step,
+        }
+
+    def load_state_dict(self, state: dict) -> None:
+        """Restore stream state from :meth:`to_dict` output."""
+        self.ema = state.get("ema")
+        self.prev_ema = state.get("prev_ema")
+        self.history = deque(state.get("history", []), maxlen=self.plateau_window)
+        self.ema_history = deque(state.get("ema_history", []), maxlen=self.spike_window)
+        # Brief shorthand "last_banner" aliases the real last_banner_step field.
+        if "last_banner_step" in state:
+            self.last_banner_step = state["last_banner_step"]
+        elif "last_banner" in state:
+            self.last_banner_step = state["last_banner"]
+        self.last_alert_step = state.get("last_alert_step", self.last_alert_step)
+        self.n_alerts = state.get("n_alerts", 0)
+        self.n_banners = state.get("n_banners", 0)
+        self.collapse_step = state.get("collapse_step")
+
 
 # ---------------------------------------------------------------------------
 # TrainMonitor — DeepSeek run analytics (loss+grad median spike detector)
