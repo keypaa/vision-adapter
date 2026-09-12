@@ -648,5 +648,5 @@ def run_train(
         import traceback
         print(f"[train] streaming train failed ({type(e).__name__}: {e})", flush=True)
         traceback.print_exc()
-        print("[train] falling back to smoke stub (check HF_TOKEN and network)", flush=True)
-        return _smoke_train_with_fake_data(dd, cfg, max_steps, dev)
+        print("[train] NOT falling back to smoke: partial ckpts/log preserved, exiting 1", flush=True)
+        return 1
