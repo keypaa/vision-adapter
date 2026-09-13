@@ -809,7 +809,42 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             for g in opt.param_groups:
                 g["lr"] = lr_at(step, steps, cfg.lr, cfg.warmup_steps)
             batch = next(it)
-            out = train_step_qwen(model, proj, opt, batch, dev, scaler=scaler)
+            # Token-budget cap: if B·L exceeds budget, split into micro-batches
+            # with grad accumulation to bound peak allocated (fix for 4901+ shards).
+            _bl_budget = 20000  # B·L tokens, ~ B=16×1250
+            try:
+                _bl_budget = int(os.environ.get("VISION_ADAPTER_BL_BUDGET", _bl_budget))
+            except ValueError:
+                pass
+            B0, L0 = batch["input_ids"].shape[:2]
+            if B0 * L0 > _bl_budget:
+                # split along batch dim
+                n_splits = (B0 * L0 + _bl_budget - 1) // _bl_budget
+                micro = max(1, B0 // n_splits)
+                outs = []
+                opt.zero_grad(set_to_none=True)
+                for s in range(0, B0, micro):
+                    e = min(s + micro, B0)
+                    mb = {k: v[s:e] if isinstance(v, torch.Tensor) else v for k, v in batch.items() if k != "g"}
+                    mb["g"] = batch["g"][s:e] if isinstance(batch.get("g"), list) else batch.get("g")
+                    # scale loss so sum of micro grads = mean grad of full batch
+                    scale = (e - s) / B0
+                    o = train_step_qwen(model, proj, opt, mb, dev, scaler=scaler, _accumulate=(e < B0), _scale=scale)
+                    outs.append(o)
+                # aggregate for logging (loss already scaled, sum = mean)
+                finite_vals = [o for o in outs if o["finite"]]
+                out = {
+                    "loss": sum(o["loss"] for o in outs),
+                    "finite": all(o["finite"] for o in outs),
+                    "gnorm": max((o["gnorm"] for o in finite_vals if not (o["gnorm"] != o["gnorm"])), default=float("nan")),
+                    "tokens": sum(o["tokens"] for o in outs),
+                    "batch_size": B0, "L": L0, "bl2": B0*L0*L0,
+                    "ckpt_on": any(o.get("ckpt_on") for o in outs),
+                    "cache_emptied": any(o.get("cache_emptied") for o in outs),
+                    "step_ms": sum(o["step_ms"] for o in outs),
+                }
+            else:
+                out = train_step_qwen(model, proj, opt, batch, dev, scaler=scaler)
             if not out["finite"]:
                 print(f"[train][WARN] non-finite at {step}, skipping", flush=True)
                 continue

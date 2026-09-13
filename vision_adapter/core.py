@@ -529,7 +529,7 @@ def render_train_curves(records, out_path: str, grok_lo: int = 0, grok_hi: int =
 # PADDED shape — not by the mask sum (one L=5k row + padding costs ~25× a
 # uniform L=1k batch at equal mask sum). Gate on shape, never on the sum.
 DEFAULT_L_MAX = 2500
-DEFAULT_COST_MAX = 50_000_000  # B=8 × 2500² (production batch)
+DEFAULT_COST_MAX = 25_000_000  # B=16 × 1250² — retuned for B=16 (was B=8×2500²); L_MAX still caps long rows
 
 
 def _resolve_ckpt_budget(adaptive_ckpt) -> tuple[int, int] | None:
@@ -607,7 +607,7 @@ def _restore_ckpt_flags(prev) -> None:
 
 
 def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=None,
-                    adaptive_ckpt="auto") -> dict:
+                    adaptive_ckpt="auto", _accumulate: bool = False, _scale: float = 1.0) -> dict:
     """One fwd/bwd/clip/step for the Qwen probe (selective lm_head loss).
 
     Shared between grok_probe_qwen and modal_probe; modal_train keeps its own
@@ -651,26 +651,36 @@ def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=N
             y_sel = shift_labels[pos[:, 0], pos[:, 1]]
             logits_sel = model.lm_head(h_sel).float()
         loss = F.cross_entropy(logits_sel, y_sel)
-
+        if _scale != 1.0:
+            loss = loss * _scale
         params = list(proj.parameters())
         if scaler is not None:
             scaled_loss = scaler.scale(loss)
-            opt.zero_grad(set_to_none=True)
+            if not _accumulate:
+                opt.zero_grad(set_to_none=True)
             scaled_loss.backward()
-            scaler.unscale_(opt)
-            gnorm = float(nn.utils.clip_grad_norm_(params, clip))
-            step_skipped = math.isnan(gnorm) or math.isinf(gnorm)
-            if not step_skipped:
-                scaler.step(opt)
-            scaler.update()
-            finite = not step_skipped
+            if _accumulate:
+                gnorm = float("nan")
+                finite = bool(torch.isfinite(loss))
+            else:
+                scaler.unscale_(opt)
+                gnorm = float(nn.utils.clip_grad_norm_(params, clip))
+                step_skipped = math.isnan(gnorm) or math.isinf(gnorm)
+                if not step_skipped:
+                    scaler.step(opt)
+                scaler.update()
+                finite = not step_skipped
         else:
             finite = bool(torch.isfinite(loss))
-            opt.zero_grad(set_to_none=True)
+            if not _accumulate:
+                opt.zero_grad(set_to_none=True)
             loss.backward()
-            gnorm = float("nan") if not finite else float(nn.utils.clip_grad_norm_(params, clip))
-            if finite:
-                opt.step()
+            if _accumulate:
+                gnorm = float("nan")
+            else:
+                gnorm = float("nan") if not finite else float(nn.utils.clip_grad_norm_(params, clip))
+                if finite:
+                    opt.step()
         B, L = batch["input_ids"].shape[:2]
         return {"loss": float(loss.item()), "finite": finite, "gnorm": gnorm,
                 "tokens": int(batch["attention_mask"].sum()),
