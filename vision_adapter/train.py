@@ -331,6 +331,36 @@ def _ensure_expandable_segments() -> bool:
     return True
 
 
+def _should_split(batch) -> bool:
+    """True when B·L² exceeds the cost budget (COST_MAX).
+
+    Uses _resolve_ckpt_budget("auto") so VISION_ADAPTER_COST_MAX env
+    overrides DEFAULT_COST_MAX (25M). Gates on padded L from
+    batch["input_ids"].shape, not attention_mask sum.
+    """
+    B, L = batch["input_ids"].shape[:2]
+    from vision_adapter.core import DEFAULT_COST_MAX, _resolve_ckpt_budget
+
+    budget = _resolve_ckpt_budget("auto")
+    cost_max = budget[1] if budget else DEFAULT_COST_MAX
+    return B * L * L > cost_max
+
+
+def _n_splits_for_batch(B: int, L: int) -> int:
+    """Cost-aware n_splits: ceil(B·L² / COST_MAX), capped to B."""
+    import math
+
+    from vision_adapter.core import DEFAULT_COST_MAX, _resolve_ckpt_budget
+
+    budget = _resolve_ckpt_budget("auto")
+    cost_max = budget[1] if budget else DEFAULT_COST_MAX
+    n = math.ceil(B * L * L / cost_max) if cost_max else 1
+    # cap to B so micro >=1 stays integral
+    if B > 0:
+        n = min(n, B)
+    return max(1, n)
+
+
 def _tiny_qwen_for_smoke(vocab: int = 1024, hidden: int = 64, layers: int = 4):
     """Random-weight Qwen-shaped backbone, fp32 CPU/GPU — mirrors test_probe fixture.
     Last layer is full_attention so the projector receives grads (see test_probe notes)."""
@@ -809,17 +839,12 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             for g in opt.param_groups:
                 g["lr"] = lr_at(step, steps, cfg.lr, cfg.warmup_steps)
             batch = next(it)
-            # Token-budget cap: if B·L exceeds budget, split into micro-batches
-            # with grad accumulation to bound peak allocated (fix for 4901+ shards).
-            _bl_budget = 20000  # B·L tokens, ~ B=16×1250
-            try:
-                _bl_budget = int(os.environ.get("VISION_ADAPTER_BL_BUDGET", _bl_budget))
-            except ValueError:
-                pass
+            # Cost-aware micro-batching: gate on B·L² vs COST_MAX (bl2)
+            # not B·L. Keeps VISION_ADAPTER_COST_MAX env override via
+            # _resolve_ckpt_budget and derives micro from cost.
             B0, L0 = batch["input_ids"].shape[:2]
-            if B0 * L0 > _bl_budget:
-                # split along batch dim
-                n_splits = (B0 * L0 + _bl_budget - 1) // _bl_budget
+            if _should_split(batch):
+                n_splits = _n_splits_for_batch(B0, L0)
                 micro = max(1, B0 // n_splits)
                 outs = []
                 opt.zero_grad(set_to_none=True)
