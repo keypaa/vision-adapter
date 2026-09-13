@@ -276,3 +276,68 @@ def test_n_splits_cost_aware():
 
     # B=16 L=4900 bl2=384M -> ceil(384/25)=16 splits -> micro=1
     assert _n_splits_for_batch(16, 4900) == 16
+
+
+def test_empty_cache_guarded_by_synchronize(monkeypatch):
+    import contextlib
+
+    import vision_adapter.core as core
+    from vision_adapter.core import HourglassProjector, train_step_qwen
+
+    torch.manual_seed(0)
+    model = _tiny_qwen()
+    proj = HourglassProjector(4096, 32)
+    batch = _batch([5, 8, 3])
+    opt = torch.optim.AdamW(proj.parameters(), lr=1e-3)
+
+    calls: list[str] = []
+    monkeypatch.setattr(core.torch.cuda, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(core.torch.cuda, "empty_cache", lambda: calls.append("empty"))
+    monkeypatch.setattr(core.torch.cuda, "is_available", lambda: True)
+    import torch as _t
+
+    monkeypatch.setattr(_t.cuda, "synchronize", lambda: calls.append("sync"))
+    monkeypatch.setattr(_t.cuda, "empty_cache", lambda: calls.append("empty"))
+
+    # Make .to("cuda") a no-op (no GPU driver) and autocast a nullcontext
+    orig_to = torch.Tensor.to
+
+    def _fake_to(self, *args, **kwargs):  # noqa: ANN001
+        target = args[0] if args else kwargs.get("device")
+        if target is not None and "cuda" in str(target):
+            return self
+        return orig_to(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", _fake_to)
+    monkeypatch.setattr(torch, "autocast", lambda *a, **kw: contextlib.nullcontext())
+    # AdamW health check tries to init cuda via accelerator; bypass it
+    monkeypatch.setattr(torch.optim.Optimizer, "_accelerator_graph_capture_health_check", lambda self: None)
+
+    out = train_step_qwen(model, proj, opt, batch, "cuda", adaptive_ckpt=(1, 1))
+    assert out["ckpt_on"] is True
+    assert out["cache_emptied"] is True
+    assert calls == ["sync", "empty"]
+
+
+def test_per_step_empty_cache_removed():
+    import pathlib
+
+    train_src = pathlib.Path("vision_adapter/train.py").read_text()
+    assert 'if not out.get("ckpt_on")' not in train_src
+    assert "cache_emptied_step" not in train_src
+
+
+def test_train_save_empty_cache_guarded_by_synchronize():
+    import pathlib
+
+    train_src = pathlib.Path("vision_adapter/train.py").read_text()
+    core_src = pathlib.Path("vision_adapter/core.py").read_text()
+    assert core_src.count("synchronize()") >= 1
+    idx_sync = train_src.find("synchronize()")
+    idx_empty = train_src.find("empty_cache()")
+    assert idx_sync != -1 and idx_empty != -1
+    assert idx_sync < idx_empty
+    c_sync = core_src.find("synchronize()")
+    c_empty = core_src.find("empty_cache()")
+    assert c_sync != -1 and c_empty != -1
+    assert c_sync < c_empty

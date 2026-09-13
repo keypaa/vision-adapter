@@ -881,18 +881,6 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                     rec["mem_reserved_gb"] = _mem["reserved_gb"]
             if out.get("cache_emptied"):
                 rec["cache_emptied"] = True
-            # Release allocator cache every step when ckpt is OFF (the 99% fast path):
-            # per-step transient ~15GB is cached as `reserved` and fragments across
-            # varying L; without this `reserved` ramps to 94GB in <20 steps.
-            # Cost is ~ms, overlapped with next prefetch. Keep for the 200 diag.
-            if not out.get("ckpt_on"):
-                try:
-                    import torch as _torch4
-                    if _torch4.cuda.is_available():
-                        _torch4.cuda.empty_cache()
-                        rec["cache_emptied_step"] = True
-                except Exception:
-                    pass
             monitor.update(step, rec["loss"], rec["samples_seen"])
             rec["ema_loss"] = round(monitor.ema or rec["loss"],5)
             recs.append(rec)
@@ -907,6 +895,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                     try:
                         import torch as _torch3
                         if _torch3.cuda.is_available():
+                            _torch3.cuda.synchronize()
                             _torch3.cuda.empty_cache()
                     except Exception:
                         pass
