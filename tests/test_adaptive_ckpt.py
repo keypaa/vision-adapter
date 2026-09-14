@@ -264,18 +264,25 @@ def test_bl2_gate_triggers_on_monster_not_small():
     from vision_adapter.train import _should_split
     import torch
 
-    # Build via real collate shape (B,L) — bl2 computed on padded L, not fake zeros alone
-    small = {"input_ids": torch.zeros(16, 800), "attention_mask": torch.ones(16, 800)}
+    # Small L=500 bl2=4M <10M stays OFF (fast path); L=2500 bl2=100M >10M triggers ON
+    small = {"input_ids": torch.zeros(16, 500), "attention_mask": torch.ones(16, 500)}
     monster = {"input_ids": torch.zeros(16, 2500), "attention_mask": torch.ones(16, 2500)}
     assert _should_split(small) is False
     assert _should_split(monster) is True
+    # Borderline: L=790 bl2~10M (the 475 killer) must now trigger with 10M budget
+    border = {"input_ids": torch.zeros(16, 790), "attention_mask": torch.ones(16, 790)}
+    assert _should_split(border) is False  # 16*790²=9.98M just under 10M
+    border2 = {"input_ids": torch.zeros(16, 800), "attention_mask": torch.ones(16, 800)}
+    assert _should_split(border2) is True  # 10.24M >10M
 
 
 def test_n_splits_cost_aware():
     from vision_adapter.train import _n_splits_for_batch
 
-    # B=16 L=4900 bl2=384M -> ceil(384/25)=16 splits -> micro=1
+    # B=16 L=4900 bl2=384M -> ceil(384/10)=39 splits capped to B=16 -> micro=1
     assert _n_splits_for_batch(16, 4900) == 16
+    # B=16 L=800 bl2=10.24M -> ceil(10.24/10)=2 splits -> micro=8
+    assert _n_splits_for_batch(16, 800) == 2
 
 
 def test_empty_cache_guarded_by_synchronize(monkeypatch):

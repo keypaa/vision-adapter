@@ -529,7 +529,7 @@ def render_train_curves(records, out_path: str, grok_lo: int = 0, grok_hi: int =
 # PADDED shape — not by the mask sum (one L=5k row + padding costs ~25× a
 # uniform L=1k batch at equal mask sum). Gate on shape, never on the sum.
 DEFAULT_L_MAX = 2500
-DEFAULT_COST_MAX = 25_000_000  # B=16 × 1250² — retuned for B=16 (was B=8×2500²); L_MAX still caps long rows
+DEFAULT_COST_MAX = 10_000_000  # B=16 × 790² — catches L≈800 killers (bl2 10.2M), keeps L<500 fast (4M)
 
 
 def _resolve_ckpt_budget(adaptive_ckpt) -> tuple[int, int] | None:
