@@ -398,3 +398,39 @@ def test_micro_batch_accumulation_matches_full_batch():
         assert torch.allclose(g_full, g_micro, atol=1e-6)
     for p_full, p_micro in zip(proj_full.parameters(), proj_micro.parameters()):
         assert torch.allclose(p_full, p_micro, atol=1e-5)
+
+
+def test_no_budget_guarantee_at_micro_1(monkeypatch):
+    """Splitting only slices B, never L: micro=1 can stay over budget.
+
+    Locks the P0 contract — a long singleton (or micro=1 slice) exceeds
+    COST_MAX with no further split possible; only ckpt covers it.
+    """
+    from vision_adapter.core import DEFAULT_COST_MAX
+    from vision_adapter.train import _n_splits_for_batch, _should_split
+
+    monkeypatch.delenv("VISION_ADAPTER_COST_MAX", raising=False)
+    # B=1 L=5000: split fires but n_splits is capped to B -> one full-L micro
+    assert _n_splits_for_batch(1, 5000) == 1
+    solo = {"input_ids": torch.zeros(1, 5000), "attention_mask": torch.ones(1, 5000)}
+    assert _should_split(solo) is True
+    assert 1 * 5000 * 5000 > DEFAULT_COST_MAX  # still over budget at micro=1
+    # B=16 L=4900: 16 splits -> micro=1, each micro still over budget
+    assert _n_splits_for_batch(16, 4900) == 16
+    assert 1 * 4900 * 4900 > DEFAULT_COST_MAX
+
+
+def test_split_ckpt_divergence_long_thin(monkeypatch):
+    """_should_split gates on bl2 only; ckpt also gates on L_MAX.
+
+    Locks the (currently accidental) complement: B=1 L=3000 never splits
+    but flips ckpt ON via L_MAX.
+    """
+    from vision_adapter.core import ckpt_needed_for_batch
+    from vision_adapter.train import _should_split
+
+    monkeypatch.delenv("VISION_ADAPTER_COST_MAX", raising=False)
+    monkeypatch.delenv("VISION_ADAPTER_L_MAX", raising=False)
+    thin = {"input_ids": torch.zeros(1, 3000), "attention_mask": torch.ones(1, 3000)}
+    assert _should_split(thin) is False  # 9M < 10M
+    assert ckpt_needed_for_batch(thin) is True  # L=3000 > L_MAX 2500
