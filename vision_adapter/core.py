@@ -653,9 +653,12 @@ def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=N
         if _scale != 1.0:
             loss = loss * _scale
         params = list(proj.parameters())
+        # Micro-batch loop in train.py zeroes once before the loop; every
+        # micro (including the final stepping one, _scale < 1) must keep
+        # accumulated grads. Only a standalone step (_scale == 1) zeroes here.
         if scaler is not None:
             scaled_loss = scaler.scale(loss)
-            if not _accumulate:
+            if not _accumulate and _scale == 1.0:
                 opt.zero_grad(set_to_none=True)
             scaled_loss.backward()
             if _accumulate:
@@ -671,7 +674,7 @@ def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=N
                 finite = not step_skipped
         else:
             finite = bool(torch.isfinite(loss))
-            if not _accumulate:
+            if not _accumulate and _scale == 1.0:
                 opt.zero_grad(set_to_none=True)
             loss.backward()
             if _accumulate:

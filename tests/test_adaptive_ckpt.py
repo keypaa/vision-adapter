@@ -348,3 +348,53 @@ def test_train_save_empty_cache_guarded_by_synchronize():
     c_empty = core_src.find("empty_cache()")
     assert c_sync != -1 and c_empty != -1
     assert c_sync < c_empty
+
+
+def test_micro_batch_accumulation_matches_full_batch():
+    """Micro-batch loop (train.py) must equal one full-batch step.
+
+    Regression: final micro used _accumulate=False which zeroed grads
+    accumulated from earlier micros, so only the last micro contributed.
+    """
+    torch.manual_seed(0)
+    model = _tiny_qwen()
+    batch = _batch([6, 6, 6, 6])  # B=4, equal loss tokens per row
+    B0 = int(batch["input_ids"].shape[0])
+    assert B0 == 4
+    state = copy.deepcopy(HourglassProjector(4096, 32).state_dict())
+
+    proj_full = HourglassProjector(4096, 32)
+    proj_full.load_state_dict(state)
+    opt_full = torch.optim.AdamW(proj_full.parameters(), lr=1e-3)
+    out_full = train_step_qwen(
+        model, proj_full, opt_full, batch, "cpu",
+        adaptive_ckpt=(10**9, 10**18),  # force OFF both branches
+    )
+    assert out_full["finite"]
+
+    torch.manual_seed(0)  # same model dropout path (frozen, but be explicit)
+    proj_micro = HourglassProjector(4096, 32)
+    proj_micro.load_state_dict(state)
+    opt_micro = torch.optim.AdamW(proj_micro.parameters(), lr=1e-3)
+    opt_micro.zero_grad(set_to_none=True)
+    outs = []
+    micro = 2
+    for s in range(0, B0, micro):
+        e = min(s + micro, B0)
+        mb = {k: v[s:e] if isinstance(v, torch.Tensor) else v for k, v in batch.items() if k != "g"}
+        mb["g"] = batch["g"][s:e] if isinstance(batch.get("g"), list) else batch.get("g")
+        scale = (e - s) / B0
+        o = train_step_qwen(
+            model, proj_micro, opt_micro, mb, "cpu",
+            adaptive_ckpt=(10**9, 10**18),
+            _accumulate=(e < B0), _scale=scale,
+        )
+        outs.append(o)
+    assert all(o["finite"] for o in outs)
+    assert sum(o["loss"] for o in outs) == pytest.approx(out_full["loss"], abs=1e-5)
+    grads_full = [p.grad.detach().clone() for p in proj_full.parameters()]
+    grads_micro = [p.grad.detach().clone() for p in proj_micro.parameters()]
+    for g_full, g_micro in zip(grads_full, grads_micro):
+        assert torch.allclose(g_full, g_micro, atol=1e-6)
+    for p_full, p_micro in zip(proj_full.parameters(), proj_micro.parameters()):
+        assert torch.allclose(p_full, p_micro, atol=1e-5)

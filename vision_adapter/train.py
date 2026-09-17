@@ -335,7 +335,7 @@ def _should_split(batch) -> bool:
     """True when B·L² exceeds the cost budget (COST_MAX).
 
     Uses _resolve_ckpt_budget("auto") so VISION_ADAPTER_COST_MAX env
-    overrides DEFAULT_COST_MAX (25M). Gates on padded L from
+    overrides DEFAULT_COST_MAX (10M). Gates on padded L from
     batch["input_ids"].shape, not attention_mask sum.
     """
     B, L = batch["input_ids"].shape[:2]
