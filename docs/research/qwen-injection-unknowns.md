@@ -20,6 +20,10 @@ géométrie MoonViT étant perdue dans le parquet). Texte post-visuel et pads
 gardent le défaut par choix minimal (limite documentée dans le docstring).
 Éval alignée (`forward_loss` utilise les mêmes positions). Reste GPU :
 l’effet sur la convergence ne se verra qu’au long run.
+RÉSOLU (2026-09-21, différentiel 2×300 steps) : legacy +3,2 % vs mRoPE
++12,3 % sur les mêmes 60 rows held-out (base commune old-400 = 1.09).
+mRoPE validé pour le long run. Inits aléatoires distinctes : caveat noté,
+écart 4× + gate pass/fail = signal fort quand même.
 
 ## U4. Cause des 0 token en génération — RÉSOLU (2026-09-21, Molab PRO 6000)
 Sorties projecteur hors-échelle : `vis rms=16.42, absmax=172` vs table
