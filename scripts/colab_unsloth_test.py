@@ -70,6 +70,7 @@ def main():
     ap.add_argument("--max_new", type=int, default=64)
     ap.add_argument("--gen-mode", choices=("greedy", "card"), default="card")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--debug-ids", action="store_true", help="print raw generated ids + text-only control")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -119,8 +120,12 @@ def main():
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-2B", dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map=str(device))
     for p in model.parameters():
         p.requires_grad_(False)
-    model.train()
-    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    # Eval harness: ckpt recompute corrupts generate (KV-cache), train() enables dropout.
+    model.eval()
+    try:
+        model.gradient_checkpointing_disable()
+    except Exception:
+        pass
     cfg_llm = getattr(model.config, "text_config", model.config)
     llm_dim = int(cfg_llm.hidden_size)
 
@@ -146,6 +151,17 @@ def main():
     gen = tok.decode(out_ids[0][cut:], skip_special_tokens=True)
     print(f"\n=== {Path(args.ckpt).name} ===")
     print(f"Gen: {gen!r}")
+    if args.debug_ids:
+        new_ids = out_ids[0][cut:].tolist()
+        print(f"DEBUG new_tokens={len(new_ids)} ids={new_ids[:20]}")
+        # Text-only control: same model+sampling, no visual injection.
+        # Empty here too => generate path broken; non-empty => image conditioning issue.
+        t = tok(args.prompt, return_tensors="pt").to(str(device))
+        torch.manual_seed(args.seed)
+        t_out = model.generate(**t, max_new_tokens=32, pad_token_id=tok.pad_token_id, **build_gen_kwargs(args.gen_mode))
+        t_new = t_out[0][t["input_ids"].shape[1]:].tolist()
+        print(f"DEBUG text-only new_tokens={len(t_new)} ids={t_new[:20]}")
+        print(f"DEBUG text-only Gen: {tok.decode(t_new, skip_special_tokens=True)!r}")
 
 if __name__ == "__main__":
     main()
