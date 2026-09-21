@@ -86,6 +86,24 @@ def test_native_mode_resolves_conditional_generation_class():
         assert kw in params, f"conditional forward must accept {kw}"
 
 
+def test_manual_generate_mechanics_cpu():
+    from scripts.colab_unsloth_test import manual_generate
+
+    torch.manual_seed(0)
+    model = _tiny_qwen()
+    model.eval()
+    B, L, H = 1, 12, 32
+    embeds = torch.randn(B, L, H)
+    mask = torch.ones(B, L, dtype=torch.long)
+    out1 = manual_generate(model, embeds, mask, max_new_tokens=5, mode="greedy", eos_id=2, seed=0)
+    out2 = manual_generate(model, embeds, mask, max_new_tokens=5, mode="greedy", eos_id=0 - 1, seed=0)
+    assert len(out1) <= 5 and len(out2) == 5  # greedy stops only on real EOS
+    card1 = manual_generate(model, embeds, mask, max_new_tokens=5, mode="card", eos_id=-1, seed=0)
+    card2 = manual_generate(model, embeds, mask, max_new_tokens=5, mode="card", eos_id=-1, seed=0)
+    assert card1 == card2  # seeded sampling is deterministic
+    assert len(card1) == 5
+
+
 def test_select_heldout_rows_only_excluded_shards():
     from scripts.eval_heldout import select_heldout_rows
 

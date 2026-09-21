@@ -52,6 +52,56 @@ def resolve_qwen_class(native: bool):
     return Qwen3_5ForConditionalGeneration if native else AutoModelForCausalLM
 
 
+def manual_generate(model, inputs_embeds, attention_mask, max_new_tokens, mode="card",
+                    eos_id=None, seed=0):
+    """Hand-rolled autoregressive loop with KV-cache (no transformers generate).
+
+    Exists because generate-from-embeds yields 0 tokens on long prefixes
+    with Qwen3.5 (transformers fallback boundary). Mechanics only: greedy
+    argmax or seeded card-recipe sampling, EOS stop. MOLAB-VERIFIED for
+    real-model behavior; CPU pins the contract.
+    """
+    import torch
+
+    was_training = model.training
+    model.eval()
+    gen = torch.Generator(device=inputs_embeds.device)
+    gen.manual_seed(seed)
+    params = build_gen_kwargs(mode if mode in ("greedy", "card") else "card")
+    out = []
+    past = None
+    cur_embeds, cur_mask = inputs_embeds, attention_mask
+    try:
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                res = model.model(input_ids=None, inputs_embeds=cur_embeds,
+                                  attention_mask=cur_mask, past_key_values=past,
+                                  use_cache=True)
+                logits = model.lm_head(res.last_hidden_state[:, -1]).float()
+                if params.get("do_sample"):
+                    probs = torch.softmax(
+                        logits / params.get("temperature", 1.0), dim=-1)
+                    if params.get("top_k"):
+                        k = min(params["top_k"], probs.shape[-1])
+                        topv, topi = torch.topk(probs, k, dim=-1)
+                        mask = torch.zeros_like(probs).scatter_(-1, topi, topv)
+                        probs = mask / mask.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+                    nxt = torch.multinomial(probs, 1, generator=gen)
+                else:
+                    nxt = logits.argmax(dim=-1, keepdim=True)
+                tok_id = int(nxt[0, 0].item())
+                out.append(tok_id)
+                if eos_id is not None and tok_id == eos_id:
+                    break
+                past = res.past_key_values
+                cur_embeds = model.get_input_embeddings()(nxt)
+                cur_mask = torch.ones((cur_mask.shape[0], cur_mask.shape[1] + 1),
+                                      dtype=cur_mask.dtype, device=cur_mask.device)
+    finally:
+        model.train(was_training)
+    return out
+
+
 def strip_trailing_eos(batch, eos_id):
     """Cut input_ids/attention_mask before the first EOS for generation.
 
@@ -84,6 +134,8 @@ def main():
     ap.add_argument("--debug-ids", action="store_true", help="print raw generated ids + text-only control")
     ap.add_argument("--prefix-mode", choices=("legacy", "native"), default="legacy",
                     help="legacy: raw embeds_for splice; native: creator protocol (placeholders+mm+mRoPE)")
+    ap.add_argument("--decode", choices=("generate", "manual"), default="generate",
+                    help="generate: transformers generate(); manual: hand-rolled KV-cache loop")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -177,13 +229,19 @@ def main():
         inp = embeds_for(model, gen_batch, proj, str(device))
         vis_mask = None
     torch.manual_seed(args.seed)
-    out_ids = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=args.max_new, pad_token_id=tok.pad_token_id, **extra_kwargs, **build_gen_kwargs(args.gen_mode))
-    gen = tok.decode(out_ids[0][cut:], skip_special_tokens=True)
+    if args.decode == "manual":
+        new_ids = manual_generate(model, inp["inputs_embeds"], inp["attention_mask"],
+                                  max_new_tokens=args.max_new, mode=args.gen_mode,
+                                  eos_id=tok.eos_token_id, seed=args.seed)
+        gen = tok.decode(new_ids, skip_special_tokens=True)
+    else:
+        out_ids = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=args.max_new, pad_token_id=tok.pad_token_id, **extra_kwargs, **build_gen_kwargs(args.gen_mode))
+        new_ids = out_ids[0][cut:].tolist()
+        gen = tok.decode(new_ids, skip_special_tokens=True)
     print(f"\n=== {Path(args.ckpt).name} ===")
     print(f"Gen: {gen!r}")
     if args.debug_ids:
-        new_ids = out_ids[0][cut:].tolist()
-        print(f"DEBUG new_tokens={len(new_ids)} ids={new_ids[:20]}")
+        print(f"DEBUG decode={args.decode} new_tokens={len(new_ids)} ids={new_ids[:20]}")
         print(f"DEBUG embeds dtype={inp['inputs_embeds'].dtype} shape={tuple(inp['inputs_embeds'].shape)} "
               f"has_nan={bool(torch.isnan(inp['inputs_embeds']).any())} "
               f"has_inf={bool(torch.isinf(inp['inputs_embeds']).any())} "
