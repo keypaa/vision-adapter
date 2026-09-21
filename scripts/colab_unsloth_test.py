@@ -26,7 +26,7 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 from vision_adapter.models.moonvit import load_moonvit_from_safetensors
 from vision_adapter.models.preprocess import collate_images
-from vision_adapter.core import HourglassProjector, make_collate, embeds_for
+from vision_adapter.core import build_projector, make_collate, embeds_for
 
 def build_gen_kwargs(mode):
     """Sampling params per Qwen3.5 model card (non-thinking VL recipe).
@@ -147,7 +147,7 @@ def main():
     # Full-state step ckpts embed optimizer/RNG state (numpy) — trusted source (own run), same as train.py resume.
     sd = torch.load(args.ckpt, map_location=str(device), weights_only=False)
     state = sd.get("proj", sd)
-    proj = HourglassProjector(4096, llm_dim).to(str(device), dtype=torch.bfloat16)
+    proj = build_projector(4096, llm_dim).to(str(device), dtype=torch.bfloat16)
     proj.load_state_dict(state)
     print(f"projector {args.ckpt} loaded")
 

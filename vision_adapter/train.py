@@ -406,7 +406,7 @@ def _smoke_train_with_fake_data(
 ) -> int:
     """5-step smoke on fake rows + random vis — no HF, no embeddings needed.
     Proves the projector + collate + monitors + selective loss wiring."""
-    from vision_adapter.core import HourglassProjector, ProbeMonitor, make_collate, train_step_qwen
+    from vision_adapter.core import ProbeMonitor, build_projector, make_collate, train_step_qwen
 
     rows, header = load_manifest(data_dir / "train_manifest.jsonl")
     is_fake = header is not None and any("fake" in r.get("emb", "") for r in rows[:5])
@@ -424,7 +424,7 @@ def _smoke_train_with_fake_data(
     dev = device if device in ("cuda", "cpu") and (device != "cuda" or torch.cuda.is_available()) else "cpu"
     if dev == "cuda":
         model = model.to("cuda")
-    proj = HourglassProjector(cfg.vision_dim, hidden).to(dev)
+    proj = build_projector(cfg.vision_dim, hidden).to(dev)
     for p in proj.parameters():
         p.requires_grad_(True)
     opt = torch.optim.AdamW(proj.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
@@ -467,7 +467,7 @@ def _local_train_with_precomputed(data_dir: Path, cfg: TrainConfig, max_steps: i
     import time
     from pathlib import Path as _P
 
-    from vision_adapter.core import HourglassProjector, ProbeMonitor, make_collate, train_step_qwen, render_curves
+    from vision_adapter.core import ProbeMonitor, build_projector, make_collate, train_step_qwen, render_curves
     from vision_adapter.registry import append_registry, registry_entry
 
     rows, header = load_manifest(data_dir / "train_manifest.jsonl")
@@ -509,7 +509,7 @@ def _local_train_with_precomputed(data_dir: Path, cfg: TrainConfig, max_steps: i
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     cfg_llm = getattr(model.config, "text_config", model.config)
     llm_dim = int(cfg_llm.hidden_size)
-    proj = HourglassProjector(cfg.vision_dim, llm_dim).to(dev, dtype=dtype)
+    proj = build_projector(cfg.vision_dim, llm_dim).to(dev, dtype=dtype)
     for pa in proj.parameters():
         pa.requires_grad_(True)
     opt = _torch.optim.AdamW(proj.parameters(), lr=cfg.lr, betas=(0.9, 0.95))
@@ -596,7 +596,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from vision_adapter.backends.auth import get_hf_token as _ghf
-    from vision_adapter.core import HourglassProjector, ProbeMonitor, make_collate, train_step_qwen, render_curves, lr_at
+    from vision_adapter.core import ProbeMonitor, build_projector, make_collate, train_step_qwen, render_curves, lr_at
     from vision_adapter.data.stream import (
         EmbStreamDataset as _EmbDS,
         build_epoch_plan as _build_plan,
@@ -660,7 +660,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     cfg_llm = getattr(model.config, "text_config", model.config)
     llm_dim = int(cfg_llm.hidden_size)
     proj_dtype = _torch.float32 if (dev=="cuda" and dtype==_torch.float16) else dtype
-    proj = HourglassProjector(cfg.vision_dim, llm_dim).to(dev, dtype=proj_dtype)
+    proj = build_projector(cfg.vision_dim, llm_dim).to(dev, dtype=proj_dtype)
     for pa in proj.parameters():
         pa.requires_grad_(True)
     opt = _torch.optim.AdamW(proj.parameters(), lr=cfg.lr, betas=(0.9,0.95))

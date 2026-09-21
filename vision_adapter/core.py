@@ -47,6 +47,42 @@ class HourglassProjector(nn.Module):
         return self.dn(self.act(self.up(self.ln(x))))
 
 
+class ScaledHourglassProjector(nn.Module):
+    """HourglassProjector + output LayerNorm x fixed target RMS (U4/NEXT-5).
+
+    Measured on Molab PRO 6000: raw head outputs rms=16.42 vs Qwen3.5-2B
+    table rms=0.0131 (~1250x) -> saturated attention, dead generation.
+    Separate wrapper (not a flag) so the base path stays byte-identical;
+    selected via ``VISION_ADAPTER_PROJECTOR=scaled`` (default hourglass).
+    ``target_rms`` is a buffer so checkpoints carry the scale they trained with.
+    """
+
+    def __init__(self, vision_dim: int = 4096, llm_dim: int = 2048, target_rms: float = 0.02):
+        super().__init__()
+        self.base = HourglassProjector(vision_dim, llm_dim)
+        self.out_norm = nn.LayerNorm(llm_dim, elementwise_affine=False)
+        self.register_buffer("target_rms", torch.tensor(float(target_rms)))
+
+    def forward(self, x):
+        return self.out_norm(self.base(x)) * float(self.target_rms)
+
+
+def build_projector(vision_dim: int = 4096, llm_dim: int = 2048):
+    """Construct the train/eval projector; env-selected, default unchanged."""
+    import os
+
+    variant = os.environ.get("VISION_ADAPTER_PROJECTOR", "hourglass")
+    if variant == "scaled":
+        try:
+            rms = float(os.environ.get("VISION_ADAPTER_PROJECTOR_RMS", "0.02"))
+        except ValueError:
+            rms = 0.02
+        return ScaledHourglassProjector(vision_dim, llm_dim, rms)
+    if variant != "hourglass":
+        raise ValueError(f"unknown VISION_ADAPTER_PROJECTOR={variant!r} (expected hourglass|scaled)")
+    return HourglassProjector(vision_dim, llm_dim)
+
+
 # ---------------------------------------------------------------------------
 # make_collate — [BOS?][img × n_vis][user][answer][EOS] with answer priority
 # ---------------------------------------------------------------------------

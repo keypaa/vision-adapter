@@ -95,7 +95,7 @@ def main():
 
     from huggingface_hub import hf_hub_download
 
-    from vision_adapter.core import HourglassProjector, make_collate
+    from vision_adapter.core import build_projector, make_collate
     from vision_adapter.data.stream import (
         EmbStreamDataset,
         build_epoch_plan,
@@ -132,7 +132,7 @@ def main():
     results = {}
     for name, path in (("base", base_path), ("final", final_path)):
         sd = torch.load(path, map_location=device, weights_only=False)
-        proj = HourglassProjector(4096, llm_dim).to(device, dtype=dtype if dtype != torch.float16 else torch.float32)
+        proj = build_projector(4096, llm_dim).to(device, dtype=dtype if dtype != torch.float16 else torch.float32)
         proj.load_state_dict(sd.get("proj", sd))
         proj.eval()
         losses, tokens = [], 0
