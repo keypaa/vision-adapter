@@ -28,6 +28,26 @@ from vision_adapter.models.moonvit import load_moonvit_from_safetensors
 from vision_adapter.models.preprocess import collate_images
 from vision_adapter.core import HourglassProjector, make_collate, embeds_for
 
+def strip_trailing_eos(batch, eos_id):
+    """Cut input_ids/attention_mask before the first EOS for generation.
+
+    make_collate always terminates the prefix with EOS (train layout
+    [user][answer][EOS]); generating after an EOS yields empty output.
+    Other batch keys pass through untouched. No EOS → full length.
+    """
+    ids = batch["input_ids"][0]
+    hits = (ids == eos_id).nonzero(as_tuple=False)
+    if len(hits):
+        cut = int(hits[0].item())
+    else:
+        cut = int(batch["attention_mask"].sum().item())
+    gen_batch = {
+        k: (v[:, :cut] if k in ("input_ids", "attention_mask") else v)
+        for k, v in batch.items()
+    }
+    return gen_batch, cut
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt", default="logs/checkpoints/projector_step200.pt", help="projector checkpoint")
@@ -103,9 +123,11 @@ def main():
 
     print(f"\nPrompt: {args.prompt!r}")
     print("Generating (Qwen embeds_for, not DeepSeek hook)...")
-    inp = embeds_for(model, batch, proj, str(device))
+    gen_batch, cut = strip_trailing_eos(batch, tok.eos_token_id)
+    print(f"prefix cut at {cut} (was {batch['input_ids'].shape[1]}) — EOS-terminated train layout would generate empty")
+    inp = embeds_for(model, gen_batch, proj, str(device))
     out_ids = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=args.max_new, do_sample=False, pad_token_id=tok.pad_token_id)
-    gen = tok.decode(out_ids[0][batch["input_ids"].shape[1]:], skip_special_tokens=True)
+    gen = tok.decode(out_ids[0][cut:], skip_special_tokens=True)
     print(f"\n=== {Path(args.ckpt).name} ===")
     print(f"Gen: {gen!r}")
 

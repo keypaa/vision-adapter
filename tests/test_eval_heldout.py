@@ -38,6 +38,30 @@ def test_forward_loss_deterministic():
     assert forward_loss(model, proj, batch, "cpu") == forward_loss(model, proj, batch, "cpu")
 
 
+def test_strip_trailing_eos_cuts_prefix_before_eos():
+    from scripts.colab_unsloth_test import strip_trailing_eos
+
+    # ids: [BOS?, img pad.., user.., EOS, pad..] — pad distinct from EOS here
+    ids = torch.tensor([[1, 7, 7, 5, 6, 2, 0, 0]])
+    attn = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
+    batch = {"input_ids": ids, "attention_mask": attn, "n_vis": torch.tensor([2])}
+    gen_batch, cut = strip_trailing_eos(batch, eos_id=2)
+    assert cut == 5
+    assert gen_batch["input_ids"].shape == (1, 5)
+    assert gen_batch["attention_mask"].shape == (1, 5)
+    assert gen_batch["n_vis"].equal(batch["n_vis"])  # untouched keys pass through
+    # Qwen case: pad_id == eos_id → first hit is still the real EOS (answer precedes pad)
+    ids2 = torch.tensor([[1, 7, 5, 2, 2, 2]])
+    batch2 = {"input_ids": ids2, "attention_mask": torch.ones(1, 6, dtype=torch.long)}
+    _, cut2 = strip_trailing_eos(batch2, eos_id=2)
+    assert cut2 == 3
+    # no EOS at all → keep full length
+    ids3 = torch.tensor([[1, 7, 5, 6]])
+    batch3 = {"input_ids": ids3, "attention_mask": torch.ones(1, 4, dtype=torch.long)}
+    _, cut3 = strip_trailing_eos(batch3, eos_id=2)
+    assert cut3 == 4
+
+
 def test_select_heldout_rows_only_excluded_shards():
     from scripts.eval_heldout import select_heldout_rows
 
