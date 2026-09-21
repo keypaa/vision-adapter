@@ -104,6 +104,38 @@ def test_manual_generate_mechanics_cpu():
     assert len(card1) == 5
 
 
+def test_score_text_nll_structure_and_sensitivity():
+    from scripts.eval_heldout import score_text_nll
+
+    torch.manual_seed(0)
+    model = _tiny_qwen()
+    proj = HourglassProjector(4096, 32)
+    vis_a = torch.randn(6, 4096)
+    vis_b = torch.randn(6, 4096)
+    user, assistant = "u test", "a answer here"
+    tok = _stub_tok()
+    nll_same = score_text_nll(model, proj, vis_a, user, assistant, tok, "cpu")
+    nll_same2 = score_text_nll(model, proj, vis_a, user, assistant, tok, "cpu")
+    nll_swap = score_text_nll(model, proj, vis_b, user, assistant, tok, "cpu")
+    assert nll_same == nll_same2  # deterministic
+    assert nll_same > 0 and nll_swap > 0  # finite positive NLLs
+    assert nll_same != nll_swap  # vis actually conditions the score
+
+
+def test_discrimination_pairs_cover_rows():
+    from scripts.eval_heldout import discrimination_pairs
+
+    rows = [{"emb": f"e{i}"} for i in range(5)]
+    pairs = discrimination_pairs(rows)
+    assert pairs == [(rows[0], rows[1]), (rows[2], rows[3])]  # leftover dropped
+
+
+def _stub_tok():
+    from tests.test_adaptive_ckpt import StubTok
+
+    return StubTok()
+
+
 def test_select_heldout_rows_only_excluded_shards():
     from scripts.eval_heldout import select_heldout_rows
 

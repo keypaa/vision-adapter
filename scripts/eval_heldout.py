@@ -82,6 +82,67 @@ def _load_backbone(device, dtype_arg="auto"):
     return tok, model, dtype
 
 
+def score_text_nll(model, proj, vis, user, assistant, tok, device, max_len=4096):
+    """Teacher-forced NLL of one (image, user, assistant) triple. No sampling."""
+    from vision_adapter.core import make_collate
+
+    coll = make_collate(tok, tok.pad_token_id, max_len=max_len, vision_dim=4096)
+    batch = coll([{"vis": vis, "user": user, "assistant": assistant, "g": "eval"}])
+    loss, _ = forward_loss(model, proj, batch, device)
+    return loss
+
+
+def discrimination_pairs(rows):
+    """Non-overlapping consecutive pairs; leftover row dropped."""
+    return [(rows[i], rows[i + 1]) for i in range(0, len(rows) - 1, 2)]
+
+
+def _run_discrimination(model, tok, ds, args, llm_dim, dtype, device, data_dir, final_path):
+    """Own-vs-swapped NLL on held-out rows (final ckpt only).
+
+    acc_img (same text, own vs swapped image) isolates vision: text priors
+    cancel. acc_txt (same image, own vs swapped text) is reported as sanity.
+    Rows with n_vis>2000 skipped (VRAM cap, documented).
+    """
+    from vision_adapter.core import build_projector
+
+    sd = torch.load(final_path, map_location=device, weights_only=False)
+    proj = build_projector(4096, llm_dim, variant=args.variant_final).to(
+        device, dtype=dtype if dtype != torch.float16 else torch.float32)
+    proj.load_state_dict(sd.get("proj", sd))
+    proj.eval()
+    items, skipped = [], 0
+    for it in ds:
+        if int(it["vis"].shape[0]) > 2000:
+            skipped += 1
+            continue
+        items.append(it)
+        if len(items) >= 2 * args.n:
+            break
+    pairs = discrimination_pairs(items)
+    print(f"[eval] {len(pairs)} pairs ({len(items)} rows, {skipped} monsters skipped)", flush=True)
+    assert pairs, "no pairs collected — held-out shards unreachable?"
+    img_wins = img_trials = txt_wins = txt_trials = 0
+    m_img = m_txt = 0.0
+    for a, b in pairs:
+        s_aa = score_text_nll(model, proj, a["vis"], a["user"], a["assistant"], tok, device)
+        s_ab = score_text_nll(model, proj, b["vis"], a["user"], a["assistant"], tok, device)
+        s_bb = score_text_nll(model, proj, b["vis"], b["user"], b["assistant"], tok, device)
+        s_ba = score_text_nll(model, proj, a["vis"], b["user"], b["assistant"], tok, device)
+        img_wins += (s_aa < s_ab) + (s_bb < s_ba)
+        img_trials += 2
+        m_img += (s_ab - s_aa) + (s_ba - s_bb)
+        txt_wins += (s_aa < s_ba) + (s_bb < s_ab)
+        txt_trials += 2
+        m_txt += (s_ba - s_aa) + (s_ab - s_bb)
+    out = {"pairs": len(pairs), "skipped_monsters": skipped,
+           "acc_img": img_wins / img_trials, "margin_img": m_img / img_trials,
+           "acc_txt": txt_wins / txt_trials, "margin_txt": m_txt / txt_trials,
+           "gate_img_60pct": bool(img_wins / img_trials >= 0.60)}
+    (data_dir / "eval_discrimination.json").write_text(json.dumps(out, indent=2))
+    print(json.dumps(out, indent=2), flush=True)
+
+
 def _resolve_ckpt(local: str | None, repo: str, name: str) -> str:
     """Local ckpt path wins (diag ckpts never pushed); else HF download."""
     if local and Path(local).is_file():
@@ -100,7 +161,10 @@ def main():
     ap.add_argument("--local-base", default=None, help="local ckpt path (preferred over HF)")
     ap.add_argument("--variant-final", default=None, help="hourglass|scaled (default: env)")
     ap.add_argument("--variant-base", default=None, help="hourglass|scaled (default: env)")
-    ap.add_argument("--n", type=int, default=60)
+    ap.add_argument("--mode", choices=("loss", "discrimination"), default="loss",
+                    help="loss: mean NLL base vs final; discrimination: own-vs-swapped image/text NLL (final only)")
+    ap.add_argument("--n", type=int, default=60,
+                    help="loss: rows; discrimination: pairs (2 rows each, n_vis<=2000, monsters skipped)")
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--dtype", default="auto")
@@ -118,9 +182,12 @@ def main():
     data_dir = Path(args.data_dir)
     cache_dir = data_dir / "cache"
 
-    print(f"[eval] resolving {args.ckpt_final} + {args.ckpt_base} (local preferred)", flush=True)
+    print(f"[eval] resolving final {args.ckpt_final} (local preferred)", flush=True)
     final_path = _resolve_ckpt(args.local_final, args.ckpt_repo, args.ckpt_final)
-    base_path = _resolve_ckpt(args.local_base, args.ckpt_repo, args.ckpt_base)
+    base_path = None
+    if args.mode == "loss":
+        print(f"[eval] resolving base {args.ckpt_base} (local preferred)", flush=True)
+        base_path = _resolve_ckpt(args.local_base, args.ckpt_repo, args.ckpt_base)
 
     print("[eval] loading backbone", flush=True)
     tok, model, dtype = _load_backbone(device, args.dtype)
@@ -139,6 +206,11 @@ def main():
     collate = make_collate(tok, tok.pad_token_id, max_len=4096, vision_dim=4096)
     ds = EmbStreamDataset(plan, order, rg_cache_dir=str(cache_dir / "rg_cache"))
     loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, drop_last=False, collate_fn=collate, num_workers=0)
+
+    if args.mode == "discrimination":
+        _run_discrimination(model, tok, ds, args, llm_dim, dtype, device, data_dir,
+                            final_path)
+        return
 
     results = {}
     variants = {"base": args.variant_base, "final": args.variant_final}
