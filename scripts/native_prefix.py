@@ -74,6 +74,72 @@ def placeholder_count(grid_thw_row: torch.Tensor, merge_size: int = 2) -> int:
     return int(torch.prod(torch.as_tensor(grid_thw_row)).item()) // (merge_size**2)
 
 
+def grid_for_nvis(n_vis: int, merge_size: int = 2) -> torch.Tensor:
+    """Synthetic ``(t, h, w)`` grid whose placeholder count reconstructs ``n_vis``.
+
+    Eval-sanity helper (the MoonViT pack grid is a different geometry): picks
+    the squarest even ``(h, w)`` with ``h*w == n_vis*merge_size**2``,
+    falling back to ``(2, total//2)`` (always even since ``total`` is a
+    multiple of 4). Deterministic.
+    """
+    import math
+
+    total = int(n_vis) * merge_size**2
+    h = w = None
+    d = math.isqrt(total)
+    while d >= 2:
+        if total % d == 0:
+            hh, ww = d, total // d
+            if hh % 2 == 0 and ww % 2 == 0:
+                h, w = hh, ww
+                break
+        d -= 1
+    if h is None:
+        h, w = 2, total // 2
+    return torch.tensor([1, h, w], dtype=torch.long)
+
+
+def build_native_generate_inputs(model, proj, batch: dict, tokenizer, grid_thw: torch.Tensor,
+                                 device: str, merge_size: int = 2) -> dict:
+    """Generate-ready native-protocol inputs with OUR projector outputs scattered.
+
+    Replicates what ``Qwen3_5Model.forward`` does natively
+    (``masked_scatter`` at the placeholder mask) but with our projector
+    instead of the native vision encoder: embed-table base + projector
+    outputs at ``input_ids == image_token_id`` positions, plus ``mm`` ids,
+    ``image_grid_thw`` and mRoPE ``position_ids`` for the generate call.
+    No-grad (eval). Cache continuation inside ``generate`` stays
+    MOLAB-VERIFIED (NEXT-1) — CPU pins the contract, GPU proves behavior.
+    """
+    native = build_native_prefix(batch, tokenizer, grid_thw, merge_size)
+    image_id = int(getattr(tokenizer, "image_token_id", IMAGE_TOKEN_ID))
+    ids = native["input_ids"].to(device)
+    attn = native["attention_mask"].to(device)
+    mm = native["mm_token_type_ids"].to(device)
+    pos = native["position_ids"].to(device)
+    table = model.get_input_embeddings()
+    out_dtype = next(model.parameters()).dtype
+    proj_dtype = next(proj.parameters()).dtype
+    with torch.no_grad():
+        base = table(ids).to(out_dtype)
+        vis = batch["vis"].to(device).to(proj_dtype)
+        pv = proj(vis).to(out_dtype)
+        merged = base.clone()
+        n_vis = [int(n) for n in batch["n_vis"].tolist()]
+        for i in range(ids.shape[0]):
+            hits = (ids[i] == image_id).nonzero(as_tuple=False).squeeze(-1)
+            nv = n_vis[i]
+            assert int(hits.numel()) == nv, f"row {i}: {int(hits.numel())} pads != n_vis {nv}"
+            merged[i, hits] = pv[i, :nv]
+    return {
+        "inputs_embeds": merged,
+        "attention_mask": attn,
+        "mm_token_type_ids": mm,
+        "image_grid_thw": native["image_grid_thw"].to(device),
+        "position_ids": pos,
+    }
+
+
 def _vision_position_ids(
     start: int, grid_thw_row: torch.Tensor, spatial_merge_size: int = 2
 ) -> torch.Tensor:

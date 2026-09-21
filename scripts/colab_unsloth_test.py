@@ -71,6 +71,8 @@ def main():
     ap.add_argument("--gen-mode", choices=("greedy", "card"), default="card")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--debug-ids", action="store_true", help="print raw generated ids + text-only control")
+    ap.add_argument("--prefix-mode", choices=("legacy", "native"), default="legacy",
+                    help="legacy: raw embeds_for splice; native: creator protocol (placeholders+mm+mRoPE)")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -143,11 +145,24 @@ def main():
 
     print(f"\nPrompt: {args.prompt!r}")
     print("Generating (Qwen embeds_for, not DeepSeek hook)...")
-    gen_batch, cut = strip_trailing_eos(batch, tok.eos_token_id)
-    print(f"prefix cut at {cut} (was {batch['input_ids'].shape[1]}) — EOS-terminated train layout would generate empty")
-    inp = embeds_for(model, gen_batch, proj, str(device))
+    extra_kwargs: dict = {}
+    if args.prefix_mode == "native":
+        from scripts.native_prefix import build_native_generate_inputs, grid_for_nvis
+
+        grid = torch.stack([grid_for_nvis(int(n)) for n in batch["n_vis"].tolist()])
+        print(f"native grid (synthetic, N==n_vis): {grid.tolist()}")
+        nin = build_native_generate_inputs(model, proj, batch, tok, grid, str(device))
+        inp = {"inputs_embeds": nin["inputs_embeds"], "attention_mask": nin["attention_mask"]}
+        extra_kwargs = {"mm_token_type_ids": nin["mm_token_type_ids"],
+                        "image_grid_thw": nin["image_grid_thw"], "position_ids": nin["position_ids"]}
+        cut = int(nin["attention_mask"][0].sum().item())
+        print(f"native prefix live={cut} mm1={(nin['mm_token_type_ids'] == 1).sum().item()} pos={tuple(nin['position_ids'].shape)}")
+    else:
+        gen_batch, cut = strip_trailing_eos(batch, tok.eos_token_id)
+        print(f"prefix cut at {cut} (was {batch['input_ids'].shape[1]}) — EOS-terminated train layout would generate empty")
+        inp = embeds_for(model, gen_batch, proj, str(device))
     torch.manual_seed(args.seed)
-    out_ids = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=args.max_new, pad_token_id=tok.pad_token_id, **build_gen_kwargs(args.gen_mode))
+    out_ids = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=args.max_new, pad_token_id=tok.pad_token_id, **extra_kwargs, **build_gen_kwargs(args.gen_mode))
     gen = tok.decode(out_ids[0][cut:], skip_special_tokens=True)
     print(f"\n=== {Path(args.ckpt).name} ===")
     print(f"Gen: {gen!r}")

@@ -147,6 +147,63 @@ def test_grid_vis_mismatch_raises():
     raise AssertionError("grid/vis length mismatch must raise ValueError")
 
 
+def test_grid_for_nvis_reconstructs_n():
+    from scripts.native_prefix import grid_for_nvis, placeholder_count
+
+    for n in (4, 6, 8, 100, 740, 836):
+        g = grid_for_nvis(n, 2)
+        assert g.shape == (3,)
+        assert placeholder_count(g, 2) == n
+    assert torch.equal(grid_for_nvis(740, 2), grid_for_nvis(740, 2))
+
+
+class SmallNativeTok(NativeTok):
+    """Same contract, small ids: the tiny test model only has 256 embeddings."""
+
+    image_token_id = 200
+    vision_start_token_id = 201
+    vision_end_token_id = 202
+
+
+def test_build_native_generate_inputs_scatters_proj_outputs():
+    from scripts.native_prefix import build_native_generate_inputs
+    from vision_adapter.core import HourglassProjector
+
+    torch.manual_seed(0)
+    model = _tiny_qwen()
+    proj = HourglassProjector(4096, 32).to(torch.float32)
+    batch, tok = _native_batch([4, 8], tok=SmallNativeTok())
+    small = {"image": 200, "start": 201, "end": 202}
+    grids = _grids_for([4, 8])
+    out1 = build_native_generate_inputs(model, proj, batch, tok, grids, "cpu")
+    out2 = build_native_generate_inputs(model, proj, batch, tok, grids, "cpu")
+    for k in ("inputs_embeds", "attention_mask", "mm_token_type_ids", "image_grid_thw", "position_ids"):
+        assert k in out1
+        assert torch.equal(out1[k], out2[k]), f"{k} must be deterministic"
+    B, Lp, H = out1["inputs_embeds"].shape
+    assert (B, Lp) == out1["attention_mask"].shape == out1["mm_token_type_ids"].shape
+    assert out_pos_shape(out1) == (3, B, Lp)
+    assert not bool(torch.isnan(out1["inputs_embeds"]).any())
+    # scatter positions carry the projector output, text positions the table embedding
+    table = model.get_input_embeddings()
+    native_ids = build_native_prefix(batch, tok, grids)["input_ids"]
+    with torch.no_grad():
+        pv = proj(batch["vis"].to(torch.float32))
+    for i, nv in enumerate([4, 8]):
+        hits = (native_ids[i] == small["image"]).nonzero(as_tuple=False).squeeze(-1)
+        assert len(hits) == nv
+        assert torch.allclose(out1["inputs_embeds"][i, hits], pv[i, :nv].to(out1["inputs_embeds"].dtype), atol=1e-6)
+        text_pos = (native_ids[i] != small["image"]) & (native_ids[i] != small["start"]) & (native_ids[i] != small["end"])
+        text_pos = text_pos & (out1["attention_mask"][i].bool())
+        assert torch.allclose(out1["inputs_embeds"][i][text_pos],
+                              table(native_ids[i][text_pos].unsqueeze(0)).squeeze(0).to(out1["inputs_embeds"].dtype),
+                              atol=1e-6)
+
+
+def out_pos_shape(out):
+    return tuple(out["position_ids"].shape)
+
+
 def test_training_path_untouched():
     import pathlib
 
