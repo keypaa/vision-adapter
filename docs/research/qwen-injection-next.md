@@ -22,6 +22,13 @@ Rerun `eval_heldout.py --n 200` + patch groupement (10 lignes) : par `g`,
 par bucket `n_vis`, par longueur de réponse + contrôle `vis` permutés.
 Tranche U2 : vision vs shortcut.
 
+## NEXT-5. Tête normalisée + diag court (1 session Molab ≤ 1h)
+Variante A : LayerNorm finale × RMS table mesuré (cible ~0.02, constante
+documentée) — déterministe, pas d’échelle ré-apprenable qui re-explose.
+Diag 200-400 steps pires shards + gate : normes saines (rms visuel ≈ table
+×0.5-2), held-out vs baseline, génération non-vide. Si vert → refactor
+d’architecture acté (MODE E-lite) avant tout run long.
+
 ## NEXT-4. Micro-bench unifié transfer + attention (1 session Molab)
 `hf_transfer` vs Range (MiB/s, retries) + apportionnement par type de couche
 sur backbone chargé une fois. Kill criteria NEXT_STEPS §3 avant tout code Flex.
