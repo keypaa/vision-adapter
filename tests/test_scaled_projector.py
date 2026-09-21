@@ -14,8 +14,17 @@ from tests.test_adaptive_ckpt import _batch, _tiny_qwen
 from vision_adapter.core import HourglassProjector, build_projector
 
 
-def test_builder_defaults_to_hourglass(monkeypatch):
+def test_builder_defaults_to_scaled(monkeypatch):
+    from vision_adapter.core import ScaledHourglassProjector
+
     monkeypatch.delenv("VISION_ADAPTER_PROJECTOR", raising=False)
+    proj = build_projector(4096, 32)
+    assert isinstance(proj, ScaledHourglassProjector)
+    assert float(proj.target_rms) == pytest.approx(0.02)
+
+
+def test_builder_hourglass_opt_out(monkeypatch):
+    monkeypatch.setenv("VISION_ADAPTER_PROJECTOR", "hourglass")
     assert type(build_projector(4096, 32)).__name__ == "HourglassProjector"
 
 
@@ -80,7 +89,7 @@ def test_builder_explicit_variant_overrides_env(monkeypatch):
     assert isinstance(build_projector(4096, 32, variant="hourglass"), HourglassProjector)
     assert isinstance(build_projector(4096, 32, variant="scaled", target_rms=0.05), ScaledHourglassProjector)
     monkeypatch.delenv("VISION_ADAPTER_PROJECTOR", raising=False)
-    assert isinstance(build_projector(4096, 32), HourglassProjector)
+    assert isinstance(build_projector(4096, 32), ScaledHourglassProjector)
 
 
 def test_resolve_ckpt_prefers_local_path(tmp_path):

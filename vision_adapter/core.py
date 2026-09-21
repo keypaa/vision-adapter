@@ -78,7 +78,7 @@ def build_projector(vision_dim: int = 4096, llm_dim: int = 2048, variant: str | 
     import os
 
     if variant is None:
-        variant = os.environ.get("VISION_ADAPTER_PROJECTOR", "hourglass")
+        variant = os.environ.get("VISION_ADAPTER_PROJECTOR", "scaled")
     if variant == "scaled":
         if target_rms is None:
             try:
