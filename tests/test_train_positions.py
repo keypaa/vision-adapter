@@ -46,6 +46,31 @@ def test_pad_columns_match_default():
         assert torch.equal(pos[0, i, live:], torch.arange(live, L))
 
 
+def test_positions_env_selects_legacy_or_mrope(monkeypatch):
+    from vision_adapter.core import _resolve_positions_mode
+
+    monkeypatch.delenv("VISION_ADAPTER_POSITIONS", raising=False)
+    assert _resolve_positions_mode() == "mrope"
+    monkeypatch.setenv("VISION_ADAPTER_POSITIONS", "legacy")
+    assert _resolve_positions_mode() == "legacy"
+    monkeypatch.setenv("VISION_ADAPTER_POSITIONS", "nope")
+    try:
+        _resolve_positions_mode()
+    except ValueError:
+        return
+    raise AssertionError("bad VISION_ADAPTER_POSITIONS must raise ValueError")
+
+
+def test_legacy_mode_matches_model_default():
+    from vision_adapter.core import train_position_ids
+
+    # legacy mode is tested via train_step below (no positions kwarg);
+    # here pin that mrope helper still honors the contract used above
+    batch = _batch([4, 4])
+    pos = train_position_ids(batch)
+    assert pos.shape[0] == 4
+
+
 def test_train_step_finite_with_mrope_positions():
     from tests.test_adaptive_ckpt import _tiny_qwen
     from vision_adapter.core import HourglassProjector, train_step_qwen

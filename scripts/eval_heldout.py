@@ -36,19 +36,22 @@ def forward_loss(model, proj, batch, device):
     exactly (same embeds_for splice AND same mRoPE train_position_ids)."""
     import torch.nn.functional as F
 
-    from vision_adapter.core import embeds_for, train_position_ids
+    from vision_adapter.core import _resolve_positions_mode, embeds_for, train_position_ids
 
     prev = model.training
     model.eval()
     try:
         with torch.no_grad():
             inp = embeds_for(model, batch, proj, device)
-            pos = train_position_ids(batch).to(inp["inputs_embeds"].device)
             out_dtype = next(model.parameters()).dtype
             amp_dtype = out_dtype if device == "cuda" else None
             with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-                out = model.model(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
-                                  position_ids=pos)
+                if _resolve_positions_mode() == "mrope":
+                    pos = train_position_ids(batch).to(inp["inputs_embeds"].device)
+                    out = model.model(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
+                                      position_ids=pos)
+                else:
+                    out = model.model(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"])
                 hidden = out.last_hidden_state
                 shift_labels = inp["labels"][:, 1:]
                 mask = shift_labels != -100

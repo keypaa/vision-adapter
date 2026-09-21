@@ -115,6 +115,17 @@ def vision_position_ids(start: int, grid_thw_row: torch.Tensor, spatial_merge_si
     return torch.stack([pos_t, pos_h, pos_w], dim=0).long()
 
 
+def _resolve_positions_mode() -> str:
+    """mrope (default) or legacy model-default positions. Kill-switch for
+    differential experiments (same head, positions as the only variable)."""
+    import os
+
+    mode = os.environ.get("VISION_ADAPTER_POSITIONS", "mrope")
+    if mode not in ("mrope", "legacy"):
+        raise ValueError(f"unknown VISION_ADAPTER_POSITIONS={mode!r} (expected mrope|legacy)")
+    return mode
+
+
 def train_position_ids(batch: dict, merge_size: int = 2) -> torch.Tensor:
     """mRoPE ``(4, B, L)`` positions for the legacy training layout.
 
@@ -758,8 +769,12 @@ def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=N
         labels = inp.pop("labels")
         base = model.model
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-            out = base(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
-                       position_ids=train_position_ids(batch).to(inp["inputs_embeds"].device))
+            if _resolve_positions_mode() == "mrope":
+                mrope_pos = train_position_ids(batch).to(inp["inputs_embeds"].device)
+                out = base(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
+                           position_ids=mrope_pos)
+            else:
+                out = base(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"])
             hidden = out.last_hidden_state
             shift_labels = labels[:, 1:]
             mask = shift_labels != -100
