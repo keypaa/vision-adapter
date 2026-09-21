@@ -246,8 +246,19 @@ def _prefetch_key_spans(url: str, md) -> dict[int, bytes]:
         return {futs[fut]: fut.result() for fut in as_completed(futs)}
 
 
-def _cache_key_index_path(cache_dir: str) -> str:
-    return os.path.join(cache_dir, KEY_INDEX_CACHE)
+def _cache_key_index_path(cache_dir: str, stream_order: list[str] | None = None) -> str:
+    """Cache file for a key index, namespaced by shard set when known.
+
+    A shared filename across different shard sets silently serves the wrong
+    index (eval over 2 shards once loaded a 13-shard training index).
+    """
+    if not stream_order:
+        return os.path.join(cache_dir, KEY_INDEX_CACHE)
+    import hashlib
+
+    digest = hashlib.sha1("\n".join(sorted(stream_order)).encode()).hexdigest()[:12]
+    stem = KEY_INDEX_CACHE.removesuffix(".json")
+    return os.path.join(cache_dir, f"{stem}.{digest}.json")
 
 
 def save_key_index(index: dict[str, tuple[str, int] | tuple[str, int, int]], path: str) -> None:
@@ -437,7 +448,7 @@ def build_key_index(
     """emb key -> (shard_file, global_row_idx), footer+key-chunk only, cached."""
     if cache_dir:
         Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    cache_path = _cache_key_index_path(cache_dir or ".")
+    cache_path = _cache_key_index_path(cache_dir or ".", stream_order)
     if not rebuild:
         hit_t0 = time.time()
         index, ok = load_key_index(cache_path)
