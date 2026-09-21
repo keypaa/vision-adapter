@@ -64,39 +64,13 @@ from __future__ import annotations
 
 import torch
 
+from vision_adapter.core import grid_for_nvis as grid_for_nvis
+from vision_adapter.core import placeholder_count as placeholder_count
+from vision_adapter.core import vision_position_ids as _vision_position_ids
+
 IMAGE_TOKEN_ID = 248056
 VISION_START_ID = 248053
 VISION_END_ID = 248054
-
-
-def placeholder_count(grid_thw_row: torch.Tensor, merge_size: int = 2) -> int:
-    """Placeholders for one image: ``prod(grid_thw) // merge_size**2``."""
-    return int(torch.prod(torch.as_tensor(grid_thw_row)).item()) // (merge_size**2)
-
-
-def grid_for_nvis(n_vis: int, merge_size: int = 2) -> torch.Tensor:
-    """Synthetic ``(t, h, w)`` grid whose placeholder count reconstructs ``n_vis``.
-
-    Eval-sanity helper (the MoonViT pack grid is a different geometry): picks
-    the squarest even ``(h, w)`` with ``h*w == n_vis*merge_size**2``,
-    falling back to ``(2, total//2)`` (always even since ``total`` is a
-    multiple of 4). Deterministic.
-    """
-    import math
-
-    total = int(n_vis) * merge_size**2
-    h = w = None
-    d = math.isqrt(total)
-    while d >= 2:
-        if total % d == 0:
-            hh, ww = d, total // d
-            if hh % 2 == 0 and ww % 2 == 0:
-                h, w = hh, ww
-                break
-        d -= 1
-    if h is None:
-        h, w = 2, total // 2
-    return torch.tensor([1, h, w], dtype=torch.long)
 
 
 def build_native_generate_inputs(model, proj, batch: dict, tokenizer, grid_thw: torch.Tensor,
@@ -138,25 +112,6 @@ def build_native_generate_inputs(model, proj, batch: dict, tokenizer, grid_thw: 
         "image_grid_thw": native["image_grid_thw"].to(device),
         "position_ids": pos,
     }
-
-
-def _vision_position_ids(
-    start: int, grid_thw_row: torch.Tensor, spatial_merge_size: int = 2
-) -> torch.Tensor:
-    """Mirror of ``Qwen3VLModel.get_vision_position_ids`` (temp_merge=1).
-
-    Returns ``(3, N)`` long tensor of (temporal, height, width) indices with
-    the source's repeat pattern (width fastest, then height, then temporal).
-    """
-    t, h, w = (int(v) for v in torch.as_tensor(grid_thw_row).tolist())
-    llm_t, llm_h, llm_w = t, h // spatial_merge_size, w // spatial_merge_size
-    pos_w = torch.arange(llm_w) + start
-    pos_h = torch.arange(llm_h) + start
-    pos_t = torch.arange(llm_t)  # time_interval=1; start added after repeat
-    pos_w = pos_w.repeat(llm_h * llm_t)
-    pos_h = pos_h.repeat_interleave(llm_w).repeat(llm_t)
-    pos_t = pos_t.repeat_interleave(llm_h * llm_w) + start
-    return torch.stack([pos_t, pos_h, pos_w], dim=0).long()
 
 
 def build_native_prefix(

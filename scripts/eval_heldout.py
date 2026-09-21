@@ -32,20 +32,23 @@ def select_heldout_rows(rows, index, heldout_shards=HELDOUT_SHARDS, n=60, seed=0
 
 
 def forward_loss(model, proj, batch, device):
-    """Selective lm_head loss, no backward/step. Mirrors train_step_qwen fwd."""
+    """Selective lm_head loss, no backward/step. Mirrors train_step_qwen fwd
+    exactly (same embeds_for splice AND same mRoPE train_position_ids)."""
     import torch.nn.functional as F
 
-    from vision_adapter.core import embeds_for
+    from vision_adapter.core import embeds_for, train_position_ids
 
     prev = model.training
     model.eval()
     try:
         with torch.no_grad():
             inp = embeds_for(model, batch, proj, device)
+            pos = train_position_ids(batch).to(inp["inputs_embeds"].device)
             out_dtype = next(model.parameters()).dtype
             amp_dtype = out_dtype if device == "cuda" else None
             with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-                out = model.model(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"])
+                out = model.model(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
+                                  position_ids=pos)
                 hidden = out.last_hidden_state
                 shift_labels = inp["labels"][:, 1:]
                 mask = shift_labels != -100

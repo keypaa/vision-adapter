@@ -67,6 +67,79 @@ class ScaledHourglassProjector(nn.Module):
         return self.out_norm(self.base(x)) * float(self.target_rms)
 
 
+def placeholder_count(grid_thw_row: torch.Tensor, merge_size: int = 2) -> int:
+    """Placeholders for one image: ``prod(grid_thw) // merge_size**2``.
+
+    U1 rule, verified against transformers Qwen3-VL processor source
+    (``replace_image_token`` + ``get_image_features`` split sizes,
+    ``merge_size=2`` = ``spatial_merge_size``). Lives here (not in
+    ``scripts/``) so the training path can share the exact contract.
+    """
+    return int(torch.prod(torch.as_tensor(grid_thw_row)).item()) // (merge_size**2)
+
+
+def grid_for_nvis(n_vis: int, merge_size: int = 2) -> torch.Tensor:
+    """Synthetic ``(t, h, w)`` grid whose placeholder count reconstructs ``n_vis``.
+
+    The precomputed parquet stores no MoonViT geometry, so training-time
+    mRoPE uses this deterministic stand-in (squarest even factors, fallback
+    ``(2, total//2)``). Documented approximation, not measured geometry.
+    """
+    import math
+
+    total = int(n_vis) * merge_size**2
+    h = w = None
+    d = math.isqrt(total)
+    while d >= 2:
+        if total % d == 0:
+            hh, ww = d, total // d
+            if hh % 2 == 0 and ww % 2 == 0:
+                h, w = hh, ww
+                break
+        d -= 1
+    if h is None:
+        h, w = 2, total // 2
+    return torch.tensor([1, h, w], dtype=torch.long)
+
+
+def vision_position_ids(start: int, grid_thw_row: torch.Tensor, spatial_merge_size: int = 2) -> torch.Tensor:
+    """Mirror of ``Qwen3VLModel.get_vision_position_ids`` (temp_merge=1).
+
+    Returns ``(3, N)`` (temporal, height, width), width fastest.
+    """
+    t, h, w = (int(v) for v in torch.as_tensor(grid_thw_row).tolist())
+    llm_t, llm_h, llm_w = t, h // spatial_merge_size, w // spatial_merge_size
+    pos_w = (torch.arange(llm_w) + start).repeat(llm_h * llm_t)
+    pos_h = (torch.arange(llm_h) + start).repeat_interleave(llm_w).repeat(llm_t)
+    pos_t = torch.arange(llm_t).repeat_interleave(llm_h * llm_w) + start
+    return torch.stack([pos_t, pos_h, pos_w], dim=0).long()
+
+
+def train_position_ids(batch: dict, merge_size: int = 2) -> torch.Tensor:
+    """mRoPE ``(4, B, L)`` positions for the legacy training layout.
+
+    Row 0 is plain arange (byte-identical to the model default: text behavior
+    unchanged). Rows 1-3 carry mRoPE over the visual span ``[1:1+n_vis]``
+    with a synthetic grid (see ``grid_for_nvis``); pad columns keep arange
+    like the default. ``n_vis=0`` rows skip the vision block.
+    Known limitation (deliberate, minimal deviation): post-vision text keeps
+    default positions instead of continuing from the vision-shifted cursor
+    as native ``get_rope_index`` would. Only the vision span differs from
+    the old behavior.
+    """
+    ids = batch["input_ids"]
+    B, L = ids.shape[:2]
+    n_vis = [int(n) for n in batch["n_vis"].tolist()]
+    pos = torch.arange(L).view(1, 1, -1).expand(4, B, L).clone()
+    for i, nv in enumerate(n_vis):
+        if nv <= 0:
+            continue
+        grid = grid_for_nvis(nv, merge_size)
+        span = vision_position_ids(1, grid, merge_size)
+        pos[1:, i, 1: 1 + nv] = span
+    return pos.long()
+
+
 def build_projector(vision_dim: int = 4096, llm_dim: int = 2048, variant: str | None = None,
                     target_rms: float | None = None):
     """Construct the train/eval projector; env-selected, default unchanged.
@@ -685,7 +758,8 @@ def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=N
         labels = inp.pop("labels")
         base = model.model
         with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-            out = base(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"])
+            out = base(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
+                       position_ids=train_position_ids(batch).to(inp["inputs_embeds"].device))
             hidden = out.last_hidden_state
             shift_labels = labels[:, 1:]
             mask = shift_labels != -100

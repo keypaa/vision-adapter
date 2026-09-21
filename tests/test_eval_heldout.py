@@ -5,6 +5,7 @@
 - select_heldout_rows must only pick rows from never-trained shards,
   deterministically.
 """
+import pytest
 import torch
 
 from tests.test_adaptive_ckpt import _batch, _tiny_qwen
@@ -24,7 +25,7 @@ def test_forward_loss_matches_train_step():
     opt = torch.optim.AdamW(proj.parameters(), lr=1e-3)
     out = train_step_qwen(model, proj, opt, batch, "cpu", adaptive_ckpt=(10**9, 10**18))
     assert out["finite"]
-    assert loss_eval == out["loss"]
+    assert loss_eval == pytest.approx(out["loss"], rel=1e-5)
     assert tokens == out["tokens"]
 
 

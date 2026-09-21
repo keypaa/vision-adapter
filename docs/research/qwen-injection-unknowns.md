@@ -13,9 +13,13 @@ Stratification manquante (par `g`, par `n_vis`, par longueur de réponse) +
 aucun contrôle par permutation (`vis` mélangés, texte fixe). Sans ça,
 shortcut de style/longueur non exclu.
 
-## U3. mRoPE faux : invalide ou atténue ?
-Le probe a appris *malgré* RoPE texte sur le span visuel. On ignore si le
-protocole natif change l’ordre de grandeur du gain ou seulement sa marge.
+## U3. mRoPE faux : invalide ou atténue ? — PARTIELLEMENT LEVÉ (local, CPU)
+`train_position_ids` (4,B,L) : ligne texte = arange (identique au défaut),
+span visuel en mRoPE sur grille synthétique (`grid_for_nvis`, la vraie
+géométrie MoonViT étant perdue dans le parquet). Texte post-visuel et pads
+gardent le défaut par choix minimal (limite documentée dans le docstring).
+Éval alignée (`forward_loss` utilise les mêmes positions). Reste GPU :
+l’effet sur la convergence ne se verra qu’au long run.
 
 ## U4. Cause des 0 token en génération — RÉSOLU (2026-09-21, Molab PRO 6000)
 Sorties projecteur hors-échelle : `vis rms=16.42, absmax=172` vs table
