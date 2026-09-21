@@ -12,7 +12,11 @@ Run in Colab (Runtime -> T4 GPU):
 
 For step10 vs step200 comparison, run twice.
 """
-import argparse, io, json, requests, sys
+import argparse
+import io
+import json
+import requests
+import sys
 from pathlib import Path
 # Colab: repo not installed as package, add parent to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -75,15 +79,18 @@ def main():
     # 3. Qwen + projector
     print("loading Qwen3.5-2B")
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-2B")
-    if tok.pad_token is None: tok.pad_token = tok.eos_token
+    if tok.pad_token is None:
+        tok.pad_token = tok.eos_token
     model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-2B", dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map=str(device))
-    for p in model.parameters(): p.requires_grad_(False)
+    for p in model.parameters():
+        p.requires_grad_(False)
     model.train()
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     cfg_llm = getattr(model.config, "text_config", model.config)
     llm_dim = int(cfg_llm.hidden_size)
 
-    sd = torch.load(args.ckpt, map_location=str(device))
+    # Full-state step ckpts embed optimizer/RNG state (numpy) — trusted source (own run), same as train.py resume.
+    sd = torch.load(args.ckpt, map_location=str(device), weights_only=False)
     state = sd.get("proj", sd)
     proj = HourglassProjector(4096, llm_dim).to(str(device), dtype=torch.bfloat16)
     proj.load_state_dict(state)
