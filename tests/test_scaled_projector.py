@@ -73,6 +73,24 @@ def test_train_step_finite_with_scaled_head():
     assert out["finite"]
 
 
+def test_builder_explicit_variant_overrides_env(monkeypatch):
+    from vision_adapter.core import HourglassProjector, ScaledHourglassProjector, build_projector
+
+    monkeypatch.setenv("VISION_ADAPTER_PROJECTOR", "scaled")
+    assert isinstance(build_projector(4096, 32, variant="hourglass"), HourglassProjector)
+    assert isinstance(build_projector(4096, 32, variant="scaled", target_rms=0.05), ScaledHourglassProjector)
+    monkeypatch.delenv("VISION_ADAPTER_PROJECTOR", raising=False)
+    assert isinstance(build_projector(4096, 32), HourglassProjector)
+
+
+def test_resolve_ckpt_prefers_local_path(tmp_path):
+    from scripts.eval_heldout import _resolve_ckpt
+
+    local = tmp_path / "proj.pt"
+    local.write_bytes(b"fake")
+    assert _resolve_ckpt(str(local), "repo", "remote.pt") == str(local)
+
+
 def test_streaming_train_uses_builder():
     import pathlib
 

@@ -67,19 +67,27 @@ class ScaledHourglassProjector(nn.Module):
         return self.out_norm(self.base(x)) * float(self.target_rms)
 
 
-def build_projector(vision_dim: int = 4096, llm_dim: int = 2048):
-    """Construct the train/eval projector; env-selected, default unchanged."""
+def build_projector(vision_dim: int = 4096, llm_dim: int = 2048, variant: str | None = None,
+                    target_rms: float | None = None):
+    """Construct the train/eval projector; env-selected, default unchanged.
+
+    Explicit ``variant``/``target_rms`` override the
+    ``VISION_ADAPTER_PROJECTOR``/``VISION_ADAPTER_PROJECTOR_RMS`` env knobs
+    (used by eval when two ckpts need different variants in one run).
+    """
     import os
 
-    variant = os.environ.get("VISION_ADAPTER_PROJECTOR", "hourglass")
+    if variant is None:
+        variant = os.environ.get("VISION_ADAPTER_PROJECTOR", "hourglass")
     if variant == "scaled":
-        try:
-            rms = float(os.environ.get("VISION_ADAPTER_PROJECTOR_RMS", "0.02"))
-        except ValueError:
-            rms = 0.02
-        return ScaledHourglassProjector(vision_dim, llm_dim, rms)
+        if target_rms is None:
+            try:
+                target_rms = float(os.environ.get("VISION_ADAPTER_PROJECTOR_RMS", "0.02"))
+            except ValueError:
+                target_rms = 0.02
+        return ScaledHourglassProjector(vision_dim, llm_dim, float(target_rms))
     if variant != "hourglass":
-        raise ValueError(f"unknown VISION_ADAPTER_PROJECTOR={variant!r} (expected hourglass|scaled)")
+        raise ValueError(f"unknown projector variant={variant!r} (expected hourglass|scaled)")
     return HourglassProjector(vision_dim, llm_dim)
 
 

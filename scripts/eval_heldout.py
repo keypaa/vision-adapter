@@ -82,18 +82,29 @@ def _load_backbone(device, dtype_arg="auto"):
     return tok, model, dtype
 
 
+def _resolve_ckpt(local: str | None, repo: str, name: str) -> str:
+    """Local ckpt path wins (diag ckpts never pushed); else HF download."""
+    if local and Path(local).is_file():
+        return local
+    from huggingface_hub import hf_hub_download
+
+    return hf_hub_download(repo, name, repo_type="model")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--ckpt-repo", default="keypa/vision-adapter-probe-checkpoints")
     ap.add_argument("--ckpt-final", default="projector_final_4000.pt")
     ap.add_argument("--ckpt-base", default="projector_step400.pt")
+    ap.add_argument("--local-final", default=None, help="local ckpt path (preferred over HF)")
+    ap.add_argument("--local-base", default=None, help="local ckpt path (preferred over HF)")
+    ap.add_argument("--variant-final", default=None, help="hourglass|scaled (default: env)")
+    ap.add_argument("--variant-base", default=None, help="hourglass|scaled (default: env)")
     ap.add_argument("--n", type=int, default=60)
     ap.add_argument("--batch-size", type=int, default=8)
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--dtype", default="auto")
     args = ap.parse_args()
-
-    from huggingface_hub import hf_hub_download
 
     from vision_adapter.core import build_projector, make_collate
     from vision_adapter.data.stream import (
@@ -107,9 +118,9 @@ def main():
     data_dir = Path(args.data_dir)
     cache_dir = data_dir / "cache"
 
-    print(f"[eval] downloading {args.ckpt_final} + {args.ckpt_base} from {args.ckpt_repo}", flush=True)
-    final_path = hf_hub_download(args.ckpt_repo, args.ckpt_final, repo_type="model")
-    base_path = hf_hub_download(args.ckpt_repo, args.ckpt_base, repo_type="model")
+    print(f"[eval] resolving {args.ckpt_final} + {args.ckpt_base} (local preferred)", flush=True)
+    final_path = _resolve_ckpt(args.local_final, args.ckpt_repo, args.ckpt_final)
+    base_path = _resolve_ckpt(args.local_base, args.ckpt_repo, args.ckpt_base)
 
     print("[eval] loading backbone", flush=True)
     tok, model, dtype = _load_backbone(device, args.dtype)
@@ -130,9 +141,11 @@ def main():
     loader = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, drop_last=False, collate_fn=collate, num_workers=0)
 
     results = {}
+    variants = {"base": args.variant_base, "final": args.variant_final}
     for name, path in (("base", base_path), ("final", final_path)):
         sd = torch.load(path, map_location=device, weights_only=False)
-        proj = build_projector(4096, llm_dim).to(device, dtype=dtype if dtype != torch.float16 else torch.float32)
+        proj = build_projector(4096, llm_dim, variant=variants[name]).to(
+            device, dtype=dtype if dtype != torch.float16 else torch.float32)
         proj.load_state_dict(sd.get("proj", sd))
         proj.eval()
         losses, tokens = [], 0
