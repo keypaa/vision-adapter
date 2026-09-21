@@ -661,6 +661,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     llm_dim = int(cfg_llm.hidden_size)
     proj_dtype = _torch.float32 if (dev=="cuda" and dtype==_torch.float16) else dtype
     proj = build_projector(cfg.vision_dim, llm_dim).to(dev, dtype=proj_dtype)
+    _rms = getattr(getattr(proj, "target_rms", None), "item", lambda: None)()
+    print(f"[train] projector: {type(proj).__name__}" + (f" target_rms={_rms}" if _rms is not None else ""), flush=True)
     for pa in proj.parameters():
         pa.requires_grad_(True)
     opt = _torch.optim.AdamW(proj.parameters(), lr=cfg.lr, betas=(0.9,0.95))
