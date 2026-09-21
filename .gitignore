@@ -14,3 +14,5 @@ probe_log*.jsonl
 runs.jsonl
 runs*.jsonl
 session-export-*.jsonl
+checkpoints/
+logs/

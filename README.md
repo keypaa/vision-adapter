@@ -70,7 +70,7 @@ python -m vision_adapter probe --data-dir ./data                  # alias for tr
 ## Tests
 
 ```bash
-python -m pytest -q  # 61 tests: preprocess, pack/resume, collate/inject, telemetry, backends, cli, dataset, docs lint
+python -m pytest -q  # 109 tests: preprocess, pack/resume, collate/inject, telemetry, backends, cli, dataset, docs lint
 ```
 
 `testpaths = ["tests"]` in `pyproject.toml`; console script `vision-adapter` (`vision_adapter.cli:main`) installed via `pip install -e .`.
