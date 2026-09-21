@@ -28,6 +28,19 @@ from vision_adapter.models.moonvit import load_moonvit_from_safetensors
 from vision_adapter.models.preprocess import collate_images
 from vision_adapter.core import HourglassProjector, make_collate, embeds_for
 
+def build_gen_kwargs(mode):
+    """Sampling params per Qwen3.5 model card (non-thinking VL recipe).
+
+    Greedy (do_sample=False) collapses to immediate EOS on this
+    post-trained model; the card prescribes sampling for VL tasks.
+    """
+    if mode == "greedy":
+        return {"do_sample": False}
+    if mode == "card":
+        return {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "top_k": 20}
+    raise ValueError(f"unknown gen mode {mode!r} (expected greedy|card)")
+
+
 def strip_trailing_eos(batch, eos_id):
     """Cut input_ids/attention_mask before the first EOS for generation.
 
@@ -55,6 +68,8 @@ def main():
     ap.add_argument("--url", default="https://unsloth.ai/cgi/image/unsloth_new_wb_logo_vnrA8AASj-jN5wy8UIYE-.png?format=raw", help="image URL (si --image non donné)")
     ap.add_argument("--image", default=None, help="chemin local image uploadée (ex: /content/image.png) — prioritaire sur --url")
     ap.add_argument("--max_new", type=int, default=64)
+    ap.add_argument("--gen-mode", choices=("greedy", "card"), default="card")
+    ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -126,7 +141,8 @@ def main():
     gen_batch, cut = strip_trailing_eos(batch, tok.eos_token_id)
     print(f"prefix cut at {cut} (was {batch['input_ids'].shape[1]}) — EOS-terminated train layout would generate empty")
     inp = embeds_for(model, gen_batch, proj, str(device))
-    out_ids = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=args.max_new, do_sample=False, pad_token_id=tok.pad_token_id)
+    torch.manual_seed(args.seed)
+    out_ids = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=args.max_new, pad_token_id=tok.pad_token_id, **build_gen_kwargs(args.gen_mode))
     gen = tok.decode(out_ids[0][cut:], skip_special_tokens=True)
     print(f"\n=== {Path(args.ckpt).name} ===")
     print(f"Gen: {gen!r}")

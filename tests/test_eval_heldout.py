@@ -62,6 +62,16 @@ def test_strip_trailing_eos_cuts_prefix_before_eos():
     assert cut3 == 4
 
 
+def test_gen_kwargs_card_matches_model_card_vl_recipe():
+    from scripts.colab_unsloth_test import build_gen_kwargs
+
+    greedy = build_gen_kwargs("greedy")
+    assert greedy == {"do_sample": False}
+    card = build_gen_kwargs("card")
+    # Qwen3.5 model-card recipe, non-thinking VL tasks
+    assert card == {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "top_k": 20}
+
+
 def test_select_heldout_rows_only_excluded_shards():
     from scripts.eval_heldout import select_heldout_rows
 
