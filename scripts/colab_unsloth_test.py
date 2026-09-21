@@ -154,6 +154,18 @@ def main():
     if args.debug_ids:
         new_ids = out_ids[0][cut:].tolist()
         print(f"DEBUG new_tokens={len(new_ids)} ids={new_ids[:20]}")
+        print(f"DEBUG embeds dtype={inp['inputs_embeds'].dtype} shape={tuple(inp['inputs_embeds'].shape)} "
+              f"has_nan={bool(torch.isnan(inp['inputs_embeds']).any())} "
+              f"has_inf={bool(torch.isinf(inp['inputs_embeds']).any())} "
+              f"mask_sum={int(inp['attention_mask'].sum())}")
+        # Run B: same prefix, no KV-cache (isolates cache/MTP interaction with inputs_embeds).
+        torch.manual_seed(args.seed)
+        out_nocache = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
+                                     max_new_tokens=args.max_new, pad_token_id=tok.pad_token_id,
+                                     use_cache=False, **build_gen_kwargs(args.gen_mode))
+        nc_new = out_nocache[0][cut:].tolist()
+        print(f"DEBUG nocache new_tokens={len(nc_new)} ids={nc_new[:20]}")
+        print(f"DEBUG nocache Gen: {tok.decode(nc_new, skip_special_tokens=True)!r}")
         # Text-only control: same model+sampling, no visual injection.
         # Empty here too => generate path broken; non-empty => image conditioning issue.
         t = tok(args.prompt, return_tensors="pt").to(str(device))
