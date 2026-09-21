@@ -202,6 +202,18 @@ def main():
         t_new = t_out[0][t["input_ids"].shape[1]:].tolist()
         print(f"DEBUG text-only new_tokens={len(t_new)} ids={t_new[:20]}")
         print(f"DEBUG text-only Gen: {tok.decode(t_new, skip_special_tokens=True)!r}")
+        # Embeds control: same text-only ids routed through inputs_embeds.
+        # Non-empty => generate-from-embeds works, visual content is suspect;
+        # empty too => inputs_embeds path broken on this model, end of track.
+        with torch.no_grad():
+            t_emb = model.get_input_embeddings()(t["input_ids"])
+        torch.manual_seed(args.seed)
+        e_out = model.generate(inputs_embeds=t_emb, attention_mask=t["attention_mask"],
+                               max_new_tokens=32, pad_token_id=tok.pad_token_id,
+                               **build_gen_kwargs(args.gen_mode))
+        e_new = e_out[0][t["input_ids"].shape[1]:].tolist()
+        print(f"DEBUG embeds-control new_tokens={len(e_new)} ids={e_new[:20]}")
+        print(f"DEBUG embeds-control Gen: {tok.decode(e_new, skip_special_tokens=True)!r}")
 
 if __name__ == "__main__":
     main()
