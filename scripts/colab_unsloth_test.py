@@ -170,10 +170,12 @@ def main():
                         "image_grid_thw": nin["image_grid_thw"], "position_ids": nin["position_ids"]}
         cut = int(nin["attention_mask"][0].sum().item())
         print(f"native prefix live={cut} mm1={(nin['mm_token_type_ids'] == 1).sum().item()} pos={tuple(nin['position_ids'].shape)}")
+        vis_mask = (nin["attention_mask"].bool() & (nin["mm_token_type_ids"] == 1))
     else:
         gen_batch, cut = strip_trailing_eos(batch, tok.eos_token_id)
         print(f"prefix cut at {cut} (was {batch['input_ids'].shape[1]}) — EOS-terminated train layout would generate empty")
         inp = embeds_for(model, gen_batch, proj, str(device))
+        vis_mask = None
     torch.manual_seed(args.seed)
     out_ids = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=args.max_new, pad_token_id=tok.pad_token_id, **extra_kwargs, **build_gen_kwargs(args.gen_mode))
     gen = tok.decode(out_ids[0][cut:], skip_special_tokens=True)
@@ -186,6 +188,11 @@ def main():
               f"has_nan={bool(torch.isnan(inp['inputs_embeds']).any())} "
               f"has_inf={bool(torch.isinf(inp['inputs_embeds']).any())} "
               f"mask_sum={int(inp['attention_mask'].sum())}")
+        if vis_mask is not None:
+            vv = inp["inputs_embeds"][vis_mask].float()
+            tt = inp["inputs_embeds"][inp["attention_mask"].bool() & ~vis_mask].float()
+            print(f"DEBUG vis_embed mean={vv.mean():.4f} absmax={vv.abs().max():.4f} rms={vv.pow(2).mean().sqrt():.4f} "
+                  f"vs text mean={tt.mean():.4f} absmax={tt.abs().max():.4f} rms={tt.pow(2).mean().sqrt():.4f}")
         # Run B: same prefix, no KV-cache (isolates cache/MTP interaction with inputs_embeds).
         torch.manual_seed(args.seed)
         out_nocache = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
