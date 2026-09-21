@@ -72,6 +72,20 @@ def test_gen_kwargs_card_matches_model_card_vl_recipe():
     assert card == {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "top_k": 20}
 
 
+def test_native_mode_resolves_conditional_generation_class():
+    import inspect
+
+    from scripts.colab_unsloth_test import resolve_qwen_class
+
+    causal = resolve_qwen_class(native=False)
+    native = resolve_qwen_class(native=True)
+    assert causal.__name__ == "AutoModelForCausalLM"
+    assert native.__name__ == "Qwen3_5ForConditionalGeneration"
+    params = inspect.signature(native.forward).parameters
+    for kw in ("inputs_embeds", "mm_token_type_ids", "image_grid_thw", "position_ids"):
+        assert kw in params, f"conditional forward must accept {kw}"
+
+
 def test_select_heldout_rows_only_excluded_shards():
     from scripts.eval_heldout import select_heldout_rows
 

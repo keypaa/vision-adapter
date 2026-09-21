@@ -23,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import torch
 from PIL import Image
 from huggingface_hub import hf_hub_download
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer
 from vision_adapter.models.moonvit import load_moonvit_from_safetensors
 from vision_adapter.models.preprocess import collate_images
 from vision_adapter.core import HourglassProjector, make_collate, embeds_for
@@ -39,6 +39,17 @@ def build_gen_kwargs(mode):
     if mode == "card":
         return {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "top_k": 20}
     raise ValueError(f"unknown gen mode {mode!r} (expected greedy|card)")
+
+
+def resolve_qwen_class(native: bool):
+    """Backbone class per prefix mode: the multimodal forward (mm kwargs,
+    mRoPE, masked scatter) only exists on Qwen3_5ForConditionalGeneration;
+    the causal class exposes a text-only decoder. Concrete class import:
+    the generic auto alias does not exist on all transformers versions."""
+    from transformers import AutoModelForCausalLM
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5ForConditionalGeneration
+
+    return Qwen3_5ForConditionalGeneration if native else AutoModelForCausalLM
 
 
 def strip_trailing_eos(batch, eos_id):
@@ -114,12 +125,14 @@ def main():
         # n_vis for this 2000x maybe ~ 300 tokens
         vis = emb.to(torch.float32)  # train uses float
 
-    # 3. Qwen + projector
-    print("loading Qwen3.5-2B")
+    # 3. Qwen + projector (native prefix needs the conditional class:
+    # only it implements the multimodal forward with mm kwargs + mRoPE)
+    qwen_cls = resolve_qwen_class(args.prefix_mode == "native")
+    print(f"loading Qwen3.5-2B ({qwen_cls.__name__})")
     tok = AutoTokenizer.from_pretrained("Qwen/Qwen3.5-2B")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
-    model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-2B", dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map=str(device))
+    model = qwen_cls.from_pretrained("Qwen/Qwen3.5-2B", dtype=torch.bfloat16, low_cpu_mem_usage=True, device_map=str(device))
     for p in model.parameters():
         p.requires_grad_(False)
     # Eval harness: ckpt recompute corrupts generate (KV-cache), train() enables dropout.
