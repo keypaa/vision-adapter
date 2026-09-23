@@ -12,10 +12,12 @@ GPU (kwargs `mm_token_type_ids`/`image_grid_thw`/`position_ids` passés à `gene
 - Si vide aussi : cause = frontière `generate` (MTP/cache) → fermer la
   piste injection, documenter, passer au serving stack si besoin.
 
-## NEXT-2. Refactor `embeds_for` vers le protocole natif (local, TDD)
-Placeholders + `mm_token_type_ids` + positions via `compute_3d_position_ids`
-(ou équivalent), test d’équivalence loss vs ancien path sur modèle tiny CPU.
-U1 doit être levé avant (règle d’expansion lue dans le processor).
+## NEXT-2. Training protocole natif — IMPLÉMENTÉ, en attente du différentiel
+`vision_adapter/native.py` (propriété unique) + `train_step_qwen` sous
+`VISION_ADAPTER_NATIVE_TRAIN=1` (défaut 0, legacy inchangé) : placeholders +
+framing + mm + offset natif post-vision, labels shiftés +2. 148 tests verts.
+Différentiel prévu : natif vs courant, 300 steps chacun, même tête scalée,
+même ordre, + held-out — gate : natif ≥ courant.
 
 ## NEXT-3. Held-out stratifié + permutation (1 session Molab)
 Rerun `eval_heldout.py --n 200` + patch groupement (10 lignes) : par `g`,

@@ -126,6 +126,20 @@ def _resolve_positions_mode() -> str:
     return mode
 
 
+def _resolve_native_train() -> bool:
+    """Native-protocol training layout (placeholders + mm + full mRoPE).
+
+    Off by default; enable with ``VISION_ADAPTER_NATIVE_TRAIN=1`` for
+    differential experiments (same head, layout as the only variable).
+    """
+    import os
+
+    raw = os.environ.get("VISION_ADAPTER_NATIVE_TRAIN", "0")
+    if raw not in ("0", "1"):
+        raise ValueError(f"unknown VISION_ADAPTER_NATIVE_TRAIN={raw!r} (expected 0|1)")
+    return raw == "1"
+
+
 def train_position_ids(batch: dict, merge_size: int = 2) -> torch.Tensor:
     """mRoPE ``(4, B, L)`` positions for the legacy training layout.
 
@@ -734,6 +748,39 @@ def _restore_ckpt_flags(prev) -> None:
             m._gradient_checkpointing_func = func
 
 
+def _backward_and_step(opt, params, loss, scaler, clip: float, _accumulate: bool, _scale: float) -> tuple[float, bool]:
+    """Backward + clip + optimizer step shared by all train_step_qwen paths.
+
+    Returns ``(gnorm, finite)``. Micro-batch accumulation (``_accumulate``)
+    skips zeroing, clipping and stepping; the final micro (``_scale < 1``)
+    must NOT re-zero (outer loop already did).
+    """
+    if scaler is not None:
+        scaled_loss = scaler.scale(loss)
+        if not _accumulate and _scale == 1.0:
+            opt.zero_grad(set_to_none=True)
+        scaled_loss.backward()
+        if _accumulate:
+            return float("nan"), bool(torch.isfinite(loss))
+        scaler.unscale_(opt)
+        gnorm = float(nn.utils.clip_grad_norm_(params, clip))
+        step_skipped = math.isnan(gnorm) or math.isinf(gnorm)
+        if not step_skipped:
+            scaler.step(opt)
+        scaler.update()
+        return gnorm, not step_skipped
+    finite = bool(torch.isfinite(loss))
+    if not _accumulate and _scale == 1.0:
+        opt.zero_grad(set_to_none=True)
+    loss.backward()
+    if _accumulate:
+        return float("nan"), finite
+    gnorm = float("nan") if not finite else float(nn.utils.clip_grad_norm_(params, clip))
+    if finite:
+        opt.step()
+    return gnorm, finite
+
+
 def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=None,
                     adaptive_ckpt="auto", _accumulate: bool = False, _scale: float = 1.0) -> dict:
     """One fwd/bwd/clip/step for the Qwen probe (selective lm_head loss).
@@ -765,16 +812,26 @@ def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=N
         amp_dtype = None
         if device == "cuda" and next(model.parameters()).dtype == torch.float32:
             amp_dtype = torch.float16
-        inp = embeds_for(model, batch, proj, device)
-        labels = inp.pop("labels")
         base = model.model
-        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+        if _resolve_native_train():
+            from vision_adapter.native import native_train_forward
+
+            fwd_embeds, labels, fwd_attn, fwd_pos = native_train_forward(model, proj, batch, device)
+            B, L = fwd_attn.shape[:2]
+        else:
+            inp = embeds_for(model, batch, proj, device)
+            labels = inp.pop("labels")
+            fwd_embeds = inp["inputs_embeds"]
+            fwd_attn = inp["attention_mask"]
+            B, L = batch["input_ids"].shape[:2]
+            fwd_pos = None
             if _resolve_positions_mode() == "mrope":
-                mrope_pos = train_position_ids(batch).to(inp["inputs_embeds"].device)
-                out = base(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
-                           position_ids=mrope_pos)
+                fwd_pos = train_position_ids(batch).to(fwd_embeds.device)
+        with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
+            if fwd_pos is not None:
+                out = base(inputs_embeds=fwd_embeds, attention_mask=fwd_attn, position_ids=fwd_pos)
             else:
-                out = base(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"])
+                out = base(inputs_embeds=fwd_embeds, attention_mask=fwd_attn)
             hidden = out.last_hidden_state
             shift_labels = labels[:, 1:]
             mask = shift_labels != -100
@@ -789,36 +846,10 @@ def train_step_qwen(model, proj, opt, batch, device, clip: float = 1.0, scaler=N
         # Micro-batch loop in train.py zeroes once before the loop; every
         # micro (including the final stepping one, _scale < 1) must keep
         # accumulated grads. Only a standalone step (_scale == 1) zeroes here.
-        if scaler is not None:
-            scaled_loss = scaler.scale(loss)
-            if not _accumulate and _scale == 1.0:
-                opt.zero_grad(set_to_none=True)
-            scaled_loss.backward()
-            if _accumulate:
-                gnorm = float("nan")
-                finite = bool(torch.isfinite(loss))
-            else:
-                scaler.unscale_(opt)
-                gnorm = float(nn.utils.clip_grad_norm_(params, clip))
-                step_skipped = math.isnan(gnorm) or math.isinf(gnorm)
-                if not step_skipped:
-                    scaler.step(opt)
-                scaler.update()
-                finite = not step_skipped
-        else:
-            finite = bool(torch.isfinite(loss))
-            if not _accumulate and _scale == 1.0:
-                opt.zero_grad(set_to_none=True)
-            loss.backward()
-            if _accumulate:
-                gnorm = float("nan")
-            else:
-                gnorm = float("nan") if not finite else float(nn.utils.clip_grad_norm_(params, clip))
-                if finite:
-                    opt.step()
-        B, L = batch["input_ids"].shape[:2]
+        gnorm, finite = _backward_and_step(opt, params, loss, scaler, clip, _accumulate, _scale)
+        B, L = fwd_attn.shape[:2]  # native layout is L+2; legacy identical to batch shape
         return {"loss": float(loss.item()), "finite": finite, "gnorm": gnorm,
-                "tokens": int(batch["attention_mask"].sum()),
+                "tokens": int(fwd_attn.sum()),
                 "batch_size": int(B), "L": int(L), "bl2": int(B * L * L),
                 "ckpt_on": bool(ckpt_on),
                 "cache_emptied": bool(cache_emptied),
