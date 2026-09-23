@@ -69,6 +69,23 @@ bash scripts/molab_ssh_up.sh --local --remote-port <NEW PORT>
 | `pkill -f "bore local ..."` kills your own shell | pattern self-matches the remote command — kill by PID (`pgrep -af "bore local"`, then `kill <pid>`) |
 | Everything dead after idle | tab closed / 90min idle / 12h max — respawn notebook, follow Reconnect |
 
+## Multi-session rules (learned 2026-09-23)
+
+Two agent sessions sharing one Molab host and one local user collided on:
+shared `Host molab-bore` stanza (last writer wins), one tunnel for two
+notebooks (a session landed on the other project's container), and a shared
+cron namespace (`keypaa`).
+
+- One SSH Host alias per (session, project): e.g. `molab-bore-va` vs
+  `molab-bore`. Never touch the other's stanza; never run `--local
+  --remote-port` (it rewrites the shared alias) — write your own stanza
+  by hand.
+- One bore tunnel per notebook (each box gets its own port).
+- Cron `agent_name` per project (e.g. `keypaa-vision` vs `keypaa-tiny`);
+  each session acts only on its own job names.
+- Fingerprint on every (re)connect: `hostname` + `ls /marimo` must match
+  the expected project before any command. On mismatch: stop everything.
+
 ## Security
 
 - One keypair per direction (`~/.ssh/molab_bore`, comment `local-to-molab-bore`);
