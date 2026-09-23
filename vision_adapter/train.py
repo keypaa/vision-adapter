@@ -94,19 +94,13 @@ def _list_hf_ckpt_files(repo_id: str) -> list[str]:
 def _download_ckpt(repo_id: str, step: int | None, dest_dir: Path) -> Path:
     from huggingface_hub import hf_hub_download
 
-    names = [f for f in _list_hf_ckpt_files(repo_id)
-             if f.startswith("projector_step") and f.endswith(".pt")]
+    names = [f for f in _list_hf_ckpt_files(repo_id) if _ckpt_step_number(f) >= 0]
     if not names:
         raise FileNotFoundError(f"no step ckpts in hf:{repo_id}")
     if step is None:
-        def _n(nm: str) -> int:
-            try:
-                return int(nm.removeprefix("projector_step").removesuffix(".pt"))
-            except ValueError:
-                return -1
-        filename = max(names, key=_n)
+        filename = max(names, key=_ckpt_step_number)
     else:
-        filename = f"projector_step{step}.pt"
+        filename = _step_ckpt_filename(step)
         if filename not in names:
             raise FileNotFoundError(f"{filename} not in hf:{repo_id}")
     local = hf_hub_download(repo_id, filename, repo_type="model",
@@ -215,7 +209,7 @@ def _list_local_step_ckpts_desc(data_dir: Path | str) -> list[Path]:
     for d in (cache_root, dd):
         if not d.is_dir():
             continue
-        for p in d.glob("projector_step*.pt"):
+        for p in d.glob("projector_*.pt"):
             if _ckpt_step_number(p.name) >= 0:
                 seen.setdefault(p.name, p)
     return sorted(seen.values(), key=lambda p: _ckpt_step_number(p.name), reverse=True)
@@ -259,11 +253,41 @@ def _restore_rng_state(rng_state: dict | None) -> None:
         pass
 
 
+def _ckpt_tag() -> str:
+    """Optional run tag scoping ckpt filenames (env VISION_ADAPTER_CKPT_TAG).
+
+    Empty (default) reproduces legacy names byte-identically. A tag prevents
+    one run from overwriting another run's step files on the shared HF repo
+    (Sept-2026 incident: scaled run clobbered hourglass intermediates).
+    """
+    import os
+    import re
+
+    tag = os.environ.get("VISION_ADAPTER_CKPT_TAG", "")
+    if tag and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", tag):
+        raise ValueError(f"bad VISION_ADAPTER_CKPT_TAG={tag!r} (want [A-Za-z0-9_-]+)")
+    return tag
+
+
+def _step_ckpt_filename(step: int) -> str:
+    tag = _ckpt_tag()
+    return f"projector_{tag}_step{int(step)}.pt" if tag else f"projector_step{int(step)}.pt"
+
+
+def _final_ckpt_filename(steps: int) -> str:
+    tag = _ckpt_tag()
+    return f"projector_{tag}_final_{int(steps)}.pt" if tag else f"projector_final_{int(steps)}.pt"
+
+
 def _ckpt_step_number(name: str) -> int:
-    try:
-        return int(name.removeprefix("projector_step").removesuffix(".pt"))
-    except ValueError:
-        return -1
+    """Parse step from legacy and tagged step filenames; -1 otherwise.
+
+    Final files (``projector[_tag]_final_K.pt``) and anything else yield -1.
+    """
+    import re
+
+    m = re.match(r"^projector_(?:(.+)_)?step(\d+)\.pt$", name)
+    return int(m.group(2)) if m else -1
 
 
 def _find_local_ckpt(data_dir: Path | str, step: int | None = None) -> Path:
@@ -278,7 +302,7 @@ def _find_local_ckpt(data_dir: Path | str, step: int | None = None) -> Path:
     cache_root = Path("/hf/hf_stream_cache") if (Path("/hf").is_dir() and os.environ.get("MODAL_TASK_ID")) else dd / "cache"
     search_dirs = [cache_root, dd]
     if step is not None:
-        filename = f"projector_step{step}.pt"
+        filename = _step_ckpt_filename(step)
         for d in search_dirs:
             cand = d / filename
             if cand.is_file():
@@ -289,7 +313,7 @@ def _find_local_ckpt(data_dir: Path | str, step: int | None = None) -> Path:
     for d in search_dirs:
         if not d.is_dir():
             continue
-        for p in d.glob("projector_step*.pt"):
+        for p in d.glob("projector_*.pt"):
             n = _ckpt_step_number(p.name)
             if n > best_n:
                 best_n = n
@@ -901,7 +925,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                             _torch3.cuda.empty_cache()
                     except Exception:
                         pass
-                    ckpt = _cache_root / f"projector_step{step}.pt"
+                    ckpt = _cache_root / _step_ckpt_filename(step)
                     import hashlib as _hashlib
 
                     from vision_adapter.config import manifest_sha256 as _mhash
@@ -952,7 +976,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         lf.write(json.dumps({"type":"run_end","run_id":run_id,"step":steps,"samples_seen":steps*cfg.batch_size,"final_loss": recs[-1]["loss"] if recs else None,"wall_min":wall})+"\n")
         # ALWAYS save final projector (even if steps < save_every) — probe must be reusable for qual samples
         try:
-            final_path = _cache_root / f"projector_final_{steps}.pt"
+            final_path = _cache_root / _final_ckpt_filename(steps)
             _torch.save({"proj": proj.state_dict(), "step": steps, "cfg": cfg.to_dict(), "final_loss": recs[-1]["loss"] if recs else None}, str(final_path))
             print(f"[train] saved final projector {final_path} ({final_path.stat().st_size/1e6:.1f}MB)", flush=True)
             _maybe_push_ckpt(final_path)
@@ -972,7 +996,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             # also mirror to data_dir for local fetches
             try:
                 import shutil as _sh
-                _sh.copyfile(str(final_path), str(data_dir / f"projector_final_{steps}.pt"))
+                _sh.copyfile(str(final_path), str(data_dir / _final_ckpt_filename(steps)))
             except Exception:
                 pass
         except Exception as e:
@@ -1074,7 +1098,7 @@ def _run_resume_hf(dd: Path, cfg: TrainConfig, max_steps: int | None, device: st
             return 1
         _recovered = False
         try:
-            _names = [f for f in _list_hf_ckpt_files(repo) if f.startswith("projector_step") and f.endswith(".pt")]
+            _names = [f for f in _list_hf_ckpt_files(repo) if _ckpt_step_number(f) >= 0]
         except Exception:
             _names = []
         _failed_name = ckpt_path.name
