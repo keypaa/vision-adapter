@@ -89,10 +89,14 @@ cron namespace (`keypaa`).
 ## Incident 2026-09-23 — account restricted, DO NOT REPEAT
 
 Account `molab.marimo.io` restricted (review at
-`https://marimo.io/account-restricted`). Suspected cause: persistent
-outbound bore tunnel (network circumvention) + keep-alive watchdog cells
-defeating the 90-min idle shutdown. Tunnel dead (`Connection refused`),
-all box-local state lost (only HF pushes survive).
+`https://marimo.io/account-restricted`). Per
+`https://marimo.io/pages/molab/restrictions` (read 2026-09-23), the
+violated clauses are: **remote control such as by SSH** (bore tunnel +
+direct shell driving) and **using notebooks for non-interactive jobs**
+(7h unattended training runs + keep-alive watchdogs defeating idle
+shutdown). Tunnel dead (`Connection refused`), all box-local state lost
+(only HF pushes survive). Appeal deadline: **14 calendar days**
+(`https://form.jotform.com/261684515249060`), then permanent deletion.
 
 Rules going forward (non-negotiable):
 - No bore/SSH tunnels, no relay of any kind.
