@@ -137,6 +137,24 @@ def _stub_tok():
     return StubTok()
 
 
+def test_forward_loss_native_layout_finite_and_deterministic(monkeypatch):
+    from scripts.eval_heldout import forward_loss
+
+    monkeypatch.setattr("vision_adapter.native.IMAGE_TOKEN_ID", 200)
+    monkeypatch.setattr("vision_adapter.native.VISION_START_ID", 201)
+    monkeypatch.setattr("vision_adapter.native.VISION_END_ID", 202)
+    torch.manual_seed(0)
+    model = _tiny_qwen()
+    proj = HourglassProjector(4096, 32)
+    batch = _batch([6, 6])
+    loss1, tokens1 = forward_loss(model, proj, batch, "cpu", layout="native")
+    loss2, _ = forward_loss(model, proj, batch, "cpu", layout="native")
+    assert loss1 == loss2
+    assert tokens1 > 0
+    splice_loss, _ = forward_loss(model, proj, batch, "cpu", layout="splice")
+    assert splice_loss != loss1  # different layout, different loss
+
+
 def test_select_heldout_rows_only_excluded_shards():
     from scripts.eval_heldout import select_heldout_rows
 

@@ -31,9 +31,10 @@ def select_heldout_rows(rows, index, heldout_shards=HELDOUT_SHARDS, n=60, seed=0
     return cands[: max(0, n)]
 
 
-def forward_loss(model, proj, batch, device):
+def forward_loss(model, proj, batch, device, layout="splice"):
     """Selective lm_head loss, no backward/step. Mirrors train_step_qwen fwd
-    exactly (same embeds_for splice AND same mRoPE train_position_ids)."""
+    exactly: ``splice`` = embeds_for path, ``native`` = native-layout path
+    (each ckpt evaluated in its own training regime)."""
     import torch.nn.functional as F
 
     from vision_adapter.core import _resolve_positions_mode, embeds_for, train_position_ids
@@ -42,18 +43,29 @@ def forward_loss(model, proj, batch, device):
     model.eval()
     try:
         with torch.no_grad():
-            inp = embeds_for(model, batch, proj, device)
+            if layout == "native":
+                from vision_adapter.native import native_train_forward
+
+                fwd_embeds, labels, fwd_attn, fwd_pos = native_train_forward(model, proj, batch, device)
+            elif layout == "splice":
+                inp = embeds_for(model, batch, proj, device)
+                labels = inp.pop("labels")
+                fwd_embeds, fwd_attn = inp["inputs_embeds"], inp["attention_mask"]
+                fwd_pos = None
+                if _resolve_positions_mode() == "mrope":
+                    fwd_pos = train_position_ids(batch).to(fwd_embeds.device)
+            else:
+                raise ValueError(f"unknown layout={layout!r} (expected splice|native)")
             out_dtype = next(model.parameters()).dtype
             amp_dtype = out_dtype if device == "cuda" else None
             with torch.autocast("cuda", dtype=amp_dtype, enabled=amp_dtype is not None):
-                if _resolve_positions_mode() == "mrope":
-                    pos = train_position_ids(batch).to(inp["inputs_embeds"].device)
-                    out = model.model(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
-                                      position_ids=pos)
+                if fwd_pos is not None:
+                    out = model.model(inputs_embeds=fwd_embeds, attention_mask=fwd_attn,
+                                      position_ids=fwd_pos)
                 else:
-                    out = model.model(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"])
+                    out = model.model(inputs_embeds=fwd_embeds, attention_mask=fwd_attn)
                 hidden = out.last_hidden_state
-                shift_labels = inp["labels"][:, 1:]
+                shift_labels = labels[:, 1:]
                 mask = shift_labels != -100
                 pos = mask.nonzero(as_tuple=False)
                 h_sel = hidden[:, :-1][pos[:, 0], pos[:, 1]]
@@ -61,7 +73,7 @@ def forward_loss(model, proj, batch, device):
                 logits_sel = model.lm_head(h_sel).float()
             loss = F.cross_entropy(logits_sel, y_sel)
             # tokens follows the train contract: attention_mask sum, not supervised positions
-            return float(loss.item()), int(batch["attention_mask"].sum())
+            return float(loss.item()), int(fwd_attn.sum())
     finally:
         model.train(prev)
 
@@ -167,6 +179,8 @@ def main():
     ap.add_argument("--local-base", default=None, help="local ckpt path (preferred over HF)")
     ap.add_argument("--variant-final", default=None, help="hourglass|scaled (default: env)")
     ap.add_argument("--variant-base", default=None, help="hourglass|scaled (default: env)")
+    ap.add_argument("--layout-final", choices=("splice", "native"), default="splice")
+    ap.add_argument("--layout-base", choices=("splice", "native"), default="splice")
     ap.add_argument("--mode", choices=("loss", "discrimination"), default="loss",
                     help="loss: mean NLL base vs final; discrimination: own-vs-swapped image/text NLL (final only)")
     ap.add_argument("--n", type=int, default=60,
@@ -220,7 +234,9 @@ def main():
 
     results = {}
     variants = {"base": args.variant_base, "final": args.variant_final}
-    print(f"[eval] variants base={variants['base']} final={variants['final']}", flush=True)
+    layouts = {"base": args.layout_base, "final": args.layout_final}
+    print(f"[eval] variants base={variants['base']} final={variants['final']} "
+          f"layouts base={layouts['base']} final={layouts['final']}", flush=True)
     for name, path in (("base", base_path), ("final", final_path)):
         sd = torch.load(path, map_location=device, weights_only=False)
         proj = build_projector(4096, llm_dim, variant=variants[name]).to(
@@ -229,7 +245,7 @@ def main():
         proj.eval()
         losses, tokens = [], 0
         for batch in loader:
-            loss, tok_n = forward_loss(model, proj, batch, device)
+            loss, tok_n = forward_loss(model, proj, batch, device, layout=layouts[name])
             losses.append(loss)
             tokens += tok_n
         results[name] = {"mean_loss": sum(losses) / len(losses), "batches": len(losses), "tokens": tokens}
