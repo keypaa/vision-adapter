@@ -24,6 +24,17 @@ def test_time_download_schema_with_fake():
     assert rec["mib_s"] == pytest.approx(1.0 / rec["seconds"], rel=0.05)
 
 
+def test_merge_record_replaces_same_method(tmp_path):
+    from scripts.bench_transfer import _merge_record
+
+    out = tmp_path / "bench_transfer.json"
+    _merge_record(out, {"method": "range", "mib_s": 100})
+    recs = _merge_record(out, {"method": "hf_transfer", "mib_s": 200})
+    assert sorted(r["method"] for r in recs) == ["hf_transfer", "range"]
+    recs = _merge_record(out, {"method": "range", "mib_s": 110})
+    assert [r["mib_s"] for r in recs if r["method"] == "range"] == [110]
+
+
 def test_attention_bench_schema_cpu():
     from tests.test_adaptive_ckpt import _tiny_qwen
     from scripts.bench_attention import bench_shape
