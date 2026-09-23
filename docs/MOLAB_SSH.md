@@ -86,6 +86,20 @@ cron namespace (`keypaa`).
 - Fingerprint on every (re)connect: `hostname` + `ls /marimo` must match
   the expected project before any command. On mismatch: stop everything.
 
+## Incident 2026-09-23 — account restricted, DO NOT REPEAT
+
+Account `molab.marimo.io` restricted (review at
+`https://marimo.io/account-restricted`). Suspected cause: persistent
+outbound bore tunnel (network circumvention) + keep-alive watchdog cells
+defeating the 90-min idle shutdown. Tunnel dead (`Connection refused`),
+all box-local state lost (only HF pushes survive).
+
+Rules going forward (non-negotiable):
+- No bore/SSH tunnels, no relay of any kind.
+- No keep-alive automation of any kind (cells, loops, pings).
+- Active tab, human-driven sessions only; close the notebook when done.
+- One driver per box; fingerprint check stays mandatory.
+
 ## Security
 
 - One keypair per direction (`~/.ssh/molab_bore`, comment `local-to-molab-bore`);
