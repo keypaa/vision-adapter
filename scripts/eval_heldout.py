@@ -220,6 +220,7 @@ def main():
 
     results = {}
     variants = {"base": args.variant_base, "final": args.variant_final}
+    print(f"[eval] variants base={variants['base']} final={variants['final']}", flush=True)
     for name, path in (("base", base_path), ("final", final_path)):
         sd = torch.load(path, map_location=device, weights_only=False)
         proj = build_projector(4096, llm_dim, variant=variants[name]).to(
