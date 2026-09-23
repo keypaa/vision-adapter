@@ -33,11 +33,13 @@ def main():
     args = ap.parse_args()
 
     from vision_adapter.data.stream import (
-        FETCH_CHUNK,
+        RemoteShard,
         _download_shard_hf_transfer,
         _fetch_range,
         _remote_size,
     )
+
+    FETCH_CHUNK = RemoteShard.FETCH_CHUNK
 
     url = f"https://huggingface.co/datasets/{args.repo}/resolve/main/{args.shard}"
     size = _remote_size(url)
@@ -50,6 +52,7 @@ def main():
         d = tempfile.mkdtemp(prefix="bench_hf_")
         try:
             p = _download_shard_hf_transfer(args.shard, d)
+            assert p is not None, "hf_transfer download returned None"
             return Path(p).stat().st_size
         finally:
             shutil.rmtree(d, ignore_errors=True)
