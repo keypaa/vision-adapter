@@ -12,12 +12,14 @@ GPU (kwargs `mm_token_type_ids`/`image_grid_thw`/`position_ids` passés à `gene
 - Si vide aussi : cause = frontière `generate` (MTP/cache) → fermer la
   piste injection, documenter, passer au serving stack si besoin.
 
-## NEXT-2. Training protocole natif — IMPLÉMENTÉ, en attente du différentiel
-`vision_adapter/native.py` (propriété unique) + `train_step_qwen` sous
-`VISION_ADAPTER_NATIVE_TRAIN=1` (défaut 0, legacy inchangé) : placeholders +
-framing + mm + offset natif post-vision, labels shiftés +2. 148 tests verts.
-Différentiel prévu : natif vs courant, 300 steps chacun, même tête scalée,
-même ordre, + held-out — gate : natif ≥ courant.
+## NEXT-2. Training protocole natif — VERDICT NÉGATIF (2026-09-23, Molab)
+Différentiel 2×300 steps (même tête scalée, mêmes batches) + held-out
+60 rows, chaque ckpt dans son régime : C-splice 0.894 vs N-natif 0.950
+(+5,9 % splice, gate 10 % manquée) ; trajectoires : C 0.845/0.970 vs
+N 0.885/1.020, même sens. Le layout natif complet n’apporte rien à 300 steps.
+DÉCISION : on garde splice+mRoPE par défaut, piste natif-training classée
+sans suppression de code (réversible si nouvelles données). Le module
+`vision_adapter/native.py` reste utile au harness de génération.
 
 ## NEXT-3. Held-out stratifié + permutation (1 session Molab)
 Rerun `eval_heldout.py --n 200` + patch groupement (10 lignes) : par `g`,
