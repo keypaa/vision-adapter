@@ -222,7 +222,9 @@ def native_train_forward(model, proj, batch: dict, device: str, merge_size: int 
     pos4 = torch.zeros((4, B, L), dtype=torch.long)
     pos4[0] = torch.arange(L).view(1, -1).expand(B, -1)
     pos4[1:] = nat["position_ids"]
-    return merged, nat["labels"], nat["attention_mask"], pos4.to(device)
+    # Everything the forward consumes lives on device (legacy embeds_for
+    # contract); a CPU mask against CUDA embeds dies instantly.
+    return merged, nat["labels"].to(device), nat["attention_mask"].to(device), pos4.to(device)
 
 
 def scatter_projector_outputs(merged: torch.Tensor, proj_out: torch.Tensor,
