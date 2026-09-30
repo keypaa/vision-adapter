@@ -1,7 +1,9 @@
-"""vision_adapter/models/precompute.py — shared MoonViT precompute wrapper.
+"""vision_adapter/models/precompute.py — staged-CLI precompute entrypoint.
 
-Shared _emb_key: sha1(rel)[:20].pt where rel is volume-relative logical path
-(agentic/foo.png, cauldron/foo.png) so Modal and local produce identical keys.
+Delegates to the real MoonViT pipeline in precompute_colab (same _emb_key
+contract, same preprocess.collate_images); this module is the thin
+backend-aware wrapper the CLI calls. Local-filesystem backends only — remote
+backends (Modal Volume) go through modal_pipeline.py upstream.
 """
 
 from __future__ import annotations
@@ -23,10 +25,12 @@ def run_precompute(
     device: str = "cuda",
     revision: str | None = None,
 ) -> None:
-    """Validate args and (in prod) run moonvit + preprocess over the corpus.
+    """Run MoonViT precompute over <data_dir>/images into <data_dir>/embeddings.
 
-    Stub: validates backend/data_dir exist and would call moonvit.py + preprocess.py
-    machinery. For tests, this only validates args.
+    Fixed 2026-09-30 (was a validation-only stub printing "ok"): now delegates
+    to precompute_colab.run with the data_dir roots. Requires a
+    local-filesystem backend (LocalBackend.root); anything else raises loudly
+    instead of silently doing nothing.
     """
     if backend is None:
         raise ValueError("backend is required (DataBackend)")
@@ -39,6 +43,19 @@ def run_precompute(
         raise ValueError(f"patch_cap must be >0, got {patch_cap}")
     if device not in ("cuda", "cpu", "mps"):
         raise ValueError(f"unsupported device {device!r}")
+    if getattr(backend, "root", None) is None:
+        raise ValueError(
+            "run_precompute needs a local-filesystem backend (LocalBackend with "
+            ".root) — remote backends run precompute via modal_pipeline.py, not "
+            "the staged CLI"
+        )
     _ = revision  # reserved for HF revision pin forwarded to moonvit weight fetch
-    _ = _emb_key  # keep shared helper live for importers
+    from vision_adapter.models import precompute_colab as _pc
+
+    _pc.run(
+        images_root=str(p / "images"),
+        out_root=str(p / "embeddings"),
+        batch_patches=patch_cap,
+        device=device,
+    )
     return None

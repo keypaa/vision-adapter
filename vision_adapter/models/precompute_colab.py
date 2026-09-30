@@ -54,12 +54,12 @@ def _emb_key(image_path: str) -> str:
     return hashlib.sha1(rel.encode()).hexdigest()[:20] + ".pt"
 
 
-def _emb_path(image_path: str) -> str:
-    return os.path.join(OUT_ROOT, _emb_key(image_path))
+def _emb_path(image_path: str, out_root: str | None = None) -> str:
+    return os.path.join(out_root or OUT_ROOT, _emb_key(image_path))
 
 
-def _already_done(image_path: str) -> bool:
-    p = _emb_path(image_path)
+def _already_done(image_path: str, out_root: str | None = None) -> bool:
+    p = _emb_path(image_path, out_root)
     if not os.path.exists(p) or os.path.getsize(p) == 0:
         return False
     try:  # cheap header validation — catches truncated writes from a killed cell
@@ -69,12 +69,13 @@ def _already_done(image_path: str) -> bool:
         return False
 
 
-def load_vit():
+def load_vit(device=None):
+    dev = torch.device(device) if device is not None else globals()["device"]
     cfg = json.load(open(hf_hub_download(repo_id=MOONVIT_REPO, repo_type="model",
                                          filename="vision_config.json")))
     st  = hf_hub_download(repo_id=MOONVIT_REPO, repo_type="model",
                           filename="moonvit_v2.safetensors")
-    vit = load_moonvit_from_safetensors(st, cfg, device=str(device),
+    vit = load_moonvit_from_safetensors(st, cfg, device=str(dev),
                                         dtype=(torch.bfloat16 if BF16 else torch.float32))
     return vit
 
@@ -109,17 +110,24 @@ def pack_batches(paths, batch_patch_cap):
     return batches
 
 
-def run():
-    _ensure_outdir()
-    vit = load_vit()
+def run(images_root=None, out_root=None, batch_patches=None, device=None):
+    """Run the precompute over a corpus. Overrides default to the module
+    globals (Colab Drive paths) so the staged CLI can point at any data_dir
+    (see vision_adapter.models.precompute.run_precompute)."""
+    images_root = images_root if images_root is not None else IMAGES_ROOT
+    out_root = out_root if out_root is not None else OUT_ROOT
+    batch_patches = batch_patches if batch_patches is not None else BATCH_PATCHES
+    dev = torch.device(device) if device is not None else globals()["device"]
+    _ensure_outdir(out_root)
+    vit = load_vit(str(dev))
     t0 = time.time()
-    todos = [p for p in enumerate_images(IMAGES_ROOT) if not _already_done(p)]
-    total = len(enumerate_images(IMAGES_ROOT))
+    todos = [p for p in enumerate_images(images_root) if not _already_done(p, out_root)]
+    total = len(enumerate_images(images_root))
     print(f"[precompute] corpus={total} images | remaining={len(todos)} "
           f"| cached_so_far={total - len(todos)}")
     if not todos:
         print("[precompute] nothing to do — cache is complete."); return
-    batches = pack_batches(todos, BATCH_PATCHES)
+    batches = pack_batches(todos, batch_patches)
     print(f"[precompute] packed into {len(batches)} batches (cap {BATCH_PATCHES} patches/step)")
 
     done = 0
@@ -130,27 +138,27 @@ def run():
                 with Image.open(p) as im:
                     ims.append(im.convert("RGB"))
             pack = collate_images(ims)
-            merged = vit(pack["pixel_values"].to(device).to(vit.patch_embed.proj.weight.dtype
-                                                            if BF16 else torch.float32),
-                          pack["grid_thws"].to(device))
+            merged = vit(pack["pixel_values"].to(dev).to(vit.patch_embed.proj.weight.dtype
+                                                         if BF16 else torch.float32),
+                         pack["grid_thws"].to(dev))
             for p, emb in zip(chunk, merged):
                 flat = emb.reshape(emb.shape[0], -1)                 # [n_merged, 4096]
                 out = flat.to(torch.bfloat16 if BF16 else torch.float32).cpu()
-                torch.save(out, _emb_path(p))
+                torch.save(out, _emb_path(p, out_root))
             done += len(chunk)
             if done % PROGRESS_EVERY < len(chunk):
-                used = torch.cuda.memory_allocated() / 2**30 if device.type == "cuda" else 0.0
-                peak = torch.cuda.max_memory_allocated() / 2**30 if device.type == "cuda" else 0.0
+                used = torch.cuda.memory_allocated() / 2**30 if dev.type == "cuda" else 0.0
+                peak = torch.cuda.max_memory_allocated() / 2**30 if dev.type == "cuda" else 0.0
                 rate = done / max(1e-6, time.time() - t0)
                 eta = (len(todos) - done) / max(1e-6, rate) / 3600
                 print(f"[precompute] {done}/{len(todos)}  "
                       f"gpu={used:.1f}GB peak={peak:.1f}GB  {rate:.1f} img/s  ETA {eta:.2f}h")
             if done and done % FLUSH_EVERY < len(chunk):
-                with open(os.path.join(OUT_ROOT, "_journal.json"), "w") as f:
+                with open(os.path.join(out_root, "_journal.json"), "w") as f:
                     json.dump({"done": total - len(todos) + done, "total": total,
                                "ts": time.time()}, f)
-                print("[precompute] journal flushed to Drive")
-    print(f"[precompute] DONE. wrote {done} embeddings this session -> {OUT_ROOT}")
+                print("[precompute] journal flushed")
+    print(f"[precompute] DONE. wrote {done} embeddings this session -> {out_root}")
 
 
 if __name__ == "__main__":
