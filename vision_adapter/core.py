@@ -16,6 +16,7 @@ Keep this file dependency-light: only torch + stdlib. No modal, no HF.
 from __future__ import annotations
 
 import math
+import re
 import statistics
 import time
 from collections import deque
@@ -81,9 +82,13 @@ def placeholder_count(grid_thw_row: torch.Tensor, merge_size: int = 2) -> int:
 def grid_for_nvis(n_vis: int, merge_size: int = 2) -> torch.Tensor:
     """Synthetic ``(t, h, w)`` grid whose placeholder count reconstructs ``n_vis``.
 
-    The precomputed parquet stores no MoonViT geometry, so training-time
-    mRoPE uses this deterministic stand-in (squarest even factors, fallback
-    ``(2, total//2)``). Documented approximation, not measured geometry.
+    FALLBACK ONLY. Audit 2026-09-30: factoring a token count into a squarest
+    even grid can invert orientation — a 56x26 portrait (``n_vis=364``) came
+    out as 28x52 landscape, a x3.0 median aspect error over the live corpus.
+    Use the measured grid (see ``grid_from_dims`` / the ``grid_thw`` sidecar)
+    whenever it is available; a run on this stand-in must declare
+    ``extra.grid_source="synthetic"`` so its curves are not compared against
+    measured-geometry runs.
     """
     import math
 
@@ -100,6 +105,22 @@ def grid_for_nvis(n_vis: int, merge_size: int = 2) -> torch.Tensor:
     if h is None:
         h, w = 2, total // 2
     return torch.tensor([1, h, w], dtype=torch.long)
+
+
+def grid_from_dims(width: int, height: int) -> torch.Tensor:
+    """True MoonViT ``(1, gh, gw)`` PRE-merge grid for a ``width x height`` px image.
+
+    Mirrors the preprocess contract exactly (resize -> pad-to-28 -> 14px
+    patches), so the geometry is verifiable without re-running the ViT: on
+    400 live corpus rows the ``n_vis`` in the embedding key index matched
+    ``placeholder_count(grid_from_dims(w, h))`` exactly. These are PRE-merge
+    dims; the LLM sees them divided by the 2x2 spatial merge.
+    """
+    from vision_adapter.models.preprocess import PATCH, _pad_to_28, _resize_size
+
+    new_w, new_h = _resize_size(int(width), int(height))
+    gw, gh = _pad_to_28(new_w) // PATCH, _pad_to_28(new_h) // PATCH
+    return torch.tensor([1, gh, gw], dtype=torch.long)
 
 
 def vision_position_ids(start: int, grid_thw_row: torch.Tensor, spatial_merge_size: int = 2) -> torch.Tensor:
@@ -144,9 +165,16 @@ def train_position_ids(batch: dict, merge_size: int = 2) -> torch.Tensor:
     """mRoPE ``(4, B, L)`` positions for the legacy training layout.
 
     Row 0 is plain arange (byte-identical to the model default: text behavior
-    unchanged). Rows 1-3 carry mRoPE over the visual span ``[1:1+n_vis]``
-    with a synthetic grid (see ``grid_for_nvis``); pad columns keep arange
-    like the default. ``n_vis=0`` rows skip the vision block.
+    unchanged). Rows 1-3 carry mRoPE over the visual span ``[1:1+n_vis]``;
+    pad columns keep arange like the default. ``n_vis=0`` rows skip the
+    vision block.
+
+    Geometry: a measured ``batch["grid_thw"]`` (B, 3) wins — it is the true
+    MoonViT grid. Rows without one fall back to the synthetic
+    ``grid_for_nvis`` stand-in, which is known to invert orientation; a
+    measured grid whose placeholder count disagrees with ``n_vis`` raises
+    rather than silently positioning a wrong geometry.
+
     Known limitation (deliberate, minimal deviation): post-vision text keeps
     default positions instead of continuing from the vision-shifted cursor
     as native ``get_rope_index`` would. Only the vision span differs from
@@ -156,13 +184,48 @@ def train_position_ids(batch: dict, merge_size: int = 2) -> torch.Tensor:
     B, L = ids.shape[:2]
     n_vis = [int(n) for n in batch["n_vis"].tolist()]
     pos = torch.arange(L).view(1, 1, -1).expand(4, B, L).clone()
+    grids = row_grids_for_batch(batch, n_vis, merge_size)
     for i, nv in enumerate(n_vis):
         if nv <= 0:
             continue
-        grid = grid_for_nvis(nv, merge_size)
-        span = vision_position_ids(1, grid, merge_size)
+        span = vision_position_ids(1, grids[i], merge_size)
         pos[1:, i, 1: 1 + nv] = span
     return pos.long()
+
+
+def row_grids_for_batch(
+    batch: dict, n_vis: list[int], merge_size: int
+) -> list[torch.Tensor]:
+    """Per-row mRoPE grid: measured ``grid_thw`` when present, else synthetic.
+
+    Rows are independent — a batch where only some rows are measured (the
+    normal regime while the sidecar is being backfilled) is fine. A measured
+    grid whose placeholder count disagrees with ``n_vis`` raises: that is a
+    data bug, not something to paper over with a synthetic grid.
+    """
+    measured = batch.get("grid_thw")
+    if measured is None:
+        return [grid_for_nvis(nv, merge_size) for nv in n_vis]
+    if len(measured) != len(n_vis):
+        raise ValueError(
+            f"grid_thw has {len(measured)} rows but batch has {len(n_vis)}"
+        )
+    out = []
+    for i, raw in enumerate(measured):
+        if raw is None:
+            out.append(grid_for_nvis(n_vis[i], merge_size))
+            continue
+        g = torch.as_tensor(raw, dtype=torch.long).reshape(-1)
+        if g.numel() != 3:
+            raise ValueError(f"row {i}: grid_thw must have 3 values, got {g.tolist()}")
+        count = placeholder_count(g, merge_size)
+        if count != n_vis[i]:
+            raise ValueError(
+                f"row {i}: grid_thw {g.tolist()} mismatch: gives {count} placeholders "
+                f"but n_vis={n_vis[i]}"
+            )
+        out.append(g)
+    return out
 
 
 def build_projector(vision_dim: int = 4096, llm_dim: int = 2048, variant: str | None = None,
@@ -190,6 +253,27 @@ def build_projector(vision_dim: int = 4096, llm_dim: int = 2048, variant: str | 
 
 
 # ---------------------------------------------------------------------------
+# marker strip — Sero textual image blocks must not reach the tokenizer
+# ---------------------------------------------------------------------------
+
+_TEXT_IMAGE_MARKER_RE = re.compile(r"\|begin_of_image\|(?:\|image\|)*\|end_of_image\|")
+
+
+def strip_text_image_markers(text):
+    """Remove ``|begin_of_image|…|image|…|end_of_image|`` blocks from user text.
+
+    Audit 2026-09-30: every live agentic row carries one such block (130 marker
+    strings = 265 Qwen tokens) while the collate separately injects the real
+    visual embeddings — double representation. The block is a fossil of the
+    source backbone's protocol and carries no signal for our model; strip it,
+    keep instruction + previous actions. No-match text returns unchanged.
+    """
+    if not isinstance(text, str):
+        return text
+    return _TEXT_IMAGE_MARKER_RE.sub("", text)
+
+
+# ---------------------------------------------------------------------------
 # make_collate — [BOS?][img × n_vis][user][answer][EOS] with answer priority
 # ---------------------------------------------------------------------------
 
@@ -201,6 +285,9 @@ def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
     - labels -100 everywhere except answer+EOS; BOS/img/user/pad never contribute
     - attention_mask covers BOS..EOS (incl. img span), not right-pad
     - vis tokens padded to batch max with zeros, dtype float32
+    - overflow guard: rows with n_vis alone past max_len get the visual span
+      trimmed (head kept) so L <= max_len (max_len >= 4); fitting rows are
+      byte-identical to the unguarded layout
 
     The bos guard (`if tok.bos_token_id is not None`) is the fix ported from
     grok_probe/modal_probe — DeepSeek has BOS, Qwen3.5 has None. Without it
@@ -210,16 +297,27 @@ def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
     def collate(batch):
         B = len(batch)
         n_vis = [int(b["vis"].shape[0]) for b in batch]
-        max_v = max(n_vis)
-        u_ids = [tok(b["user"], add_special_tokens=False)["input_ids"] for b in batch]
+        u_ids = [tok(strip_text_image_markers(b["user"]), add_special_tokens=False)["input_ids"]
+                 for b in batch]
         a_ids = [tok(b["assistant"], add_special_tokens=False)["input_ids"] for b in batch]
         seq_lens, parts = [], []
         for u, a, nv in zip(u_ids, a_ids, n_vis):
+            # Overflow guard (audit 2026-09-30: live n_vis max 16653 > max_len):
+            # the visual span alone must never push L past max_len. Reserve
+            # BOS + EOS + 1 user + 1 answer token (answer-priority floor).
+            nv = min(nv, max(0, max_len - 4))
             budget_text = max_len - nv - 2
             a = a[: max(1, budget_text)]
             u = u[: max(1, budget_text - len(a))]
+            # Close the +1 edge (answer longer than budget leaves the 1-token
+            # user floor one past max_len) by trimming the visual tail, never text.
+            excess = (1 + nv + len(u) + len(a) + 1) - max_len
+            if excess > 0:
+                nv = max(0, nv - excess)
             parts.append((nv, u, a))
             seq_lens.append(1 + nv + len(u) + len(a) + 1)
+        kept = [nv for nv, _, _ in parts]
+        max_v = max(kept)
         L = max(max_v, max(seq_lens))
         input_ids = torch.full((B, L), pad_id, dtype=torch.long)
         labels = torch.full((B, L), -100, dtype=torch.long)
@@ -237,9 +335,10 @@ def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
                 input_ids[i, ans_start: ans_start + len(a) + 1]
         vis_pad = torch.zeros(B, max_v, vision_dim, dtype=torch.float32)
         for i, b in enumerate(batch):
-            vis_pad[i, : n_vis[i]] = b["vis"]
+            vis_pad[i, : kept[i]] = b["vis"][: kept[i]]
         return {"input_ids": input_ids, "attention_mask": attn, "labels": labels,
-                "vis": vis_pad, "n_vis": torch.tensor(n_vis, dtype=torch.long),
+                "vis": vis_pad, "n_vis": torch.tensor(kept, dtype=torch.long),
+                "grid_thw": [b.get("grid_thw") for b in batch],
                 "g": [b.get("g", "?") for b in batch]}
 
     return collate

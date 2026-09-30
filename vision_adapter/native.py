@@ -5,25 +5,35 @@ loss paths. ``scripts/native_prefix.py`` only re-exports from here.
 
 Creator protocol per row: ``[slot][vstart][pads x N][vend][user...]``
 with ``N == n_vis`` asserted, ``mm=1`` on pads only, mRoPE positions with
-native post-vision offset. Grids are synthetic (``grid_for_nvis``): the
-precomputed parquet stores no MoonViT geometry (documented approximation).
+native post-vision offset. Grids come from the batch's measured
+``grid_thw`` (see ``vision_adapter.grid_sidecar``); rows without one fall
+back to the synthetic ``grid_for_nvis`` stand-in.
 """
+
 from __future__ import annotations
 
 import torch
 
-from vision_adapter.core import grid_for_nvis, placeholder_count, vision_position_ids
+from vision_adapter.core import (
+    row_grids_for_batch,
+    placeholder_count,
+    vision_position_ids,
+)
 
 IMAGE_TOKEN_ID = 248056
 VISION_START_ID = 248053
 VISION_END_ID = 248054
 
 
-def _check_grids(grids: torch.Tensor, n_vis: list[int], merge_size: int, B: int) -> list[int]:
+def _check_grids(
+    grids: torch.Tensor, n_vis: list[int], merge_size: int, B: int
+) -> list[int]:
     counts = [placeholder_count(grids[i], merge_size) for i in range(B)]
     for i in range(B):
         if int(torch.prod(grids[i]).item()) % (merge_size**2) != 0:
-            raise ValueError(f"row {i}: grid {grids[i].tolist()} not divisible by merge**2={merge_size**2}")
+            raise ValueError(
+                f"row {i}: grid {grids[i].tolist()} not divisible by merge**2={merge_size**2}"
+            )
         if counts[i] != n_vis[i]:
             raise ValueError(
                 f"row {i}: grid gives N={counts[i]} placeholders but n_vis={n_vis[i]} "
@@ -32,7 +42,9 @@ def _check_grids(grids: torch.Tensor, n_vis: list[int], merge_size: int, B: int)
     return counts
 
 
-def _grouped_positions(types: list[int], live: int, grid: torch.Tensor, merge_size: int) -> torch.Tensor:
+def _grouped_positions(
+    types: list[int], live: int, grid: torch.Tensor, merge_size: int
+) -> torch.Tensor:
     """mRoPE columns over one live span, native cursor semantics (text
     advances, vision consumes grid then jumps max(h,w)//merge)."""
     groups: list[tuple[int, int, int]] = []
@@ -59,7 +71,9 @@ def _grouped_positions(types: list[int], live: int, grid: torch.Tensor, merge_si
     return torch.cat(cols, dim=1) if cols else torch.zeros((3, 0), dtype=torch.long)
 
 
-def build_native_prefix(batch: dict, tokenizer, grid_thw: torch.Tensor, merge_size: int = 2) -> dict:
+def build_native_prefix(
+    batch: dict, tokenizer, grid_thw: torch.Tensor, merge_size: int = 2
+) -> dict:
     """Native-protocol generation-prefix inputs (answer cut). See module doc."""
     image_id = int(getattr(tokenizer, "image_token_id", IMAGE_TOKEN_ID))
     vstart_id = int(getattr(tokenizer, "vision_start_token_id", VISION_START_ID))
@@ -74,7 +88,9 @@ def build_native_prefix(batch: dict, tokenizer, grid_thw: torch.Tensor, merge_si
     grids = torch.as_tensor(grid_thw, dtype=torch.long)
     B = ids.shape[0]
     if grids.ndim != 2 or grids.shape[0] != B or grids.shape[1] != 3:
-        raise ValueError(f"grid_thw must be (B, 3) with B={B}, got {tuple(grids.shape)}")
+        raise ValueError(
+            f"grid_thw must be (B, 3) with B={B}, got {tuple(grids.shape)}"
+        )
     counts = _check_grids(grids, n_vis, merge_size, B)
 
     new_rows: list[list[int]] = []
@@ -92,7 +108,7 @@ def build_native_prefix(batch: dict, tokenizer, grid_thw: torch.Tensor, merge_si
         prefix = row[:cut]
         nv = n_vis[i]
         framed = [vstart_id] + [image_id] * counts[i] + [vend_id]
-        new_rows.append(prefix[:1] + framed + prefix[1 + nv:])
+        new_rows.append(prefix[:1] + framed + prefix[1 + nv :])
 
     L = max(len(r) for r in new_rows)
     out_ids = torch.full((B, L), pad_id, dtype=torch.long)
@@ -101,12 +117,16 @@ def build_native_prefix(batch: dict, tokenizer, grid_thw: torch.Tensor, merge_si
     for i, r in enumerate(new_rows):
         out_ids[i, : len(r)] = torch.tensor(r, dtype=torch.long)
         out_attn[i, : len(r)] = 1
-        out_mm[i, : len(r)] = torch.tensor([1 if t == image_id else 0 for t in r], dtype=torch.long)
+        out_mm[i, : len(r)] = torch.tensor(
+            [1 if t == image_id else 0 for t in r], dtype=torch.long
+        )
 
     out_pos = torch.zeros((3, B, L), dtype=torch.long)
     for i in range(B):
         live = int(out_attn[i].sum().item())
-        out_pos[:, i, :live] = _grouped_positions(out_mm[i, :live].tolist(), live, grids[i], merge_size)
+        out_pos[:, i, :live] = _grouped_positions(
+            out_mm[i, :live].tolist(), live, grids[i], merge_size
+        )
 
     return {
         "input_ids": out_ids,
@@ -133,7 +153,8 @@ def build_native_train_batch(
     shifted by +(2+N-nv) (== +2, N==nv asserted). Returns 3-row native
     mRoPE positions (text decoder prepends its arange row); see
     :func:`native_train_forward` for the 4-row assembly.
-    ``grid_thw=None`` derives synthetic grids from ``n_vis``.
+    ``grid_thw=None`` falls back to the batch's ``grid_thw``, then to
+    synthetic grids derived from ``n_vis``.
     """
     if image_token_id is None:
         image_token_id = IMAGE_TOKEN_ID
@@ -147,11 +168,10 @@ def build_native_train_batch(
     n_vis = [int(n) for n in batch["n_vis"].tolist()]
     B, L = ids.shape[:2]
     if grid_thw is None:
-        grids = torch.stack([grid_for_nvis(nv, merge_size) for nv in n_vis])
-    else:
-        grids = torch.as_tensor(grid_thw, dtype=torch.long)
-        if grids.ndim != 2 or grids.shape[0] != B or grids.shape[1] != 3:
-            raise ValueError(f"grid_thw must be (B, 3) with B={B}, got {tuple(grids.shape)}")
+        grid_thw = batch.get("grid_thw")
+    grids = torch.stack(
+        row_grids_for_batch({"grid_thw": grid_thw}, n_vis, merge_size)
+    )
     counts = _check_grids(grids, n_vis, merge_size, B)
 
     new_rows: list[list[int]] = []
@@ -167,7 +187,7 @@ def build_native_train_batch(
             continue
         delta = (2 + counts[i]) - nv
         framed = [vision_start_id] + [image_token_id] * counts[i] + [vision_end_id]
-        new_rows.append(row[:1] + framed + row[1 + nv: mask_len])
+        new_rows.append(row[:1] + framed + row[1 + nv : mask_len])
         shifted = [-100] * (mask_len + delta)
         for p, v in enumerate(lab[:mask_len]):
             if v != -100:
@@ -184,12 +204,16 @@ def build_native_train_batch(
         out_ids[i, : len(r)] = torch.tensor(r, dtype=torch.long)
         out_attn[i, : len(r)] = 1
         out_lab[i, : len(new_labs[i])] = torch.tensor(new_labs[i], dtype=torch.long)
-        out_mm[i, : len(r)] = torch.tensor([1 if t == image_token_id else 0 for t in r], dtype=torch.long)
+        out_mm[i, : len(r)] = torch.tensor(
+            [1 if t == image_token_id else 0 for t in r], dtype=torch.long
+        )
 
     out_pos = torch.zeros((3, B, Lp), dtype=torch.long)
     for i in range(B):
         live = int(out_attn[i].sum().item())
-        out_pos[:, i, :live] = _grouped_positions(out_mm[i, :live].tolist(), live, grids[i], merge_size)
+        out_pos[:, i, :live] = _grouped_positions(
+            out_mm[i, :live].tolist(), live, grids[i], merge_size
+        )
 
     return {
         "input_ids": out_ids,
@@ -224,11 +248,20 @@ def native_train_forward(model, proj, batch: dict, device: str, merge_size: int 
     pos4[1:] = nat["position_ids"]
     # Everything the forward consumes lives on device (legacy embeds_for
     # contract); a CPU mask against CUDA embeds dies instantly.
-    return merged, nat["labels"].to(device), nat["attention_mask"].to(device), pos4.to(device)
+    return (
+        merged,
+        nat["labels"].to(device),
+        nat["attention_mask"].to(device),
+        pos4.to(device),
+    )
 
 
-def scatter_projector_outputs(merged: torch.Tensor, proj_out: torch.Tensor,
-                              placeholder_mask: torch.Tensor, n_vis: list[int]) -> torch.Tensor:
+def scatter_projector_outputs(
+    merged: torch.Tensor,
+    proj_out: torch.Tensor,
+    placeholder_mask: torch.Tensor,
+    n_vis: list[int],
+) -> torch.Tensor:
     """In-place scatter of projector rows onto placeholder positions (grad-safe).
 
     ``merged`` is modified and returned. Row ``i`` takes ``proj_out[i, :nv]``
@@ -236,6 +269,8 @@ def scatter_projector_outputs(merged: torch.Tensor, proj_out: torch.Tensor,
     """
     for i, nv in enumerate(n_vis):
         hits = placeholder_mask[i].nonzero(as_tuple=False).squeeze(-1)
-        assert int(hits.numel()) == nv, f"row {i}: {int(hits.numel())} pads != n_vis {nv}"
+        assert int(hits.numel()) == nv, (
+            f"row {i}: {int(hits.numel())} pads != n_vis {nv}"
+        )
         merged[i, hits] = proj_out[i, :nv]
     return merged

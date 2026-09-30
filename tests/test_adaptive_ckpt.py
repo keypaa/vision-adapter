@@ -381,8 +381,15 @@ def test_micro_batch_accumulation_matches_full_batch():
     micro = 2
     for s in range(0, B0, micro):
         e = min(s + micro, B0)
-        mb = {k: v[s:e] if isinstance(v, torch.Tensor) else v for k, v in batch.items() if k != "g"}
+        mb = {
+            k: v[s:e] if isinstance(v, torch.Tensor) else v
+            for k, v in batch.items()
+            if k not in ("g", "grid_thw")
+        }
         mb["g"] = batch["g"][s:e] if isinstance(batch.get("g"), list) else batch.get("g")
+        # per-row lists must be sliced too, else the micro-batch keeps all rows
+        if isinstance(batch.get("grid_thw"), list):
+            mb["grid_thw"] = batch["grid_thw"][s:e]
         scale = (e - s) / B0
         o = train_step_qwen(
             model, proj_micro, opt_micro, mb, "cpu",

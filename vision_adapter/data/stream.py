@@ -598,14 +598,35 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
         start_pos: int = 0,
         rg_cache_dir: str | None = None,
         vision_dim: int = VISION_DIM,
+        grid_sidecar: str | None = None,
     ):
         super().__init__()
         self.plan, self.order = plan, stream_order
         self.start_pos = start_pos
         self.rg_cache_dir = rg_cache_dir
         self.vision_dim = vision_dim
+        if grid_sidecar:
+            from vision_adapter.grid_sidecar import GridSidecar
+
+            self._grids = GridSidecar(grid_sidecar)
+        else:
+            self._grids = None
         if rg_cache_dir:
             os.makedirs(rg_cache_dir, exist_ok=True)
+
+    def attach_grid(self, row: dict) -> dict:
+        """Attach the measured ``grid_thw`` for this row's emb key, if known.
+
+        Returns the row untouched when no sidecar is loaded or the key is
+        absent — the caller then uses the synthetic stand-in and must label
+        the run ``grid_source=synthetic``.
+        """
+        if self._grids is None:
+            return row
+        grid = self._grids.get(row.get("emb", ""))
+        if grid is None:
+            return row
+        return {**row, "grid_thw": grid}
 
     def __iter__(self):  # noqa: C901
         import pyarrow.parquet as pq
@@ -669,7 +690,10 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                         )
                         del buf
                         assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
-                        yield {"vis": vis, "user": row["user"], "assistant": row["assistant"], "g": row.get("g", "?")}
+                        yield self.attach_grid(
+                            {"vis": vis, "user": row["user"], "assistant": row["assistant"],
+                             "g": row.get("g", "?"), "emb": row.get("emb", "")}
+                        )
                         emitted += 1
                 _enforce_lru_cache(self.rg_cache_dir, max_shards=4)
                 if next_shard_fut is not None and next_shard_fut.done():
@@ -752,7 +776,10 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                             )
                             del buf
                             assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
-                            yield {"vis": vis, "user": row["user"], "assistant": row["assistant"], "g": row.get("g", "?")}
+                            yield self.attach_grid(
+                            {"vis": vis, "user": row["user"], "assistant": row["assistant"],
+                             "g": row.get("g", "?"), "emb": row.get("emb", "")}
+                        )
                             emitted += 1
                     finally:
                         del tbl
