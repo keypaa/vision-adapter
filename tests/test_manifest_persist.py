@@ -10,7 +10,8 @@ def test_persist_fetched_manifest_roundtrip(tmp_path):
         {"emb": "e2", "user": "u2", "assistant": "a2", "g": "t"},
     ]
     out = _persist_fetched_manifest(tmp_path, rows)
-    assert out == tmp_path / "train_manifest.jsonl"
+    # the fetched rows carry grid_thw, so they land under the measured name
+    assert out == tmp_path / "train_manifest_grids.jsonl"
     back, header = load_manifest(out)
     assert len(back) == 2
     assert header is not None  # header-first, not legacy

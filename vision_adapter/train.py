@@ -453,6 +453,31 @@ def resolve_dtype(capability: int, dtype_arg: str = "auto"):
     return explicit[dtype_arg]
 
 
+MEASURED_MANIFEST_FILE = "train_manifest_grids.jsonl"
+PLAIN_MANIFEST_FILE = "train_manifest.jsonl"
+
+
+def resolve_manifest_name(data_dir) -> str:
+    """Which train manifest to use: the measured-geometry one if present.
+
+    The backfilled manifest carries grid_thw on every row (verified 117600/
+    117600 against the stored n_vis). It coexists with the original rather
+    than replacing it, because existing checkpoints recorded a
+    manifest_sha256 against the old file and a resume that silently saw a
+    different one would be unverifiable.
+
+    Raises rather than defaulting when neither exists — an empty plan should
+    fail loudly, not train on nothing.
+    """
+    for name in (MEASURED_MANIFEST_FILE, PLAIN_MANIFEST_FILE):
+        if (Path(data_dir) / name).is_file():
+            return name
+    raise FileNotFoundError(
+        f"no train manifest in {data_dir}: expected "
+        f"{MEASURED_MANIFEST_FILE} or {PLAIN_MANIFEST_FILE}"
+    )
+
+
 def _val_cache_path(data_dir, sample_size: int):
     """Where the materialized val lives. Keyed by size so two vals never clash."""
     return Path(data_dir) / f"val_cache_{int(sample_size)}.pt"
@@ -781,7 +806,7 @@ def _persist_fetched_manifest(data_dir: Path, rows: list[dict]) -> Path:
     """
     from vision_adapter.manifest import write_manifest_with_header
 
-    out = Path(data_dir) / "train_manifest.jsonl"
+    out = Path(data_dir) / MEASURED_MANIFEST_FILE
     write_manifest_with_header(out, rows)
     return out
 
@@ -816,9 +841,14 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     tok_hf = _ghf()
     if tok_hf:
         os.environ["HF_TOKEN"] = tok_hf
-    # Manifest: prefer local file; else fetch from HF
-    local_manifest = data_dir / "train_manifest.jsonl"
-    if local_manifest.is_file():
+    # Manifest: prefer the measured-geometry one, else the plain one, else fetch.
+    manifest_name = None
+    for candidate in (MEASURED_MANIFEST_FILE, PLAIN_MANIFEST_FILE):
+        if (data_dir / candidate).is_file():
+            manifest_name = candidate
+            break
+    local_manifest = data_dir / manifest_name if manifest_name else None
+    if local_manifest is not None:
         rows, header = load_manifest(local_manifest)
         # If local manifest is fake fixture, treat as smoke — caller already handled
         is_fake = any("fake" in r.get("emb","") for r in rows[:10])
@@ -995,7 +1025,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             )
             print(f"[train] geometry: {_have}/{_have + _missing} manifest rows carry "
                   f"grid_thw (grid_source={_grid_source})", flush=True)
-            hdr = config_header(cfg, manifest_path=str(local_manifest) if local_manifest.is_file() else None, extra={"run":"train-stream","device":dev,"dtype":str(dtype),"sample_size":sample_size,"grid_source":_grid_source})
+            hdr = config_header(cfg, manifest_path=str(local_manifest) if local_manifest.is_file() else None, extra={"run":"train-stream","device":dev,"dtype":str(dtype),"sample_size":sample_size,"grid_source":_grid_source,"manifest":manifest_name or MEASURED_MANIFEST_FILE})
             run_id = hdr.get("run_id")
             with open(log_path, "w", buffering=1) as lf:
                 lf.write(json.dumps(hdr)+"\n")

@@ -28,7 +28,10 @@ from vision_adapter.backends.auth import get_hf_token as _get_hf_token
 
 EMB_REPO = "keypa/vision-adapter-embeddings"
 MANIFEST_REPO = "keypa/vision-adapter-manifests"
-MANIFEST_FILE = "train_manifest.jsonl"
+# The backfilled manifest, which carries grid_thw on every row (verified
+# 117600/117600 against the stored n_vis). Preferred over the plain one
+# when present; see train.resolve_manifest_name.
+MANIFEST_FILE = "train_manifest_grids.jsonl"
 KEY_INDEX_CACHE = "key_index_cache.json"
 
 # Vision dim is fixed by MoonViT 2x2 merge flatten — matches config TrainConfig.vision_dim
