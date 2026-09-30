@@ -12,6 +12,7 @@ is intentionally backend-agnostic: it takes DataBackend and a TrainConfig.
 """
 from __future__ import annotations
 
+import itertools
 import os
 from pathlib import Path
 import time
@@ -457,6 +458,28 @@ MEASURED_MANIFEST_FILE = "train_manifest_grids.jsonl"
 PLAIN_MANIFEST_FILE = "train_manifest.jsonl"
 
 
+def resolve_step_budget(max_steps: int | None, lr_horizon: int | None = None) -> int | None:
+    """Normalise max_steps into a step budget, or None for unbounded.
+
+    ``None`` means "run until stopped" — the loop, the progress line and the
+    final-checkpoint name all handle it. It used to mean 5, which made
+    modal_train's ``max_steps=None`` a silent 5-step run.
+
+    A cosine LR needs an end to decay toward, so an unbounded run must say
+    where its schedule ends (``lr_horizon``). A bounded run already does.
+    """
+    if max_steps is not None:
+        if max_steps <= 0:
+            raise ValueError(f"max_steps must be >0, got {max_steps}")
+        return int(max_steps)
+    if lr_horizon is None:
+        raise ValueError(
+            "max_steps=None runs until stopped, but the cosine LR schedule "
+            "needs an end: pass lr_horizon (the step the LR decays toward)"
+        )
+    return None
+
+
 def geometry_guard(grid_source: str, allow_synthetic: bool = False) -> None:
     """Refuse to train on the synthetic geometry stand-in unless asked.
 
@@ -833,7 +856,7 @@ def _persist_fetched_manifest(data_dir: Path, rows: list[dict]) -> Path:
     return out
 
 
-def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str, dtype_arg: str = "auto", resume_ckpt: dict | None = None, allow_synthetic: bool = False) -> int:  # noqa: C901
+def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str, dtype_arg: str = "auto", resume_ckpt: dict | None = None, allow_synthetic: bool = False, lr_horizon: int | None = None) -> int:  # noqa: C901
     """Native HF streaming train — cluster-sampled RemoteShard, no grok import.
 
     When resume_ckpt is given, continue at ckpt["step"]+1 with restored
@@ -1045,7 +1068,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             _grid_source = grid_source_for(_have, _missing)
             print(f"[train] geometry: {_have}/{_have + _missing} manifest rows carry "
                   f"grid_thw (grid_source={_grid_source})", flush=True)
-            geometry_guard(_grid_source, allow_synthetic=allow_synthetic)
+            geometry_guard(_grid_source, allow_synthetic=allow_synthetic, lr_horizon=lr_horizon)
             hdr = config_header(cfg, manifest_path=str(local_manifest) if local_manifest.is_file() else None, extra={"run":"train-stream","device":dev,"dtype":str(dtype),"sample_size":sample_size,"grid_source":_grid_source,"manifest":manifest_name or MEASURED_MANIFEST_FILE})
             run_id = hdr.get("run_id")
             with open(log_path, "w", buffering=1) as lf:
@@ -1111,9 +1134,14 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     if _resume_info is not None:
         steps = int(_resume_info["total_steps"])
         start_step = int(_resume_info["resume_step"]) + 1
+        lr_horizon = steps
     else:
-        steps = max_steps or 5
+        steps = resolve_step_budget(max_steps, lr_horizon=lr_horizon)
         start_step = 1
+        if steps is None:
+            print(f"[train] unbounded run (max_steps=None) — LR decays toward "
+                  f"step {lr_horizon}, checkpoints every {cfg.save_every} steps, "
+                  f"stop with Ctrl-C", flush=True)
     if _resume_info is not None and isinstance(resume_ckpt, dict):
         try:
             import hashlib as _phash
@@ -1146,9 +1174,10 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     else:
         _log_ctx = open(log_path, "a", buffering=1)
     with _log_ctx as lf:
-        for step in range(start_step, steps+1):
+        _step_iter = range(start_step, steps + 1) if steps is not None else itertools.count(start_step)
+        for step in _step_iter:
             for g in opt.param_groups:
-                g["lr"] = lr_at(step, steps, cfg.lr, cfg.warmup_steps)
+                g["lr"] = lr_at(step, lr_horizon, cfg.lr, cfg.warmup_steps)
             batch = next(it)
             # Cost-aware micro-batching: gate on B·L² vs COST_MAX (bl2)
             # not B·L. Keeps VISION_ADAPTER_COST_MAX env override via
@@ -1268,18 +1297,20 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                         pass
                 except Exception as e:
                     print(f"[{time.strftime('%H:%M:%S')}] [train] ckpt save failed step {step}: {e} | {_stats_str()}", flush=True)
-            if step % 5 == 0 or step==steps:
-                print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] [train] stream step {step}/{steps} loss={rec['loss']:.4f} ema={rec['ema_loss']:.4f} gnorm={rec['gnorm']:.2f} | {_stats_str()}", flush=True)
+            if step % 5 == 0 or (steps is not None and step == steps):
+                _tot = f"/{steps}" if steps is not None else "/inf"
+                print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] [train] stream step {step}{_tot} loss={rec['loss']:.4f} ema={rec['ema_loss']:.4f} gnorm={rec['gnorm']:.2f} | {_stats_str()}", flush=True)
         try:
             render_curves(recs, str(curves_path))
         except Exception:
             pass
         wall = round((time.time()-t0)/60,1)
-        lf.write(json.dumps({"type":"run_end","run_id":run_id,"step":steps,"samples_seen":steps*cfg.batch_size,"final_loss": recs[-1]["loss"] if recs else None,"wall_min":wall})+"\n")
+        _end_step = steps if steps is not None else (recs[-1]["step"] if recs else 0)
+        lf.write(json.dumps({"type":"run_end","run_id":run_id,"step":_end_step,"samples_seen":_end_step*cfg.batch_size,"final_loss": recs[-1]["loss"] if recs else None,"wall_min":wall})+"\n")
         # ALWAYS save final projector (even if steps < save_every) — probe must be reusable for qual samples
         try:
-            final_path = _cache_root / _final_ckpt_filename(steps)
-            _torch.save({"proj": proj.state_dict(), "step": steps, "cfg": cfg.to_dict(), "final_loss": recs[-1]["loss"] if recs else None}, str(final_path))
+            final_path = _cache_root / _final_ckpt_filename(_end_step)
+            _torch.save({"proj": proj.state_dict(), "step": _end_step, "cfg": cfg.to_dict(), "final_loss": recs[-1]["loss"] if recs else None}, str(final_path))
             print(f"[train] saved final projector {final_path} ({final_path.stat().st_size/1e6:.1f}MB)", flush=True)
             _maybe_push_ckpt(final_path)
             # also push log + curves + manifest + runs + nohup stdout so HF alone
@@ -1298,7 +1329,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             # also mirror to data_dir for local fetches
             try:
                 import shutil as _sh
-                _sh.copyfile(str(final_path), str(data_dir / _final_ckpt_filename(steps)))
+                _sh.copyfile(str(final_path), str(data_dir / _final_ckpt_filename(_end_step)))
             except Exception:
                 pass
         except Exception as e:
@@ -1322,7 +1353,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             pass
     return 0
 
-def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None, allow_synthetic: bool = False) -> int:
+def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None, allow_synthetic: bool = False, lr_horizon: int | None = None) -> int:
     """Load latest (or K) local step ckpt and continue via the streaming restore path."""
     try:
         ckpt_path = _find_local_ckpt(dd, resume_step)
@@ -1363,7 +1394,7 @@ def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device:
             print(str(e), flush=True)
             raise
     try:
-        return _streaming_train(dd, cfg, max_steps, _resume_dev, dtype, resume_ckpt=resume_ckpt, allow_synthetic=allow_synthetic)
+        return _streaming_train(dd, cfg, max_steps, _resume_dev, dtype, resume_ckpt=resume_ckpt, allow_synthetic=allow_synthetic, lr_horizon=lr_horizon)
     except Exception as e:
         import traceback
         print(f"[train] streaming resume failed ({type(e).__name__}: {e})", flush=True)
@@ -1372,7 +1403,7 @@ def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device:
         return 1
 
 
-def _run_resume_hf(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None, allow_synthetic: bool = False) -> int:
+def _run_resume_hf(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None, allow_synthetic: bool = False, lr_horizon: int | None = None) -> int:
     """Download latest (or K) step ckpt from the HF ckpt repo, then continue via the identical Task 2 restore path."""
     import os
 
@@ -1430,7 +1461,7 @@ def _run_resume_hf(dd: Path, cfg: TrainConfig, max_steps: int | None, device: st
             print(str(e), flush=True)
             raise
     try:
-        return _streaming_train(dd, cfg, max_steps, _resume_dev, dtype, resume_ckpt=resume_ckpt, allow_synthetic=allow_synthetic)
+        return _streaming_train(dd, cfg, max_steps, _resume_dev, dtype, resume_ckpt=resume_ckpt, allow_synthetic=allow_synthetic, lr_horizon=lr_horizon)
     except Exception as e:
         import traceback
         print(f"[train] streaming resume failed ({type(e).__name__}: {e})", flush=True)
@@ -1449,6 +1480,7 @@ def run_train(
     resume: str = "off",
     resume_step: int | None = None,
     allow_synthetic: bool = False,
+    lr_horizon: int | None = None,
 ) -> int:
     """Entry point for `cli train` non-dryrun.
 
@@ -1466,9 +1498,9 @@ def run_train(
         print(f"[train] unknown --resume {resume!r} (expected off|local|hf)", flush=True)
         return 1
     if resume == "hf":
-        return _run_resume_hf(dd, cfg, max_steps, device, dtype, resume_step, allow_synthetic=allow_synthetic)
+        return _run_resume_hf(dd, cfg, max_steps, device, dtype, resume_step, allow_synthetic=allow_synthetic, lr_horizon=lr_horizon)
     if resume == "local":
-        return _run_resume_local(dd, cfg, max_steps, device, dtype, resume_step, allow_synthetic=allow_synthetic)
+        return _run_resume_local(dd, cfg, max_steps, device, dtype, resume_step, allow_synthetic=allow_synthetic, lr_horizon=lr_horizon)
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     # Only gate on GPU when we actually need CUDA kernels; smoke fallback runs on CPU
     # but warn — real training will need a card.
@@ -1502,7 +1534,7 @@ def run_train(
         return _local_train_with_precomputed(dd, cfg, max_steps, dev, dtype)
     print("[train] no local embeddings — streaming from HF (keypa/vision-adapter-embeddings)", flush=True)
     try:
-        return _streaming_train(dd, cfg, max_steps, dev, dtype, allow_synthetic=allow_synthetic)
+        return _streaming_train(dd, cfg, max_steps, dev, dtype, allow_synthetic=allow_synthetic, lr_horizon=lr_horizon)
     except Exception as e:
         import traceback
         print(f"[train] streaming train failed ({type(e).__name__}: {e})", flush=True)

@@ -199,6 +199,7 @@ def train_cmd(args: argparse.Namespace) -> int:
         resume=getattr(args, "resume", "off"),
         resume_step=getattr(args, "resume_step", None),
         allow_synthetic=getattr(args, "allow_synthetic", False),
+        lr_horizon=getattr(args, "lr_horizon", None),
     )
 
 
@@ -275,7 +276,11 @@ def build_parser() -> argparse.ArgumentParser:
         default="default",
         help="train config preset (probe_big=96 PRO 6000)",
     )
-    p.add_argument("--max-steps", type=int, default=None, help="max training steps")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="max training steps; omit for unbounded (stop with Ctrl-C)")
+    p.add_argument("--lr-horizon", type=int, default=None,
+                   help="step the cosine LR decays toward; required when "
+                        "--max-steps is omitted")
     p.add_argument("--val-every", type=int, default=None,
                    help="held-out probe interval in steps (default 250; must be >0)")
     p.add_argument("--allow-synthetic", dest="allow_synthetic", action="store_true",
@@ -300,7 +305,11 @@ def build_parser() -> argparse.ArgumentParser:
     # probe (alias for train --config colab)
     p = subs.add_parser("probe", help="alias for train --config colab")
     p.add_argument("--data-dir", default="data", help="data directory")
-    p.add_argument("--max-steps", type=int, default=None, help="max training steps")
+    p.add_argument("--max-steps", type=int, default=None,
+                   help="max training steps; omit for unbounded (stop with Ctrl-C)")
+    p.add_argument("--lr-horizon", type=int, default=None,
+                   help="step the cosine LR decays toward; required when "
+                        "--max-steps is omitted")
     p.add_argument("--val-every", type=int, default=None,
                    help="held-out probe interval in steps (default 250; must be >0)")
     p.add_argument("--allow-synthetic", dest="allow_synthetic", action="store_true",
