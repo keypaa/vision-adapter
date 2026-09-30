@@ -20,13 +20,12 @@ Status legend for Report sections:
 |---|---|
 | DeepSeek-V4 attention | **Eager-only.** `modeling_deepseek_v4.py` sets `_supports_flash_attn=False`, `_supports_sdpa=False`, `_supports_flex_attn=False` because `head_dim=512` (FA2/3/4 cap at 256; SDPA lacks the per-head sink term; FlexAttention breaks on the compressor KV-append). ⇒ **No flash-attention version works on the LLM, on any GPU.** Do NOT set `attn_implementation` — it would be silently ignored. |
 | FA2.7.4 wheel | Used only by the MoonViT **precompute**, which is **done**. Not part of training. |
-| Trainer execution state | **Never run.** No `checkpoints/`, `logs/`, or `dryrun_report.txt` on the Volume. |
-| Embedding HF repo (`vision-adapter-embeddings`) | **Empty** — the raw-`.pt`-blob `push_embeddings_to_hf` committed nothing before being stopped. |
-| Manifest HF repo (`vision-adapter-manifests`) | **Fully pushed** (train / val / cauldron). |
-| Image HF repo (`vision-adapter-images`) | **8 / 17 shards** present; 9 remaining; `push_image_corpus_to_hf` is resumable per shard. |
-| Corpus / volume | ~139k embeddings (~950 GB `.pt`), 79,659 agentic + ~59,328 cauldron images. Training manifest = 120k subset (54k agentic / 54k doc / 12k conv) + ~2.4k val. |
+| Embedding HF repo (`vision-adapter-embeddings`) | **Fully pushed** — 103 shards, 138,987 rows (~884 GiB). |
+| Manifest HF repo (`vision-adapter-manifests`) | **Fully pushed** — `train_manifest_grids.jsonl` (117,600 rows, per-row `grid_thw`) + `train_manifest_val_disjoint.jsonl` (1,272 rows, disjoint by image) + the pre-backfill train/val + cauldron. |
+| Image HF repo (`vision-adapter-images`) | **Fully pushed** — 17 shards, 138,987 images. `filename` is load-bearing: the embedding key is `sha1(filename)[:20]`. |
+| Corpus | 138,987 embeddings, 138,987 images (79,659 agentic + ~59,328 cauldron). Train manifest = 117,600 rows (52,924 agentic / 52,908 doc / 11,768 conv); held-out = 1,272 rows disjoint by image. |
 | B300 GPU | 288 GB VRAM / 8 TB/s, ~$7.10/h on Modal, SM103 Blackwell. Requires torch ≥ 2.7 + cu128 (current pin `torch==2.5.1` cannot run it). Quantized DeepSeek ~155-167 GiB fits in VRAM, so CPU-offload/`device_map` can be dropped. |
-| Step math | `BATCH_SIZE=8`, `MAX_SEQ_LEN=4096`, `EPOCHS=2`, 120k train ⇒ **30,000 steps**. Grok-window telemetry is samples-based (`samples_seen` ~58k ⇒ step ~7,200-11,000 at bs 8). |
+| Step math | `BATCH_SIZE=8`, `MAX_SEQ_LEN=4096`, `EPOCHS=2`, 117.6k train ⇒ **29,400 steps**. Grok-window telemetry is samples-based (`samples_seen` ~58k ⇒ step ~7,200-11,000 at bs 8). |
 | I/O bottleneck | **Unmeasured.** `it_s ~0.1` (TELEMETRY) suggests backward-through-304B is the wall, but the I/O share is unknown — that is exactly what Phase 1 measures before any rewrite. |
 
 ---
@@ -226,12 +225,12 @@ carries FP8/MoE hacks the probe must not touch.
 | Aspect | Probe (`vision_adapter/train.py:_streaming_train`, `grok_probe_qwen.py`) | Train (`modal_train.py:build_model`, `_train_impl`) |
 |---|---|---|
 | LLM | `Qwen/Qwen3.5-2B` `H2048 (2B) /2560 (4B)` | `deepseek-ai/DeepSeek-V4-Flash-0731` `H4096, FP8 e4m3 blocks + int8 experts` 155GiB quantized |
-| Injection | `inputs_embeds`-only overwrite `[1:1+n_vis]` (`core.py:127 embeds_for` clone+proj) — Qwen forbids ids+embeds together (spec) | `visual_inject` hook on `embed_tokens` output (`core.py:151` register_forward_hook, `tid2eid[input_ids]` still routed for MoE) |
-| Loss | selective `lm_head(text_hidden)` only where `shift_labels!=-100` tens tokens (`core.py:489`) — full `248k vocab ~80GiB at bs16` avoided | full sequence, chunked eager `budget 2**26` (`modal_train.py:352 _make_chunked_eager` avoids `46GiB` logits OOM) |
-| Precision | `bf16 Ampere+ (>=80) else fp32 on T4, fp16+scaler path` (`train.py:158 dtype_map`) | `bfloat16 dequant per GEMM` (`_fp8_linear_train`, `_dequant_expert_slice` via `kernels>=0.16 DeepGEMM`) |
-| Collate | `make_collate` BOS guard `if tok.bos_token_id is not None` (Qwen `None` vs DeepSeek `0`) (`core.py:86`) | same `make_collate` DeepSeek path BOS always present |
+| Injection | `inputs_embeds`-only overwrite `[1:1+n_vis]` (`core.py:368 embeds_for` clone+proj) — Qwen forbids ids+embeds together (spec) | `visual_inject` hook on `embed_tokens` output (`core.py:392` register_forward_hook, `tid2eid[input_ids]` still routed for MoE) |
+| Loss | selective `lm_head(text_hidden)` only where `shift_labels!=-100` tens tokens (`core.py:935`) — full `248k vocab ~80GiB at bs16` avoided | full sequence, chunked eager `budget 2**26` (`modal_train.py:352 _make_chunked_eager` avoids `46GiB` logits OOM) |
+| Precision | `bf16 for any cc>=70 (incl. T4), fp32 below` — `auto` never returns fp16 (`train.py:430 resolve_dtype`) | `bfloat16 dequant per GEMM` (`_fp8_linear_train`, `_dequant_expert_slice` via `kernels>=0.16 DeepGEMM`) |
+| Collate | `make_collate` BOS guard `if tok.bos_token_id is not None` (Qwen `None` vs DeepSeek `0`) (`core.py:280`) | same `make_collate` DeepSeek path BOS always present |
 
-Do not mix `inputs_embeds` injection into DeepSeek or `input_ids` into Qwen without reading `core.py:127/151`.
+Do not mix `inputs_embeds` injection into DeepSeek or `input_ids` into Qwen without reading `core.py:368/392`.
 
 ### Constraints decided
 

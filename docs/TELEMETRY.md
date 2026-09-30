@@ -42,12 +42,28 @@ The run's closing `run_end` and the `runs.jsonl` registry entry
 
 ### val probe (`"type": "val"`)
 
-Every 250th step. Held-out `train_manifest_val.jsonl` — never optimised.
+Every `cfg.val_every` steps (default 250, `--val-every` to change) **and always
+on the last step**, so a short run still reports a val loss. Held-out
+`train_manifest_val_disjoint.jsonl` — 1,272 rows disjoint from train by image,
+never optimised. `val_every <= 0` is rejected at config build time: a run
+with the probe silently disabled looks identical to a healthy one.
 
 | Field | Meaning |
 |---|---|
-| `val_loss` | mean CE on the data never seen by the optimiser |
+| `loss` | mean CE on the data never seen by the optimiser |
 | `n_rows`   | how many held-out examples were averaged |
+| `wall_min` | how long the probe took (fetches the val once, then reads a local cache) |
+
+The record carries no `gnorm` or `ema_loss`, so a val line can never be read
+as a train line by the curve or registry consumers.
+
+The probe reuses `train_step_qwen`'s exact loss recipe (same shift, same -100
+mask, same `lm_head` gather), so a gap between the two curves is real
+overfitting rather than a difference of method.
+
+The val is materialized once to `val_cache_<n>.pt` (~10 MB) and every later
+probe reads it locally — the val plan spans 99 shards, so re-streaming it per
+probe would be ~16 GB each time.
 
 ### run end (`"type": "run_end"` — last line)
 

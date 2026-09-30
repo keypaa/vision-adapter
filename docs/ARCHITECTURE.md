@@ -88,7 +88,7 @@ All training constants live in one frozen dataclass. Every field is validated in
 | `warmup_steps` | `100` | linear warmup before cosine decay to 10% |
 | `grad_clip` | `1.0` | global grad-norm clip |
 | `max_seq_len` | `4096` | text + vision tokens per example (answer has priority) |
-| `epochs` | `2` | passes over 120k |
+| `epochs` | `2` | passes over the 117,600-row train manifest |
 | `batch_size` | `8` | per-device |
 | `samples_per_baseten_grok` | `57600` | `900×64` — grok reference |
 | `log_every` | `1` | log period (probe overrides 20) |

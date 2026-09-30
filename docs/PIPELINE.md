@@ -41,7 +41,7 @@ Auth chain (all stages, `backends/auth.py:15`): `--hf-token > $HF_TOKEN > $HUGGI
 | Repo | Type | Holds |
 |---|---|---|
 | `keypa/MoonViT-V2-Standalone` | model | `moonvit_v2.safetensors` (`vision_tower.*`), `vision_config.json`, `moonvit.py`/`preprocess.py` code |
-| `keypa/vision-adapter-manifests` | dataset | `train_manifest.jsonl` header-first + `train_manifest_val.jsonl` + `cauldron_manifest.jsonl` |
+| `keypa/vision-adapter-manifests` | dataset | `train_manifest_grids.jsonl` (train input, per-row `grid_thw`) + `train_manifest_val_disjoint.jsonl` (held-out) + `train_manifest.jsonl` / `train_manifest_val.jsonl` (pre-backfill) + `cauldron_manifest.jsonl` |
 | `keypa/vision-adapter-embeddings` | dataset | `data/emb_XXXX.parquet` `103×1360=138987 rows 883.8GiB` (`stream.py:29 EMB_REPO`, `pack.py:15`) |
 | `keypa/vision-adapter-grok-probe` | dataset | probe pushes `latest.safetensors+latest.opt.pt+probe_log.jsonl+probe_curves.png` each `500 steps` (`GROK_PROBE.md`) |
 

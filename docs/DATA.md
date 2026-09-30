@@ -82,7 +82,8 @@ No, but the number needs translating. Baseten's ~900-step grok point was:
 66k images × batch 64 → 1035 steps ≈ 1 epoch; grok observed *just before
 epoch end*, i.e. after the model had seen **≈ 58k samples**.
 
-Our manifest is 120k, and our per-device batch is 8 (A100 memory-bound).
+Our manifest is 117,600 rows (the 120k target, minus what the upstream slices
+actually yielded), and our per-device batch is 8 (A100 memory-bound).
 Grokking correlates with *samples seen*, not wall-clock steps. The honest
 translation:
 
@@ -104,8 +105,10 @@ exactly why we log everything (see OPERATIONS.md).
 ./data/images/agentic/<name>.png|jpg        # dataset stage output, 79,659 files
 ./data/images/cauldron/<subset>-<idx>-<j>.png
 ./data/metadata/cauldron_manifest.jsonl     # raw cauldron rows
-./data/train_manifest.jsonl                 # header-first 45/45/10 SFT mix (trainer input)
-./data/train_manifest_val.jsonl             # held-out ~2% for eval hooks
+./data/train_manifest_grids.jsonl            # header-first 45/45/10 SFT mix + per-row grid_thw (trainer input)
+./data/train_manifest.jsonl                 # same mix before the geometry backfill — superseded, kept for old ckpt sha256
+./data/train_manifest_val_disjoint.jsonl    # held-out 1,272 rows, disjoint from train by image
+./data/train_manifest_val.jsonl             # original 2,400-row val — 47% emb overlap with train, do not use
 ./data/embeddings/<sha1>.pt                 # precomputed MoonViT features (→ packed to shards)
 ./data/shards/emb_XXXX.parquet              # packed shards: key, n_vis, vis_bytes (SHARD_ROWS=1360, compression=None, per-shard sha256)
 ./data/logs/train_log.jsonl                 # per-step telemetry (line 0 = config_header, see OPERATIONS.md)

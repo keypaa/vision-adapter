@@ -9,7 +9,7 @@ model repo; two are dataset repos. Everything is opt-in per repo via the
 | Repo | Type | Visibility | What it holds | Code ref |
 |---|---|---|---|---|
 | `keypa/MoonViT-V2-Standalone` | **model** | public | 401 M-param BF16 MoonViT-V2 weights, `vision_config.json`, Kimi's own `mm_projector`, and runtime code (`moonvit.py`, `preprocess.py`, etc.) | `ARCHITECTURE.md` |
-| `keypa/vision-adapter-manifests` | dataset | public by default | `train_manifest.jsonl` header-first `v1 git_sha,seeds,upstream,shard_set_hash,row_count,tags` + `train_manifest_val.jsonl` + `cauldron_manifest.jsonl` | `stream.py:30 MANIFEST_REPO`, `vision_adapter/manifest.py:60` |
+| `keypa/vision-adapter-manifests` | dataset | public by default | `train_manifest_grids.jsonl` (117,600 rows + per-row `grid_thw`; header-first `v1 git_sha,seeds,upstream,shard_set_hash,row_count,tags`) + `train_manifest_val_disjoint.jsonl` (1,272 rows, disjoint by image) + `train_manifest.jsonl` / `train_manifest_val.jsonl` (pre-backfill, kept for old ckpt `manifest_sha256`) + `cauldron_manifest.jsonl` | `stream.py:30 MANIFEST_REPO`, `vision_adapter/manifest.py:37` |
 | `keypa/vision-adapter-embeddings` | dataset | public by default | `data/emb_XXXX.parquet` `103×1360=138987 rows 883.8GiB 8.58GiB avg` (`key=embeddings/<sha1[:20]>.pt, n_vis, vis_bytes` bf16→tobytes, `compression=None`, per-shard `sha256`) | `stream.py:29 EMB_REPO`, `pack.py:15` |
 | `keypa/vision-adapter-grok-probe` | dataset | public | probe pushes `latest.safetensors+latest.opt.pt+probe_log.jsonl+probe_curves.png` each `500 steps` (Colab crash resilience) | `GROK_PROBE.md:61` |
 
