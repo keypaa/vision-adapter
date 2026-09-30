@@ -12,6 +12,7 @@ is intentionally backend-agnostic: it takes DataBackend and a TrainConfig.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import time
 import torch
@@ -450,6 +451,43 @@ def resolve_dtype(capability: int, dtype_arg: str = "auto"):
             f"unknown dtype {dtype_arg!r} (expected auto|bf16|fp16|fp32)"
         )
     return explicit[dtype_arg]
+
+
+def _val_cache_path(data_dir, sample_size: int):
+    """Where the materialized val lives. Keyed by size so two vals never clash."""
+    return Path(data_dir) / f"val_cache_{int(sample_size)}.pt"
+
+
+def materialize_val(batches, data_dir, sample_size: int, rebuild: bool = False) -> list:
+    """Return the val batches as plain tensors, materializing them once.
+
+    The cache wins: if it already exists the ``batches`` argument is never
+    iterated, so a caller can pass a streaming source unconditionally
+    without paying for it twice. That is the whole point — the val plan
+    spans 99 shards (~17GB of Range fetches) and a long run probes it
+    repeatedly, but the vectors themselves are only ~10MB.
+    """
+    path = _val_cache_path(data_dir, sample_size)
+    if path.is_file() and not rebuild:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    if batches is None:
+        raise RuntimeError(
+            f"val cache missing at {path} and no source to build it from"
+        )
+
+    out = []
+    for b in batches:
+        out.append(
+            {k: (v.detach().cpu() if isinstance(v, torch.Tensor) else v)
+             for k, v in b.items()}
+        )
+    tmp = path.with_suffix(".pt.tmp")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(out, str(tmp))
+    os.replace(str(tmp), str(path))
+    print(f"[train] val materialized: {len(out)} batches -> {path} "
+          f"({path.stat().st_size/2**20:.1f} MiB, no re-stream needed)", flush=True)
+    return out
 
 
 def _val_due(step: int, val_every: int, total_steps: int | None = None) -> bool:
@@ -900,6 +938,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     # are the constraint here). A missing val manifest disables the probe
     # loudly rather than silently training unmonitored.
     val_plan, val_order = None, []
+    _n_val_planned = 0
     if cfg.val_every > 0:
         _val_rows: list[dict] = []
         _local_val = data_dir / VAL_MANIFEST_FILE
@@ -927,6 +966,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 excluded_shards=set(plan.keys()),
             )
             _n_val = sum(len(v) for v in val_plan.values())
+            _n_val_planned = _n_val
             print(f"[train] val plan: {_n_val}/{len(_val_rows)} rows "
                   f"from {len(val_plan)} shards (every {cfg.val_every} steps)", flush=True)
         else:
@@ -995,12 +1035,13 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     it = _batch_iter()
 
     def _val_batches():
-        """Fresh pass over the held-out split each probe (re-stream, no cache)."""
+        """Collate the held-out split. Materialized on the first call."""
         ds = _EmbDS(val_plan, val_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"),
                     vision_dim=cfg.vision_dim, grid_sidecar=cfg.grid_sidecar)
-        return _torch.utils.data.DataLoader(
+        loader = _torch.utils.data.DataLoader(
             ds, batch_size=cfg.batch_size, drop_last=False, collate_fn=collate, num_workers=0
         )
+        return materialize_val(loader, data_dir, _n_val_planned)
     # Ensure first shard prefetch completes before first batch (or timeout 30s)
     if _first_shard_fut is not None:
         try:
