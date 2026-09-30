@@ -176,7 +176,8 @@ def test_resume_falls_back_to_previous_on_corrupt_latest(tmp_path, monkeypatch):
 
     seen: dict = {}
 
-    def _fake_stream(dd, cfg, max_steps, dev, dtype, resume_ckpt=None):
+    def _fake_stream(dd, cfg, max_steps, dev, dtype, resume_ckpt=None,
+                     allow_synthetic=False):
         seen["step"] = resume_ckpt.get("step")
         seen["path_step"] = resume_ckpt.get("step")
         assert dev == "cpu"

@@ -198,6 +198,7 @@ def train_cmd(args: argparse.Namespace) -> int:
         dtype=getattr(args, "dtype", "auto"),
         resume=getattr(args, "resume", "off"),
         resume_step=getattr(args, "resume_step", None),
+        allow_synthetic=getattr(args, "allow_synthetic", False),
     )
 
 
@@ -277,6 +278,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=None, help="max training steps")
     p.add_argument("--val-every", type=int, default=None,
                    help="held-out probe interval in steps (default 250; must be >0)")
+    p.add_argument("--allow-synthetic", dest="allow_synthetic", action="store_true",
+                   help="train on the synthetic geometry stand-in (inverts orientation "
+                        "on ~18%% of rows) as a deliberate A/B baseline")
     p.add_argument("--batch-size", type=int, default=None, help="override batch size (e.g. 48 for PRO 6000 ckpt OFF)")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32 with true AMP; T4: use bf16 or fp32")
@@ -299,6 +303,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-steps", type=int, default=None, help="max training steps")
     p.add_argument("--val-every", type=int, default=None,
                    help="held-out probe interval in steps (default 250; must be >0)")
+    p.add_argument("--allow-synthetic", dest="allow_synthetic", action="store_true",
+                   help="train on the synthetic geometry stand-in (inverts orientation "
+                        "on ~18%% of rows) as a deliberate A/B baseline")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32")
     p.add_argument("--push-to-hf", dest="push_to_hf", action="store_true", help="push ckpts + log to HF model repo on save")

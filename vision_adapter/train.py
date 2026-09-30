@@ -457,6 +457,28 @@ MEASURED_MANIFEST_FILE = "train_manifest_grids.jsonl"
 PLAIN_MANIFEST_FILE = "train_manifest.jsonl"
 
 
+def geometry_guard(grid_source: str, allow_synthetic: bool = False) -> None:
+    """Refuse to train on the synthetic geometry stand-in unless asked.
+
+    Measured 2026-09-30 over the 117600-row manifest: grid_for_nvis differs
+    from the true MoonViT grid on 38.1% of rows and INVERTS portrait and
+    landscape on 18.3% of them (aspect error up to x89). A long run on that
+    geometry looks healthy and is wrong, so it must be requested by name.
+
+    Pass allow_synthetic=True for a deliberate A/B against the old geometry —
+    that is a real experiment, it just must never be the default.
+    """
+    if grid_source == "measured" or allow_synthetic:
+        return
+    raise RuntimeError(
+        f"refusing to train on grid_source={grid_source!r}: the manifest lacks "
+        f"measured MoonViT geometry, and the synthetic stand-in inverts image "
+        f"orientation on ~18% of rows. Use the backfilled manifest "
+        f"({MEASURED_MANIFEST_FILE}), or pass allow_synthetic=True to run the "
+        f"old geometry as a deliberate baseline."
+    )
+
+
 def resolve_manifest_name(data_dir) -> str:
     """Which train manifest to use: the measured-geometry one if present.
 
@@ -811,7 +833,7 @@ def _persist_fetched_manifest(data_dir: Path, rows: list[dict]) -> Path:
     return out
 
 
-def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str, dtype_arg: str = "auto", resume_ckpt: dict | None = None) -> int:  # noqa: C901
+def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, device: str, dtype_arg: str = "auto", resume_ckpt: dict | None = None, allow_synthetic: bool = False) -> int:  # noqa: C901
     """Native HF streaming train — cluster-sampled RemoteShard, no grok import.
 
     When resume_ckpt is given, continue at ckpt["step"]+1 with restored
@@ -1017,14 +1039,13 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         print(f"[train] resume appending to {log_path} run_id={run_id}", flush=True)
     else:
         try:
-            from vision_adapter.manifest import manifest_has_grids
+            from vision_adapter.manifest import grid_source_for, manifest_has_grids
 
             _have, _missing = manifest_has_grids(rows)
-            _grid_source = "measured" if _have and not _missing else (
-                "partial" if _have else "synthetic"
-            )
+            _grid_source = grid_source_for(_have, _missing)
             print(f"[train] geometry: {_have}/{_have + _missing} manifest rows carry "
                   f"grid_thw (grid_source={_grid_source})", flush=True)
+            geometry_guard(_grid_source, allow_synthetic=allow_synthetic)
             hdr = config_header(cfg, manifest_path=str(local_manifest) if local_manifest.is_file() else None, extra={"run":"train-stream","device":dev,"dtype":str(dtype),"sample_size":sample_size,"grid_source":_grid_source,"manifest":manifest_name or MEASURED_MANIFEST_FILE})
             run_id = hdr.get("run_id")
             with open(log_path, "w", buffering=1) as lf:
@@ -1301,7 +1322,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             pass
     return 0
 
-def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None) -> int:
+def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None, allow_synthetic: bool = False) -> int:
     """Load latest (or K) local step ckpt and continue via the streaming restore path."""
     try:
         ckpt_path = _find_local_ckpt(dd, resume_step)
@@ -1342,7 +1363,7 @@ def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device:
             print(str(e), flush=True)
             raise
     try:
-        return _streaming_train(dd, cfg, max_steps, _resume_dev, dtype, resume_ckpt=resume_ckpt)
+        return _streaming_train(dd, cfg, max_steps, _resume_dev, dtype, resume_ckpt=resume_ckpt, allow_synthetic=allow_synthetic)
     except Exception as e:
         import traceback
         print(f"[train] streaming resume failed ({type(e).__name__}: {e})", flush=True)
@@ -1351,7 +1372,7 @@ def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device:
         return 1
 
 
-def _run_resume_hf(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None) -> int:
+def _run_resume_hf(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None, allow_synthetic: bool = False) -> int:
     """Download latest (or K) step ckpt from the HF ckpt repo, then continue via the identical Task 2 restore path."""
     import os
 
@@ -1409,7 +1430,7 @@ def _run_resume_hf(dd: Path, cfg: TrainConfig, max_steps: int | None, device: st
             print(str(e), flush=True)
             raise
     try:
-        return _streaming_train(dd, cfg, max_steps, _resume_dev, dtype, resume_ckpt=resume_ckpt)
+        return _streaming_train(dd, cfg, max_steps, _resume_dev, dtype, resume_ckpt=resume_ckpt, allow_synthetic=allow_synthetic)
     except Exception as e:
         import traceback
         print(f"[train] streaming resume failed ({type(e).__name__}: {e})", flush=True)
@@ -1427,6 +1448,7 @@ def run_train(
     dtype: str = "auto",
     resume: str = "off",
     resume_step: int | None = None,
+    allow_synthetic: bool = False,
 ) -> int:
     """Entry point for `cli train` non-dryrun.
 
@@ -1444,9 +1466,9 @@ def run_train(
         print(f"[train] unknown --resume {resume!r} (expected off|local|hf)", flush=True)
         return 1
     if resume == "hf":
-        return _run_resume_hf(dd, cfg, max_steps, device, dtype, resume_step)
+        return _run_resume_hf(dd, cfg, max_steps, device, dtype, resume_step, allow_synthetic=allow_synthetic)
     if resume == "local":
-        return _run_resume_local(dd, cfg, max_steps, device, dtype, resume_step)
+        return _run_resume_local(dd, cfg, max_steps, device, dtype, resume_step, allow_synthetic=allow_synthetic)
     dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
     # Only gate on GPU when we actually need CUDA kernels; smoke fallback runs on CPU
     # but warn — real training will need a card.
@@ -1480,7 +1502,7 @@ def run_train(
         return _local_train_with_precomputed(dd, cfg, max_steps, dev, dtype)
     print("[train] no local embeddings — streaming from HF (keypa/vision-adapter-embeddings)", flush=True)
     try:
-        return _streaming_train(dd, cfg, max_steps, dev, dtype)
+        return _streaming_train(dd, cfg, max_steps, dev, dtype, allow_synthetic=allow_synthetic)
     except Exception as e:
         import traceback
         print(f"[train] streaming train failed ({type(e).__name__}: {e})", flush=True)

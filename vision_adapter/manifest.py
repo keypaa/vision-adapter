@@ -203,3 +203,15 @@ def manifest_has_grids(rows: list[dict[str, Any]]) -> tuple[int, int]:
     )
     total = sum(1 for r in rows if r.get("type") != "manifest_header")
     return have, total - have
+
+
+def grid_source_for(have: int, missing: int) -> str:
+    """Classify a manifest's geometry coverage.
+
+    ``partial`` exists so a half-backfilled manifest can never be reported
+    as fully measured — that is the kind of claim that makes two loss curves
+    look comparable when they are not.
+    """
+    if missing == 0 and have > 0:
+        return "measured"
+    return "partial" if have else "synthetic"
