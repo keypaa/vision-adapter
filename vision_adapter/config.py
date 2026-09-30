@@ -178,6 +178,14 @@ class TrainConfig:
             raise ValueError(f"vision_dim must be >0, got {self.vision_dim}")
         if not 0 < self.ema_beta < 1:
             raise ValueError(f"ema_beta must be in (0,1), got {self.ema_beta}")
+        # val_every<=0 would silently disable the held-out probe, which is the
+        # one thing that makes a long run interpretable. Reject it at build
+        # time rather than letting a run look healthy while unmonitored.
+        if self.val_every <= 0:
+            raise ValueError(
+                f"val_every must be >0 (0 would silently disable the val probe), "
+                f"got {self.val_every}"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)

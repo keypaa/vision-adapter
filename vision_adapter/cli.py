@@ -97,6 +97,22 @@ def pack_cmd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _apply_cfg_overrides(cfg, args: argparse.Namespace):
+    """Apply the flag-level config overrides in one place.
+
+    Split out of train_cmd so the complexity budget stays under mccabe's
+    limit, and so every ``--flag`` that maps to a TrainConfig field is
+    visible together rather than scattered through the command body.
+    """
+    if getattr(args, "batch_size", None) is not None:
+        cfg = cfg.replace(batch_size=args.batch_size)
+        print(f"[train] override batch_size={cfg.batch_size} (ckpt OFF kept)", flush=True)
+    if getattr(args, "val_every", None) is not None:
+        cfg = cfg.replace(val_every=args.val_every)
+        print(f"[train] override val_every={cfg.val_every} steps", flush=True)
+    return cfg
+
+
 def train_cmd(args: argparse.Namespace) -> int:
     _resolve_hf_token(args)
     dryrun = getattr(args, "dryrun", False)
@@ -120,10 +136,7 @@ def train_cmd(args: argparse.Namespace) -> int:
     cfg_name = getattr(args, "config", "default")
     cfg_fn = {"default": default_config, "probe": probe_config, "probe_big": probe_big_config, "colab": colab_probe_config}.get(cfg_name, default_config)
     cfg = cfg_fn()
-    # --batch-size override (for PRO 6000 96GB ckpt OFF)
-    if getattr(args, "batch_size", None) is not None:
-        cfg = cfg.replace(batch_size=args.batch_size)
-        print(f"[train] override batch_size={cfg.batch_size} (ckpt OFF kept)", flush=True)
+    cfg = _apply_cfg_overrides(cfg, args)
     backend_name = getattr(args, "backend", "local")
     data_dir = Path(getattr(args, "data_dir", "data"))
     max_steps = getattr(args, "max_steps", None)
@@ -262,6 +275,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="train config preset (probe_big=96 PRO 6000)",
     )
     p.add_argument("--max-steps", type=int, default=None, help="max training steps")
+    p.add_argument("--val-every", type=int, default=None,
+                   help="held-out probe interval in steps (default 250; must be >0)")
     p.add_argument("--batch-size", type=int, default=None, help="override batch size (e.g. 48 for PRO 6000 ckpt OFF)")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32 with true AMP; T4: use bf16 or fp32")
@@ -282,6 +297,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = subs.add_parser("probe", help="alias for train --config colab")
     p.add_argument("--data-dir", default="data", help="data directory")
     p.add_argument("--max-steps", type=int, default=None, help="max training steps")
+    p.add_argument("--val-every", type=int, default=None,
+                   help="held-out probe interval in steps (default 250; must be >0)")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32")
     p.add_argument("--push-to-hf", dest="push_to_hf", action="store_true", help="push ckpts + log to HF model repo on save")
