@@ -28,6 +28,25 @@ from vision_adapter.models.moonvit import load_moonvit_from_safetensors
 from vision_adapter.models.preprocess import collate_images
 from vision_adapter.core import build_projector, make_collate, embeds_for
 
+def build_legacy_gen_kwargs(batch, device):
+    """Generation kwargs for the legacy splice layout, positions included.
+
+    Training feeds mRoPE over the visual span (train_step_qwen ->
+    train_position_ids). Passing only inputs_embeds + attention_mask to
+    generate left the image tokens on plain arange positions — a geometry the
+    backbone never saw in training. The held-out loss gate uses the real
+    positions, which is why the curve and the generation check disagreed.
+    """
+    from vision_adapter.core import _resolve_positions_mode, train_position_ids
+
+    if _resolve_positions_mode() != "mrope":
+        return {}
+    pos = train_position_ids(batch).to(device)
+    # generate() wants the live prefix only; the batch is already the prefix
+    # here, so the full width is correct.
+    return {"position_ids": pos}
+
+
 def build_gen_kwargs(mode):
     """Sampling params per Qwen3.5 model card (non-thinking VL recipe).
 
@@ -227,6 +246,7 @@ def main():
         gen_batch, cut = strip_trailing_eos(batch, tok.eos_token_id)
         print(f"prefix cut at {cut} (was {batch['input_ids'].shape[1]}) — EOS-terminated train layout would generate empty")
         inp = embeds_for(model, gen_batch, proj, str(device))
+        extra_kwargs = build_legacy_gen_kwargs(gen_batch, device)
         vis_mask = None
     torch.manual_seed(args.seed)
     if args.decode == "manual":

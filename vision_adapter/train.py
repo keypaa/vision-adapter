@@ -480,6 +480,35 @@ def resolve_step_budget(max_steps: int | None, lr_horizon: int | None = None) ->
     return None
 
 
+def resolve_proj_dtype(device: str, backbone_dtype) -> "torch.dtype":
+    """The projector is the only trainable module, so it is always fp32.
+
+    It used to follow the backbone, which left it in bf16 on the common path
+    (only the fp16 branch got fp32). bf16's spacing at magnitude 1.0 is
+    0.0078 with a down-step of 0.0039, so a 5e-4 AdamW update rounds away on
+    every step: measured on real checkpoints, the input LayerNorm gain was
+    still exactly 1.0 after 200 steps while the other five tensors moved.
+    """
+    del device, backbone_dtype  # the answer does not depend on either
+    return torch.float32
+
+
+def resolve_sample_size(max_steps: int | None, batch_size: int, n_rows: int) -> int:
+    """How many manifest rows the data plan should draw.
+
+    A bounded run plans ``max_steps * batch * 2`` so there is material for an
+    epoch wrap. An unbounded run has no step count to plan against, so it
+    takes the whole manifest — the alternative (substituting 5 for None, as
+    this did) silently reduced an unbounded run to 160 rows from a single
+    shard, and the run then memorised them for as long as it was left running.
+    """
+    if batch_size <= 0:
+        raise ValueError(f"batch_size must be >0, got {batch_size}")
+    if max_steps is None:
+        return int(n_rows)
+    return int(min(n_rows, max_steps * batch_size * 2))
+
+
 def geometry_guard(grid_source: str, allow_synthetic: bool = False) -> None:
     """Refuse to train on the synthetic geometry stand-in unless asked.
 
@@ -938,7 +967,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     cfg_llm = getattr(model.config, "text_config", model.config)
     llm_dim = int(cfg_llm.hidden_size)
-    proj_dtype = _torch.float32 if (dev=="cuda" and dtype==_torch.float16) else dtype
+    proj_dtype = resolve_proj_dtype(dev, dtype)
     proj = build_projector(cfg.vision_dim, llm_dim).to(dev, dtype=proj_dtype)
     _rms = getattr(getattr(proj, "target_rms", None), "item", lambda: None)()
     print(f"[train] projector: {type(proj).__name__}" + (f" target_rms={_rms}" if _rms is not None else ""), flush=True)
@@ -1004,7 +1033,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         sample_size = int(_resume_info["sample_size"])
         _plan_seed = int(_resume_info.get("seed", 0))
     else:
-        sample_size = min(len(rows), (max_steps or 5) * cfg.batch_size * 2)
+        sample_size = resolve_sample_size(max_steps, cfg.batch_size, len(rows))
         _plan_seed = 0
     plan = _build_plan(rows, index, sample_size=sample_size, seed=_plan_seed, excluded_shards=EXCLUDED)
     n_planned = sum(len(v) for v in plan.values())
