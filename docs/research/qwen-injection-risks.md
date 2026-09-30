@@ -19,3 +19,17 @@ positions visuelles fausseraient le routage des premières couches.
 Écrire du Flex pour Qwen avant de savoir quelle couche domine (NEXT_STEPS §3),
 ou bench Qwen en espérant un transfert DeepSeek : gaspillage probable.
 Bench d’abord, code ensuite.
+
+## R5. Tous les runs historiques incluent les markers (audit 2026-09-30)
+Les 4 000 steps (resume 400→4000, scalé+mRoPE, held-out +11,9 %) ont entraîné
+AVEC les 265 tokens markers par row agentic. Stripper change le setup :
+comparer un futur run sans markers aux courbes historiques serait comparer
+deux distributions différentes. Toute run card post-strip doit le noter
+explicitement (champ à prévoir dans `experiments/run_cards.jsonl`).
+
+## R6. Gates val non probantes à 47 % d'overlap (audit 2026-09-30)
+`train_manifest_val.jsonl` recouvre train à 47 % par `emb` : un gate
+`val_loss` sur ce split mesure en partie de la mémorisation. Ne pas verdir
+de gate val sans split disjoint par `emb` (rebuild) ou sans le documenter
+comme optimiste. Le held-out shards (`eval_heldout.py`) n'est pas innocenté
+non plus (U7).

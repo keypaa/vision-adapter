@@ -51,3 +51,25 @@ Contenu généré : écho de prompt + hallucination (scène de bureau pour un
 logo), pas de description — signal visuel faible ou ignoré à 300 steps
 hors-domaine. Prochain test qui compte : image in-domain + comparaison
 au texte assistant de sa propre row.
+
+## U5. Impact loss des 265 tokens markers — OUVERT (audit 2026-09-30)
+Quantifié (265 tokens/row agentic, ~94 % du user médian) mais effet sur la
+convergence jamais mesuré : aucun run sans markers. Expérience de clôture :
+différentiel même-tête même-batches avec strip dans `make_collate`
+(TDD, pin test sur tokens libérés), held-out mêmes 60 rows par régime.
+BLOQUÉ par décision 2026-09-30 : noter d'abord, aucun fix implémenté.
+
+## U6. `n_vis` par `g` et mélange effectif — LEVÉ (2026-09-30, PC local)
+Mesuré en 44 s, CPU + réseau seuls (aucun GPU nécessaire — correction de la
+note précédente) : key-index 138 987 clés, join 117 600/117 600, 0 manquant.
+Mélange effectif ≈ 22/72/6 en tokens visuels (agentic/doc/conv), pas 45/45/10 ;
+agentic ~364 constant (max 380), long tail portée par `doc` seul (max 16 598).
+Détail : `qwen-injection-evidence.md` § `n_vis` par `g`. Reste ouvert : la part
+en tokens supervisés et temps GPU (nécessite un run instrumenté).
+
+## U7. Disjonction image/épisode du val — OUVERT (audit 2026-09-30)
+47 % d'overlap `emb` train/val mesuré sur `train_manifest_val.jsonl`, mais la
+disjonction du val shard-level (`eval_heldout.py`) n'est pas vérifiée
+(trajectoires UI multi-screenshots, questions multiples par image Cauldron).
+Clôture : audit overlap par `emb` + heuristique trajectoire sur les shards
+évalués. Non lancé.

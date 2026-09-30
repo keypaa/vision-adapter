@@ -20,3 +20,17 @@ Date : 2026-09-21. Statut : spec verrouillé sur sources, non implémenté.
 
 Voir aussi : `qwen-injection-evidence.md`, `qwen-injection-unknowns.md`,
 `qwen-injection-risks.md`, `qwen-injection-next.md`.
+
+## Audit manifest live (2026-09-30, lecture-seule, aucun fix implémenté)
+
+- Les 52 924 rows `agentic` (100 %) portent un bloc image textuel Sero
+  (`|begin_of_image| + 128×|image| + |end_of_image|`, compte fixe) = 265 tokens
+  Qwen par row ; `make_collate` ne le strippe pas et `embeds_for` injecte les
+  embeddings en plus → double représentation avérée, ~265/283 tokens du user
+  médian agentic = markers.
+- 38,6 % des rows train répètent une clé `emb` déjà vue (8 653 clés, tout en
+  `doc`/`conv`, 0 en agentic) ; 47 % des rows val (1 128/2 400) ont leur `emb`
+  dans train → val_loss `modal_train.py` optimiste.
+- Comptes live : train 117 600 (agentic 52 924 / doc 52 908 / conv 11 768),
+  val 2 400 — ni 120k ni 114 024. Détail chiffré : `qwen-injection-evidence.md`
+  § Audit ; composition acceptée telle quelle (décision 2026-09-30).
