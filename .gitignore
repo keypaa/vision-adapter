@@ -16,3 +16,7 @@ runs*.jsonl
 session-export-*.jsonl
 checkpoints/
 logs/
+zenno/traces/
+zenno/telemetry/
+zenno/graph/
+*.egg-info/

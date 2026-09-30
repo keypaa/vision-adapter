@@ -341,6 +341,152 @@ def _cuda_mem_snapshot() -> dict | None:
         return None
 
 
+VAL_MANIFEST_FILE = "train_manifest_val_disjoint.jsonl"
+
+
+def _val_rows_from_file(path) -> list[dict]:
+    """Load a val manifest, skipping the provenance header row."""
+    from vision_adapter.manifest import load_manifest
+
+    rows, _header = load_manifest(path)
+    return rows
+
+
+def _batch_loss(model, proj, batch, device, position_ids=None):
+    """Cross-entropy on the supervised tokens, exactly as the train step does.
+
+    Mirrors ``core.train_step_qwen``'s loss branch: same shift, same -100 mask,
+    same ``lm_head`` gather, so a val/train gap reflects overfitting and not a
+    difference of recipe. The projector still runs (it is the thing being
+    evaluated) but no backward happens — the caller decides that.
+    """
+    import torch.nn.functional as F
+
+    from vision_adapter.core import (
+        _resolve_native_train,
+        _resolve_positions_mode,
+        embeds_for,
+        train_position_ids,
+    )
+
+    if _resolve_native_train():
+        from vision_adapter.native import native_train_forward
+
+        embeds, labels, attn, pos4 = native_train_forward(model, proj, batch, device)
+        if position_ids is None:
+            position_ids = pos4
+    else:
+        inp = embeds_for(model, batch, proj, device)
+        labels = inp.pop("labels")
+        embeds, attn = inp["inputs_embeds"], inp["attention_mask"]
+        if position_ids is None and _resolve_positions_mode() == "mrope":
+            position_ids = train_position_ids(batch).to(embeds.device)
+
+    out = model.model(
+        inputs_embeds=embeds,
+        attention_mask=attn,
+        position_ids=position_ids,
+    )
+    hidden = out.last_hidden_state
+    shift_labels = labels[:, 1:]
+    mask = shift_labels != -100
+    if not bool(mask.any()):
+        return None
+    pos = mask.nonzero(as_tuple=False)
+    h_sel = hidden[:, :-1][pos[:, 0], pos[:, 1]]
+    y_sel = shift_labels[pos[:, 0], pos[:, 1]]
+    return F.cross_entropy(model.lm_head(h_sel).float(), y_sel)
+
+
+def _val_probe(loss_fn, model, proj, batches, device):
+    """Mean per-batch loss over the held-out split, plus the row count.
+
+    ``loss_fn(model, proj, batch, device) -> loss tensor or None`` (None for a
+    batch with no supervised token). Grad-free; the projector is returned to
+    its previous train/eval mode afterwards.
+    """
+    import torch
+
+    total, n_batches, n_rows = 0.0, 0, 0
+    prev_training = proj.training if hasattr(proj, "training") else None
+    if prev_training is not None:
+        proj.eval()
+    try:
+        with torch.no_grad():
+            for batch in batches:
+                loss = loss_fn(model, proj, batch, device)
+                n_batches += 1
+                n_rows += int(batch["input_ids"].shape[0])
+                if loss is not None:
+                    total += float(loss.item())
+    finally:
+        if prev_training is not None:
+            proj.train(prev_training)
+    return total / max(1, n_batches), n_rows
+
+
+def resolve_dtype(capability: int, dtype_arg: str = "auto"):
+    """Pick the backbone dtype from a CUDA capability code (major*10+minor).
+
+    ``auto`` NEVER returns fp16. Measured on a T4 (2026-09-30): the forward is
+    fine in fp16 (hidden absmax 48, logits 10.7, loss 9.36) but the backward
+    through the frozen backbone saturates and NaNs every projector grad
+    (6/6 params non-finite), because the projector is the only fp32 module and
+    the overflowing values are activations, not fp16 parameter grads — a
+    GradScaler cannot help. In bf16 the same step gives gnorm=522, 0/6
+    non-finite. Only pre-Ampere (cc<70, no bf16) falls back to fp32.
+    """
+    import torch as _torch
+
+    if dtype_arg == "auto":
+        return _torch.bfloat16 if capability >= 70 else _torch.float32
+    explicit = {
+        "bf16": _torch.bfloat16,
+        "fp16": _torch.float16,
+        "fp32": _torch.float32,
+    }
+    if dtype_arg not in explicit:
+        raise ValueError(
+            f"unknown dtype {dtype_arg!r} (expected auto|bf16|fp16|fp32)"
+        )
+    return explicit[dtype_arg]
+
+
+def _val_due(step: int, val_every: int, total_steps: int | None = None) -> bool:
+    """Whether to run the held-out probe at this step.
+
+    The final step always probes so a short run still reports a val loss;
+    step 0 never does, since that is the pre-training baseline the first
+    interval already captures.
+    """
+    if val_every <= 0:
+        return False
+    if step <= 0:
+        return False
+    if total_steps is not None and step == total_steps:
+        return True
+    return step % val_every == 0
+
+
+def _val_record(
+    step: int, loss: float, n_rows: int, wall_min: float | None = None
+) -> dict:
+    """One ``type: "val"`` log line.
+
+    Distinct type plus the absence of grad/ema fields keeps a val line from
+    ever being read as a train line by the curve/registry consumers.
+    """
+    rec = {
+        "type": "val",
+        "step": int(step),
+        "loss": round(float(loss), 5),
+        "n_rows": int(n_rows),
+    }
+    if wall_min is not None:
+        rec["wall_min"] = round(float(wall_min), 1)
+    return rec
+
+
 def _ensure_expandable_segments() -> bool:
     """Default PYTORCH_CUDA_ALLOC_CONF to expandable_segments (fragmentation relief).
 
@@ -518,9 +664,7 @@ def _local_train_with_precomputed(data_dir: Path, cfg: TrainConfig, max_steps: i
     # dtype: honors --dtype, defaults to bf16 Ampere+ else fp32
     if dev == "cuda":
         p = _torch.cuda.get_device_properties(0)
-        cc = p.major*10 + p.minor
-        dtype_map = {"auto": _torch.bfloat16 if cc>=80 else _torch.float32, "bf16": _torch.bfloat16, "fp16": _torch.float16, "fp32": _torch.float32}
-        dtype = dtype_map.get(dtype_arg, dtype_map["auto"])
+        dtype = resolve_dtype(p.major*10 + p.minor, dtype_arg)
     else:
         dtype = _torch.float32
     print(f"[train] local train: {len(sample)} rows, device={dev} dtype={dtype}", flush=True)
@@ -652,9 +796,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     dev = device if device in ("cuda","cpu") and (device!="cuda" or _torch.cuda.is_available()) else "cpu"
     if dev == "cuda":
         p = _torch.cuda.get_device_properties(0)
-        cc = p.major*10 + p.minor
-        dtype_map = {"auto": _torch.bfloat16 if cc>=80 else (_torch.float16 if cc>=70 else _torch.float32), "bf16": _torch.bfloat16, "fp16": _torch.float16, "fp32": _torch.float32}
-        dtype = dtype_map.get(dtype_arg, dtype_map["auto"])
+        dtype = resolve_dtype(p.major*10 + p.minor, dtype_arg)
         _torch.backends.cuda.matmul.allow_tf32 = True
     else:
         dtype = _torch.bfloat16 if False else _torch.float32
@@ -754,6 +896,41 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     plan = _build_plan(rows, index, sample_size=sample_size, seed=_plan_seed, excluded_shards=EXCLUDED)
     n_planned = sum(len(v) for v in plan.values())
     print(f"[train] streaming plan: {n_planned} rows from {len(plan)} shards", flush=True)
+    # Held-out plan, re-streamed from HF at each probe (no local cache: disk/RAM
+    # are the constraint here). A missing val manifest disables the probe
+    # loudly rather than silently training unmonitored.
+    val_plan, val_order = None, []
+    if cfg.val_every > 0:
+        _val_rows: list[dict] = []
+        _local_val = data_dir / VAL_MANIFEST_FILE
+        try:
+            if _local_val.is_file():
+                _val_rows = _val_rows_from_file(_local_val)
+            else:
+                from huggingface_hub import hf_hub_download
+
+                _kw = {"repo_type": "dataset"}
+                if tok_hf:
+                    _kw["token"] = tok_hf  # type: ignore[assignment]
+                _p = hf_hub_download(
+                    "keypa/vision-adapter-manifests", VAL_MANIFEST_FILE, **_kw
+                )
+                _val_rows = _val_rows_from_file(_p)
+        except Exception as e:  # noqa: BLE001
+            print(f"[train][WARN] val manifest unavailable ({e}) — val probe OFF", flush=True)
+        if _val_rows:
+            # exclude every shard the train plan already draws from, so a val
+            # row can never be served by a shard the trainer is streaming
+            val_order = [s for s in stream_order if s not in EXCLUDED]
+            val_plan = _build_plan(
+                _val_rows, index, sample_size=len(_val_rows), seed=_plan_seed,
+                excluded_shards=set(plan.keys()),
+            )
+            _n_val = sum(len(v) for v in val_plan.values())
+            print(f"[train] val plan: {_n_val}/{len(_val_rows)} rows "
+                  f"from {len(val_plan)} shards (every {cfg.val_every} steps)", flush=True)
+        else:
+            print("[train][WARN] no val rows — val probe OFF for this run", flush=True)
     # Logging
     log_path = data_dir / "probe_log.jsonl"
     curves_path = data_dir / "probe_curves.png"
@@ -804,7 +981,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
 
     def _batch_iter():
         _rg = str(_cache_root / "rg_cache") if "_cache_root" in locals() else str(data_dir / "cache" / "rg_cache")
-        ds = _EmbDS(plan, stream_order, start_pos=_start_pos, rg_cache_dir=_rg, vision_dim=cfg.vision_dim)
+        ds = _EmbDS(plan, stream_order, start_pos=_start_pos, rg_cache_dir=_rg, vision_dim=cfg.vision_dim, grid_sidecar=cfg.grid_sidecar)
         loader = _torch.utils.data.DataLoader(ds, batch_size=cfg.batch_size, drop_last=True, collate_fn=collate, num_workers=0)
         yield from loader
         # epoch wrap
@@ -812,10 +989,18 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             # NOTE: ds2 keeps start_pos=0 on purpose — _start_pos is a one-time
             # skip into the interrupted epoch for data continuity; later epochs
             # replay fully while samples_seen bookkeeping continues via step.
-            ds2 = _EmbDS(plan, stream_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"), vision_dim=cfg.vision_dim)
+            ds2 = _EmbDS(plan, stream_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"), vision_dim=cfg.vision_dim, grid_sidecar=cfg.grid_sidecar)
             loader2 = _torch.utils.data.DataLoader(ds2, batch_size=cfg.batch_size, drop_last=True, collate_fn=collate, num_workers=0)
             yield from loader2
     it = _batch_iter()
+
+    def _val_batches():
+        """Fresh pass over the held-out split each probe (re-stream, no cache)."""
+        ds = _EmbDS(val_plan, val_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"),
+                    vision_dim=cfg.vision_dim, grid_sidecar=cfg.grid_sidecar)
+        return _torch.utils.data.DataLoader(
+            ds, batch_size=cfg.batch_size, drop_last=False, collate_fn=collate, num_workers=0
+        )
     # Ensure first shard prefetch completes before first batch (or timeout 30s)
     if _first_shard_fut is not None:
         try:
@@ -911,6 +1096,23 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             rec["ema_loss"] = round(monitor.ema or rec["loss"],5)
             recs.append(rec)
             lf.write(json.dumps(rec)+"\n")
+            # Held-out probe. Runs on the SAME forward math as the train step
+            # (native_train_forward) under no_grad, so a gap between the two
+            # curves is real overfitting and not a recipe difference.
+            if val_plan and _val_due(step, cfg.val_every, steps):
+                _vt = time.time()
+                try:
+                    _vloss, _vn = _val_probe(
+                        _batch_loss, model, proj, _val_batches(), dev
+                    )
+                    lf.write(json.dumps(
+                        _val_record(step, _vloss, _vn, (time.time() - _vt) / 60)
+                    ) + "\n")
+                    print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] "
+                          f"[train] VAL step={step} loss={_vloss:.5f} "
+                          f"n={_vn} ({(time.time()-_vt)/60:.1f}min)", flush=True)
+                except Exception as e:  # noqa: BLE001 — a failed probe must not kill the run
+                    print(f"[train][WARN] val probe failed at step {step}: {e}", flush=True)
             # save every 10 steps for probe (200) to avoid losing $ on interrupt; hero uses cfg.save_every 500
             _save_every = 10 if steps <= 500 else cfg.save_every
             if _save_due(step, _save_every, last_save_ts, time.time(), _push_interval):
