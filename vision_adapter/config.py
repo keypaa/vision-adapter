@@ -126,11 +126,6 @@ class TrainConfig:
 
     # --- model geometry ---
     vision_dim: int = 4096              # MoonViT 2×2 merge flatten
-    # Path to the emb-key -> measured (1, gh, gw) sidecar (see
-    # vision_adapter.grid_sidecar). When set, mRoPE positions the visual span
-    # on the true MoonViT grid; when None every row falls back to the
-    # synthetic grid_for_nvis stand-in, which can invert orientation.
-    grid_sidecar: str | None = None
 
     # --- optimisation ---
     lr: float = 5e-4
@@ -263,10 +258,11 @@ def config_header(
         "python": sys.version.split()[0],
         "platform": platform.platform(),
         "config": cfg.to_dict(),
-        # mRoPE geometry regime. "synthetic" positions the visual span on the
-        # grid_for_nvis stand-in, which can invert orientation — curves from
-        # the two regimes are not comparable without this field.
-        "grid_source": "measured" if cfg.grid_sidecar else "synthetic",
+        # mRoPE geometry regime, measured from the manifest rather than
+        # configured: "measured" = the rows carry grid_thw, "synthetic" =
+        # every row falls back to grid_for_nvis, which can invert
+        # orientation. Curves from the two regimes are not comparable.
+        "grid_source": extra.get("grid_source", "unknown") if extra else "unknown",
     }
     if extra:
         header.update(extra)

@@ -1,106 +1,84 @@
-"""Grid sidecar: emb_key -> measured (1, gh, gw), built without re-running the ViT.
+"""grid_thw rides in the manifest itself — no sidecar file, no config knob.
 
-The corpus parquet already stores the true image dims, and preprocess is
-deterministic, so the MoonViT grid is recoverable (verified 400/400 against
-the n_vis in the embedding key index). The sidecar persists it so training
-can position mRoPE on measured geometry instead of the synthetic stand-in.
+Refactor 2026-09-30. The sidecar existed because I was reluctant to touch the
+manifest, which produced a second index of the same data plus a config field,
+a cache file, and a load path — four things to keep in sync for 20 bytes per
+row. The manifest already carries {emb, user, assistant, g} and IS the plan
+that training iterates, so the measured grid belongs there. Cost: ~20 bytes
+per row, +3% on an 82 MB manifest.
+
+The recovery itself is unchanged and still verified: the grid is a
+deterministic function of the image dims under the preprocess contract
+(400/400 live rows matched the stored n_vis), so the backfill is a one-time
+rewrite of the manifest from the image corpus.
 
 Run: python -m pytest tests/test_grid_sidecar.py -q
 """
 import json
 
-from vision_adapter.grid_sidecar import GridSidecar, build_sidecar_rows
+from vision_adapter.manifest import (
+    grid_thw_for_row,
+    manifest_has_grids,
+)
 
 
-class _FakeBatch:
-    def __init__(self, d):
-        self._d = d
-
-    def column(self, name):
-        class _C:
-            def __init__(self, v):
-                self._v = v
-
-            def to_pylist(self):
-                return self._v
-
-        return _C(self._d[name])
+def _row(emb, g="doc", grid=None):
+    r = {"emb": emb, "user": "u", "assistant": "a", "g": g}
+    if grid is not None:
+        r["grid_thw"] = grid
+    return r
 
 
-def test_rows_derive_grid_from_image_dims():
-    batches = [
-        _FakeBatch(
-            {
-                "filename": ["agentic/aitw_000000.jpg", "cauldron/x.png"],
-                "image": [b"fake-bytes-a", b"fake-bytes-b"],
-                "size": [10, 20],
-            }
-        )
-    ]
-    sizes = {("agentic", "aitw_000000.jpg"): (364, 784)}
-    rows = build_sidecar_rows(
-        batches,
-        key_fn=lambda g, b: f"embeddings/{g}-{b}.pt",
-        dims_fn=lambda g, b: sizes.get((g, b)),
+def test_row_with_a_grid_is_measured():
+    assert grid_thw_for_row(_row("e", grid=[1, 56, 26])) == [1, 56, 26]
+
+
+def test_row_without_a_grid_is_synthetic():
+    """A manifest not yet backfilled must still train, on the stand-in."""
+    assert grid_thw_for_row(_row("e")) is None
+
+
+def test_manifest_grid_coverage_is_reportable():
+    """The backfill needs to know how far it got, per group."""
+    rows = [_row("a", "agentic", [1, 4, 8]), _row("b", "agentic"),
+            _row("c", "doc", [1, 2, 4])]
+    have, missing = manifest_has_grids(rows)
+    assert have == 2 and missing == 1
+
+
+def test_manifest_without_grids_reports_zero_coverage():
+    rows = [_row("a"), _row("b")]
+    have, missing = manifest_has_grids(rows)
+    assert (have, missing) == (0, 2)
+
+
+def test_grid_survives_a_manifest_roundtrip(tmp_path):
+    """A rewrite must not drop grid_thw — that is the whole point."""
+    from vision_adapter.manifest import load_manifest, write_manifest_with_header
+
+    rows = [_row("e1", "agentic", [1, 56, 26]), _row("e2", "doc", [1, 52, 28])]
+    p = write_manifest_with_header(tmp_path / "m.jsonl", rows)
+    back, _header = load_manifest(p)
+    assert [r["grid_thw"] for r in back] == [[1, 56, 26], [1, 52, 28]]
+
+
+def test_legacy_manifest_still_loads_without_grids(tmp_path):
+    """Backwards compatibility: old manifests have no grid_thw at all."""
+    from vision_adapter.manifest import load_manifest
+
+    p = tmp_path / "legacy.jsonl"
+    p.write_text(
+        json.dumps({"emb": "e1", "user": "u", "assistant": "a", "g": "doc"}) + "\n"
     )
-    assert [r["emb"] for r in rows] == ["embeddings/agentic-aitw_000000.jpg.pt"]
-    # 364x784 px -> the measured portrait grid verified against the key index
-    assert rows[0]["grid_thw"] == [1, 56, 26]
+    rows, _ = load_manifest(p)
+    assert grid_thw_for_row(rows[0]) is None
 
 
-def test_missing_dims_produce_no_row():
-    """A file whose dims we could not read is omitted, never guessed."""
-    batches = [_FakeBatch({"filename": ["a.png"], "image": [b"x"], "size": [1]})]
-    rows = build_sidecar_rows(
-        batches, key_fn=lambda *_: "embeddings/aa.pt", dims_fn=lambda *_: None
-    )
-    assert rows == []
-
-
-def test_sidecar_roundtrip(tmp_path):
-    p = tmp_path / "grid_sidecar.json"
-    p.write_text(json.dumps({"embeddings/aa.pt": [1, 56, 26]}))
-    sc = GridSidecar(p)
-    assert sc.get("embeddings/aa.pt") == [1, 56, 26]
-    assert sc.get("embeddings/missing.pt") is None
-
-
-def test_sidecar_absent_file_is_empty(tmp_path):
-    sc = GridSidecar(tmp_path / "nope.json")
-    assert sc.get("embeddings/aa.pt") is None
-    assert len(sc) == 0
-
-
-def test_sidecar_grid_for_batch_falls_back_per_row():
-    sc = GridSidecar(None)
-    sc.data["embeddings/aa.pt"] = [1, 56, 26]
-    n_vis = [364, 4]
-    embs = ["embeddings/aa.pt", "embeddings/bb.pt"]
-    grids, sources = sc.grids_for(embs, n_vis)
-    assert grids[0] == [1, 56, 26] and sources[0] == "measured"
-    # no entry for bb -> synthetic, and the caller can see it
-    assert sources[1] == "synthetic"
-    assert grids[1] != grids[0]
-
-
-def test_dataset_item_carries_measured_grid(tmp_path):
-    """A stream item must expose grid_thw so collate/train can use it."""
-    import json as _json
+def test_dataset_no_longer_takes_a_sidecar_path():
+    """The config knob is gone; rows carry their own geometry."""
+    import inspect
 
     from vision_adapter.data.stream import EmbStreamDataset
 
-    p = tmp_path / "grid.json"
-    p.write_text(_json.dumps({"embeddings/aa.pt": [1, 56, 26]}))
-    ds = EmbStreamDataset(plan={}, stream_order=[], grid_sidecar=str(p))
-    item = ds.attach_grid({"emb": "embeddings/aa.pt", "n_vis": 364})
-    assert item["grid_thw"] == [1, 56, 26]
-    # unknown emb -> no grid, caller falls back and can label the run synthetic
-    assert "grid_thw" not in ds.attach_grid({"emb": "embeddings/zz.pt", "n_vis": 4})
-
-
-def test_dataset_without_sidecar_leaves_items_untouched():
-    from vision_adapter.data.stream import EmbStreamDataset
-
-    ds = EmbStreamDataset(plan={}, stream_order=[])
-    row = {"emb": "embeddings/aa.pt", "n_vis": 364}
-    assert ds.attach_grid(dict(row)) == row
+    sig = inspect.signature(EmbStreamDataset.__init__)
+    assert "grid_sidecar" not in sig.parameters

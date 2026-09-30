@@ -987,7 +987,15 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         print(f"[train] resume appending to {log_path} run_id={run_id}", flush=True)
     else:
         try:
-            hdr = config_header(cfg, manifest_path=str(local_manifest) if local_manifest.is_file() else None, extra={"run":"train-stream","device":dev,"dtype":str(dtype),"sample_size":sample_size})
+            from vision_adapter.manifest import manifest_has_grids
+
+            _have, _missing = manifest_has_grids(rows)
+            _grid_source = "measured" if _have and not _missing else (
+                "partial" if _have else "synthetic"
+            )
+            print(f"[train] geometry: {_have}/{_have + _missing} manifest rows carry "
+                  f"grid_thw (grid_source={_grid_source})", flush=True)
+            hdr = config_header(cfg, manifest_path=str(local_manifest) if local_manifest.is_file() else None, extra={"run":"train-stream","device":dev,"dtype":str(dtype),"sample_size":sample_size,"grid_source":_grid_source})
             run_id = hdr.get("run_id")
             with open(log_path, "w", buffering=1) as lf:
                 lf.write(json.dumps(hdr)+"\n")
@@ -1021,7 +1029,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
 
     def _batch_iter():
         _rg = str(_cache_root / "rg_cache") if "_cache_root" in locals() else str(data_dir / "cache" / "rg_cache")
-        ds = _EmbDS(plan, stream_order, start_pos=_start_pos, rg_cache_dir=_rg, vision_dim=cfg.vision_dim, grid_sidecar=cfg.grid_sidecar)
+        ds = _EmbDS(plan, stream_order, start_pos=_start_pos, rg_cache_dir=_rg, vision_dim=cfg.vision_dim)
         loader = _torch.utils.data.DataLoader(ds, batch_size=cfg.batch_size, drop_last=True, collate_fn=collate, num_workers=0)
         yield from loader
         # epoch wrap
@@ -1029,7 +1037,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             # NOTE: ds2 keeps start_pos=0 on purpose — _start_pos is a one-time
             # skip into the interrupted epoch for data continuity; later epochs
             # replay fully while samples_seen bookkeeping continues via step.
-            ds2 = _EmbDS(plan, stream_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"), vision_dim=cfg.vision_dim, grid_sidecar=cfg.grid_sidecar)
+            ds2 = _EmbDS(plan, stream_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"), vision_dim=cfg.vision_dim)
             loader2 = _torch.utils.data.DataLoader(ds2, batch_size=cfg.batch_size, drop_last=True, collate_fn=collate, num_workers=0)
             yield from loader2
     it = _batch_iter()
@@ -1037,7 +1045,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     def _val_batches():
         """Collate the held-out split. Materialized on the first call."""
         ds = _EmbDS(val_plan, val_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"),
-                    vision_dim=cfg.vision_dim, grid_sidecar=cfg.grid_sidecar)
+                    vision_dim=cfg.vision_dim)
         loader = _torch.utils.data.DataLoader(
             ds, batch_size=cfg.batch_size, drop_last=False, collate_fn=collate, num_workers=0
         )

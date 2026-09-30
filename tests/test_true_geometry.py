@@ -132,19 +132,30 @@ def test_mixed_batch_measures_only_rows_with_a_grid():
 
 
 def test_run_card_declares_grid_source():
-    """A run on the synthetic stand-in must say so; curves are not comparable."""
+    """A run on the synthetic stand-in must say so; curves are not comparable.
+
+    grid_source is now a measured fact about the manifest, not a config knob:
+    the caller reports the coverage it actually saw.
+    """
     from vision_adapter.config import config_header, default_config
 
-    syn = config_header(default_config(), extra={"run": "t"})
+    syn = config_header(default_config(), extra={"run": "t", "grid_source": "synthetic"})
     assert syn["grid_source"] == "synthetic"
 
-    import dataclasses
-    import tempfile
-    from pathlib import Path
-
-    with tempfile.TemporaryDirectory() as d:
-        p = Path(d) / "grid.json"
-        p.write_text("{}")
-        cfg = dataclasses.replace(default_config(), grid_sidecar=str(p))
-        meas = config_header(cfg, extra={"run": "t"})
+    meas = config_header(default_config(), extra={"run": "t", "grid_source": "measured"})
     assert meas["grid_source"] == "measured"
+
+    # and an unlabelled run says so rather than defaulting to a claim
+    unknown = config_header(default_config(), extra={"run": "t"})
+    assert unknown["grid_source"] == "unknown"
+
+
+def test_partial_grid_coverage_is_labelled_partial_not_measured():
+    """A half-backfilled manifest must not be reported as fully measured."""
+    from vision_adapter.manifest import manifest_has_grids
+
+    rows = [{"emb": "a", "grid_thw": [1, 4, 8]}, {"emb": "b"}]
+    have, missing = manifest_has_grids(rows)
+    assert (have, missing) == (1, 1)
+    source = "measured" if have and not missing else ("partial" if have else "synthetic")
+    assert source == "partial"

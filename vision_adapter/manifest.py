@@ -179,3 +179,27 @@ def disjoint_val_rows(
         and r.get("emb")
         and r.get("emb") not in seen
     ]
+
+
+def grid_thw_for_row(row: dict[str, Any]) -> list[int] | None:
+    """The row's measured MoonViT grid, or None when the manifest lacks one.
+
+    A manifest written before the geometry backfill has no ``grid_thw`` at
+    all; callers then fall back to the synthetic ``grid_for_nvis`` stand-in
+    and must label the run ``grid_source=synthetic``.
+    """
+    grid = row.get("grid_thw")
+    if not grid or len(grid) != 3:
+        return None
+    return [int(v) for v in grid]
+
+
+def manifest_has_grids(rows: list[dict[str, Any]]) -> tuple[int, int]:
+    """``(with_grid, without_grid)`` over data rows, for backfill progress."""
+    have = sum(
+        1
+        for r in rows
+        if r.get("type") != "manifest_header" and grid_thw_for_row(r) is not None
+    )
+    total = sum(1 for r in rows if r.get("type") != "manifest_header")
+    return have, total - have

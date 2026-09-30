@@ -6,7 +6,7 @@ loss paths. ``scripts/native_prefix.py`` only re-exports from here.
 Creator protocol per row: ``[slot][vstart][pads x N][vend][user...]``
 with ``N == n_vis`` asserted, ``mm=1`` on pads only, mRoPE positions with
 native post-vision offset. Grids come from the batch's measured
-``grid_thw`` (see ``vision_adapter.grid_sidecar``); rows without one fall
+``grid_thw`` carried by the manifest row; rows without one fall
 back to the synthetic ``grid_for_nvis`` stand-in.
 """
 
