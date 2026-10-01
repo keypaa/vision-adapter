@@ -31,6 +31,50 @@ Killed
 Other shards in the same run show ~170 MiB row groups; `emb_0094` shows
 **1.8 GiB** ones. One prefetch took 1172 s.
 
+## Shard sizes are not uniform — they span 146x
+
+From the repo listing (`keypa/vision-adapter-embeddings`, 103 shards, 949 GB
+on disk / ~832 GiB of parquet). Every shard holds 1360 rows; the row *byte*
+size varies because `n_vis` varies per image:
+
+| shards | parquet size | implied mean `n_vis` | 128-row group |
+|---|---|---|---|
+| `emb_0000`-`0007` (8) | ~435 MB | ~35 | 0.03 GiB |
+| `emb_0008`-`0075` (68) | ~3.8 GB | ~350 | 0.34 GiB |
+| `emb_0076`-`0085` (10) | 5.8-8.4 GB | ~700-900 | 0.7-0.9 GiB |
+| `emb_0086`-`0090` (5) | 12-13 GB | ~1,240 | 1.2 GiB |
+| `emb_0091`-`0097` (7) | 40-42 GB | ~4,000 | 3.9 GiB |
+| `emb_0098`-`0101` (4) | 50-64 GB | ~5,800 | 5.7-6.0 GiB |
+| `emb_0102` (1) | 12.8 GB | — | — |
+
+Three things follow, and they change what is worth investigating:
+
+1. **The 27 largest shards hold ~83% of the corpus.** `emb_0099` is 146x
+   `emb_0000`.
+2. **They look sorted ascending.** `0000`-`0007` at 435 MB, then a jump to
+   3.8 GB, then 8, then 40, then 63 — consistent with a packer that wrote
+   row groups smallest-first. If that is true, shard index is a proxy for
+   size, which makes "which shards are in this plan" a cheap thing to reason
+   about. Verify it rather than assuming.
+3. **`MAX_RG_ROWS = 128` cannot protect the large shards.** The guard is on
+   rows; the cost is `128 x n_vis x 4096 x 2` bytes. A 6 GiB group passes a
+   128-row assert unchanged, and with the prefetch thread plus the main
+   thread both holding a span, plus the fp32 collate copy, the theoretical
+   peak on the largest shard is well past what a 12 GB Colab has.
+
+**An inconsistency worth resolving, not assuming.** The table above predicts
+128-row groups for `emb_0094` (40-42 GB shards) of ~3.9 GiB, but the log
+reports **1.8 GiB** for that shard. Either `emb_0094` is packed with smaller
+row groups than the others, or its mean `n_vis` is lower than shard size
+alone implies (shard size depends on compression, not only on raw
+`n_vis x 4096 x 2`). Get the real row-group layout from the parquet footer
+rather than deriving it — `RemoteShard` already fetches that footer, so a
+loop over the 103 shards printing `num_rows`, `total_byte_size` and
+`total_compressed_size` per group would settle it in one pass.
+
+`build_epoch_plan` shuffles shards before selecting, so whether a run meets a
+0.03 GiB shard or a 6 GiB one is currently luck. Nothing in the code warns.
+
 ## What the path is supposed to do
 
 `vision_adapter/data/stream.py`:
