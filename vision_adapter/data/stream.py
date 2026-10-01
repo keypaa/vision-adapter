@@ -322,13 +322,24 @@ def _get_hf_shard_path(shard: str, cache_dir: str | None = None) -> str | None:
 
 
 def _download_shard_hf_transfer(shard: str, cache_dir: str | None = None, token: str | None = None) -> str | None:
-    """Try whole-shard download via hf_transfer (Rust, 1GiB/s agg) when in Modal.
+    """Whole-shard download via hf_transfer (Rust, ~1GiB/s aggregate).
 
-    Returns local path on success, None on miss/failure (caller falls back to Range).
-    Uses `hf_hub_download` with HF_HUB_ENABLE_HF_TRANSFER=1 when set; falls back
-    gracefully when hf_transfer not installed."""
-    if not _in_modal():
-        return None
+    Was Modal-only (`if not _in_modal(): return None`), which meant the target
+    platform — a rented GPU instance — always paid the urllib Range path,
+    measured at 1.5-28 MiB/s against hf_transfer's documented ~1 GiB/s.
+    Two independent audits flagged the same gate.
+
+    Returns local path on success, None on miss/failure (caller falls back to
+    Range). Identical bytes and identical row order as the Range path, so
+    checkpoints and resume are unaffected — only the transport changes.
+    Enable the Rust transfer with HF_HUB_ENABLE_HF_TRANSFER=1; without
+    huggingface_hub it degrades to the Range path as before.
+    """
+    if cache_dir:
+        # already downloaded? hand it back without touching the network
+        cached = _shard_cache_path(cache_dir, shard)
+        if cached:
+            return cached
     try:
         from huggingface_hub import hf_hub_download  # type: ignore[import]
 
@@ -338,7 +349,6 @@ def _download_shard_hf_transfer(shard: str, cache_dir: str | None = None, token:
             kw["token"] = tok  # type: ignore[assignment]
         if cache_dir:
             kw["local_dir"] = cache_dir  # type: ignore[assignment]
-            # Ensure cache_dir exists and is writable (ephemeral NVMe on B300 288GiB)
             Path(cache_dir).mkdir(parents=True, exist_ok=True)
         p = hf_hub_download(**kw)  # type: ignore[arg-type]
         return p if os.path.exists(p) else None
@@ -346,29 +356,102 @@ def _download_shard_hf_transfer(shard: str, cache_dir: str | None = None, token:
         return None
 
 
-def _enforce_lru_cache(cache_dir: str | None, max_shards: int = 4) -> None:
-    """LRU eviction for whole-shard hf_transfer cache (Phase 2).
+def drain_row_group_prefetch(fut):
+    """Wait for a pending row-group prefetch and return its fetched span.
 
-    Keeps at most `max_shards` (≈32GiB for 4×8GiB shards) on B300 288GiB ephemeral.
-    Colab 12GiB keeps Range fallback, so this is Modal-only.
-    Evicts oldest `emb_*.parquet` by mtime."""
-    if not _in_modal() or not cache_dir or not os.path.isdir(cache_dir):
+    Without this the main thread calls `load_span` on a span the prefetch
+    thread is still fetching: the cache file is not there yet, so the same
+    bytes are downloaded twice, concurrently. That is the worst place to
+    double traffic — it happens precisely on the slow row groups the prefetch
+    was introduced to hide.
+
+    Returns None when nothing is in flight (the common case) so the caller
+    falls through to its normal load.
+    """
+    if fut is None:
+        return None
+    try:
+        return fut.result()
+    except Exception:
+        return None
+
+
+def _enforce_lru_cache(cache_dir: str | None, max_shards: int = 4) -> None:
+    """LRU eviction for the whole-shard cache, sized by free disk not by host.
+
+    Holds at most ``max_shards`` shards. Now that the whole-shard path runs
+    off-Modal too, a fixed shard count would be wrong on either extreme: 4
+    shards is 12-256 GB depending on which ones landed, and 4×64GB overflows
+    a 100 GB disk. Size it from `shutil.disk_usage` instead, and keep a
+    caller-supplied ``max_shards`` as the ceiling when given.
+    """
+    if not cache_dir or not os.path.isdir(cache_dir):
         return
+    limit = _shard_lru_limit(cache_dir, max_shards)
     try:
         import glob
 
         shards = glob.glob(os.path.join(cache_dir, "emb_*.parquet"))
-        if len(shards) <= max_shards:
+        if len(shards) <= limit:
             return
         shards.sort(key=lambda p: os.path.getmtime(p))
-        for old in shards[: len(shards) - max_shards]:
+        for old in shards[: len(shards) - limit]:
             try:
                 os.remove(old)
-                print(f"[stream] LRU evicted {os.path.basename(old)} (cache >{max_shards} shards)", flush=True)
+                print(f"[stream] LRU evicted {os.path.basename(old)} "
+                      f"(cache >{limit} shards)", flush=True)
             except Exception:
                 pass
     except Exception:
         pass
+
+
+def _shard_lru_limit(cache_dir: str, max_shards: int | None = None) -> int:
+    """How many whole shards fit in the disk budget for ``cache_dir``.
+
+    80% of free space, so the download that triggers the eviction still lands.
+    Falls back to 4 when the disk cannot be measured — the previous
+    behaviour, which is the safe side for a 12 GB Colab disk.
+    """
+    if max_shards is not None:
+        try:
+            return max(1, int(max_shards))
+        except (TypeError, ValueError):
+            pass
+    try:
+        import shutil
+
+        free = shutil.disk_usage(cache_dir).free
+        biggest = _biggest_cached_shard(cache_dir)
+        if biggest <= 0:
+            return 4
+        return max(1, int((free * 0.8) // biggest))
+    except Exception:
+        return 4
+
+
+def _biggest_cached_shard(cache_dir: str) -> int:
+    """Largest cached shard in bytes, or 0 — the unit the disk budget divides by."""
+    try:
+        import glob
+
+        sizes = [os.path.getsize(p) for p in glob.glob(os.path.join(cache_dir, "emb_*.parquet"))]
+        return max(sizes) if sizes else 0
+    except Exception:
+        return 0
+
+
+def _shard_cache_path(cache_dir: str | None, shard: str) -> str | None:
+    """Local path of an already-downloaded whole shard, or None."""
+    if not cache_dir:
+        return None
+    for cand in (
+        os.path.join(cache_dir, shard),
+        os.path.join(cache_dir, os.path.basename(shard)),
+    ):
+        if os.path.exists(cand):
+            return cand
+    return None
 
 
 def _coalesce_ranges(ranges: list[tuple[int, int]], gap: int = 2 * 2**20) -> list[tuple[int, int]]:
@@ -614,12 +697,13 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
         import pyarrow.parquet as pq
 
         emitted = 0
-        # Phase 2 daemon: shard-level prefetch (whole-shard hf_transfer 1GiB/s, LRU 4 shards)
+        # Phase 2 daemon: shard-level prefetch (whole-shard hf_transfer
+        # ~1GiB/s). Not Modal-gated — the whole-shard path is open everywhere.
         shard_list = [s for s in self.order if self.plan.get(s)]
         shard_idx = {s: i for i, s in enumerate(shard_list)}
         shard_prefetch: ThreadPoolExecutor | None = None
         next_shard_fut = None
-        if _in_modal() and self.rg_cache_dir:
+        if self.rg_cache_dir:
             shard_prefetch = ThreadPoolExecutor(max_workers=1)
         for sf in self.order:
             rows_here = self.plan.get(sf)
@@ -636,12 +720,12 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                             next_shard_fut = shard_prefetch.submit(_download_shard_hf_transfer, nxt, self.rg_cache_dir)
                         except Exception:
                             pass
-            # Phase 2 fast path: whole-shard hf_transfer (Modal, 1 GiB/s) — local parquet read, no Range
-            local_path: str | None = None
-            if _in_modal():
-                local_path = _get_hf_shard_path(sf, cache_dir=self.rg_cache_dir)
-                if local_path is None:
-                    local_path = _download_shard_hf_transfer(sf, cache_dir=self.rg_cache_dir)
+            # Phase 2 fast path: whole-shard hf_transfer (~1 GiB/s) — local
+            # parquet read, no Range. Not Modal-gated any more: the target is a
+            # rented instance, and the Range path measures 1.5-28 MiB/s.
+            local_path: str | None = _get_hf_shard_path(sf, cache_dir=self.rg_cache_dir)
+            if local_path is None:
+                local_path = _download_shard_hf_transfer(sf, cache_dir=self.rg_cache_dir)
             if local_path and os.path.exists(local_path):
                 pf = pq.ParquetFile(local_path)
                 md = pf.metadata
@@ -730,15 +814,30 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                                 dt = time.time() - t0
                                 if dt > 2:
                                     print(f"[stream] prefetched {Path(sf).name} rg{n_rgi} ({(n_hi-n_lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
+                                # hand the bytes back so the main thread can
+                                # adopt them instead of fetching the same span
+                                return rs2._span[1] if rs2._span else None
 
                             next_fut = prefetch.submit(_bg)
 
                     lo, hi = rg_span(md, rgi)
+                    # If a prefetch for THIS row group is still in flight, wait
+                    # for it and adopt its bytes. Racing it would re-download
+                    # the identical span on the main thread, which is how the
+                    # slowest groups were being fetched twice.
                     t0 = time.time()
-                    rs.load_span(lo, hi)
-                    dt = time.time() - t0
-                    if dt > 2:
-                        print(f"[stream] streamed {Path(sf).name} rg{rgi} ({(hi-lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
+                    _adopted = drain_row_group_prefetch(next_fut)
+                    if _adopted is not None and isinstance(_adopted, bytes) and len(_adopted) == hi - lo:
+                        rs._span = (lo, _adopted)
+                        dt = time.time() - t0
+                        print(f"[stream] adopted prefetched {Path(sf).name} rg{rgi} "
+                              f"({(hi-lo)/2**20:.0f}MiB, waited {dt:.0f}s)", flush=True)
+                    else:
+                        rs.load_span(lo, hi)
+                        dt = time.time() - t0
+                        if dt > 2:
+                            print(f"[stream] streamed {Path(sf).name} rg{rgi} ({(hi-lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
+                    next_fut = None
 
                     tbl = pf.read_row_group(rgi, columns=["key", "n_vis", "vis_bytes"])
                     try:
