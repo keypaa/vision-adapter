@@ -31,46 +31,54 @@ Killed
 Other shards in the same run show ~170 MiB row groups; `emb_0094` shows
 **1.8 GiB** ones. One prefetch took 1172 s.
 
-## Shard sizes are not uniform — they span 146x
+## Shard sizes are not uniform — they span 147x
 
-From the repo listing (`keypa/vision-adapter-embeddings`, 103 shards, 949 GB
-on disk / ~832 GiB of parquet). Every shard holds 1360 rows; the row *byte*
-size varies because `n_vis` varies per image:
+Exact sizes from the repo listing (`keypa/vision-adapter-embeddings`):
+**103 shards, 948,958,922,090 bytes = 883.8 GiB.** Every shard holds 1360 rows;
+the row *byte* size varies because `n_vis` varies per image.
 
-| shards | parquet size | implied mean `n_vis` | 128-row group |
+| shards | count | exact range | bytes/shard |
 |---|---|---|---|
-| `emb_0000`-`0007` (8) | ~435 MB | ~35 | 0.03 GiB |
-| `emb_0008`-`0075` (68) | ~3.8 GB | ~350 | 0.34 GiB |
-| `emb_0076`-`0085` (10) | 5.8-8.4 GB | ~700-900 | 0.7-0.9 GiB |
-| `emb_0086`-`0090` (5) | 12-13 GB | ~1,240 | 1.2 GiB |
-| `emb_0091`-`0097` (7) | 40-42 GB | ~4,000 | 3.9 GiB |
-| `emb_0098`-`0101` (4) | 50-64 GB | ~5,800 | 5.7-6.0 GiB |
-| `emb_0102` (1) | 12.8 GB | — | — |
+| `emb_0000`-`0007` | 8 | 0.40-0.41 GiB | 414-420 MiB |
+| `emb_0008` | 1 | 2.53 GiB | 2595 MiB (transitional) |
+| `emb_0009`-`0075` | 67 | 3.47-3.56 GiB | 3553-3647 MiB |
+| `emb_0076` | 1 | 5.43 GiB | 5563 MiB (transitional) |
+| `emb_0077`-`0085` | 9 | 7.70-7.85 GiB | 7883-8034 MiB |
+| `emb_0086`-`0090` | 5 | 11.51-12.13 GiB | 11787-12418 MiB |
+| `emb_0091`-`0097` | 7 | 37.64-39.24 GiB | 38545-40181 MiB |
+| `emb_0098` | 1 | 46.89 GiB | 48011 MiB |
+| `emb_0099`-`0101` | 3 | 58.79-59.36 GiB | 60203-60783 MiB |
+| `emb_0102` | 1 | 11.96 GiB | 12247 MiB (partial trailing shard) |
 
-Three things follow, and they change what is worth investigating:
+Extremes: smallest `emb_0003` at **433,702,382 bytes**; largest `emb_0101` at
+**63,735,961,870 bytes**. Ratio **147x**.
 
-1. **The 27 largest shards hold ~83% of the corpus.** `emb_0099` is 146x
-   `emb_0000`.
-2. **They look sorted ascending.** `0000`-`0007` at 435 MB, then a jump to
-   3.8 GB, then 8, then 40, then 63 — consistent with a packer that wrote
-   row groups smallest-first. If that is true, shard index is a proxy for
-   size, which makes "which shards are in this plan" a cheap thing to reason
-   about. Verify it rather than assuming.
+Four things follow, and they change what is worth investigating:
+
+1. **The distribution is top-loaded, not a gradient.** `emb_0099`-`0101` are
+   184 GiB — 21% of the repo in 3% of the files. Sizing an RG cache or a
+   prefetch window from "typical" shard size understates it by an order of
+   magnitude.
+2. **The bands are suspiciously discrete.** Each group is within a few percent
+   of its neighbours, with two transitional shards (`0008`, `0076`) between
+   bands. That is the signature of a packer that grouped rows by `n_vis` and
+   then fixed the row count per shard — worth confirming from the code that
+   wrote these rather than inferred. If shard index predicts `n_vis`, then
+   "which shards are in this plan" is answerable without touching the corpus.
 3. **`MAX_RG_ROWS = 128` cannot protect the large shards.** The guard is on
-   rows; the cost is `128 x n_vis x 4096 x 2` bytes. A 6 GiB group passes a
-   128-row assert unchanged, and with the prefetch thread plus the main
-   thread both holding a span, plus the fp32 collate copy, the theoretical
-   peak on the largest shard is well past what a 12 GB Colab has.
+   rows; the cost is `128 x n_vis x 4096 x 2` bytes, so the same guard spans
+   0.03 GiB at `n_vis=35` and 16 GiB at `n_vis=16,653`. A 6 GiB group passes
+   a 128-row assert unchanged.
+4. **`emb_0102` is a partial trailing shard** at 11.96 GiB — not the end of
+   the 59 GiB band. Any reasoning that treats `0101` as the terminus
+   misestimates the tail.
 
-**An inconsistency worth resolving, not assuming.** The table above predicts
-128-row groups for `emb_0094` (40-42 GB shards) of ~3.9 GiB, but the log
-reports **1.8 GiB** for that shard. Either `emb_0094` is packed with smaller
-row groups than the others, or its mean `n_vis` is lower than shard size
-alone implies (shard size depends on compression, not only on raw
-`n_vis x 4096 x 2`). Get the real row-group layout from the parquet footer
-rather than deriving it — `RemoteShard` already fetches that footer, so a
-loop over the 103 shards printing `num_rows`, `total_byte_size` and
-`total_compressed_size` per group would settle it in one pass.
+**Row-group layout is NOT derivable from shard size.** The shard bytes depend
+on compression as well as on `n_vis x 4096 x 2`, and the OOM'd shard's logged
+1.8 GiB groups do not match what its 38.6 GiB size implies. Get the real
+layout from the parquet footer: `RemoteShard` already fetches it, so looping
+over the 103 shards printing `num_rows`, `total_byte_size` and
+`total_compressed_size` per group settles it in one pass.
 
 `build_epoch_plan` shuffles shards before selecting, so whether a run meets a
 0.03 GiB shard or a 6 GiB one is currently luck. Nothing in the code warns.
