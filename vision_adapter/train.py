@@ -607,19 +607,26 @@ def materialize_val(batches, data_dir, sample_size: int, rebuild: bool = False) 
     return out
 
 
-def _val_due(step: int, val_every: int, total_steps: int | None = None) -> bool:
+def _val_due(
+    step: int,
+    val_every: int,
+    total_steps: int | None = None,
+    has_run_before: bool = False,
+) -> bool:
     """Whether to run the held-out probe at this step.
 
-    The final step always probes so a short run still reports a val loss;
-    step 0 never does, since that is the pre-training baseline the first
-    interval already captures.
+    The interval cadence is unconditional. The final step probes only if the
+    val has already run once during this run: that keeps the guarantee that a
+    long run ends with a val loss on its last checkpoint (where the
+    information is freshest) without charging a smoke test — which asked for
+    no val — for one.
     """
     if val_every <= 0:
         return False
     if step <= 0:
         return False
     if total_steps is not None and step == total_steps:
-        return True
+        return has_run_before
     return step % val_every == 0
 
 
@@ -1221,6 +1228,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         _log_ctx = _resume_fh
     else:
         _log_ctx = open(log_path, "a", buffering=1)
+    _val_has_run = False
     with _log_ctx as lf:
         _step_iter = range(start_step, steps + 1) if steps is not None else itertools.count(start_step)
         for step in _step_iter:
@@ -1276,7 +1284,9 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             # Held-out probe. Runs on the SAME forward math as the train step
             # (native_train_forward) under no_grad, so a gap between the two
             # curves is real overfitting and not a recipe difference.
-            if val_plan and _val_due(step, cfg.val_every, steps):
+            if val_plan and _val_due(
+                step, cfg.val_every, steps, has_run_before=_val_has_run
+            ):
                 _vt = time.time()
                 try:
                     _vloss, _vn = _val_probe(
@@ -1285,6 +1295,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                     lf.write(json.dumps(
                         _val_record(step, _vloss, _vn, (time.time() - _vt) / 60)
                     ) + "\n")
+                    _val_has_run = True
                     print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] "
                           f"[train] VAL step={step} loss={_vloss:.5f} "
                           f"n={_vn} ({(time.time()-_vt)/60:.1f}min)", flush=True)

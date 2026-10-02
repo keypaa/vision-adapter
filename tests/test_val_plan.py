@@ -69,8 +69,11 @@ def test_val_step_decides_when_to_probe():
     assert _val_due(100, val_every=50)
     # disabled entirely when the config has no interval
     assert not _val_due(100, val_every=0)
-    # the last step always probes, so a short run still reports a val loss
-    assert _val_due(10, val_every=50, total_steps=10)
+    # the last step probes only if the val has already run this run, so a
+    # smoke test that asked for no val does not pay for one at exit
+    # (see tests/test_val_final_step.py for the full rule)
+    assert _val_due(10, val_every=50, total_steps=10, has_run_before=True)
+    assert not _val_due(10, val_every=50, total_steps=10, has_run_before=False)
 
 
 def test_val_record_shape_is_distinguishable_from_train():
