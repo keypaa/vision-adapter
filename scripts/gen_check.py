@@ -32,6 +32,9 @@ def main() -> int:
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--no-positions", action="store_true",
                     help="reproduce the pre-fix behaviour (no position_ids)")
+    ap.add_argument("--gen-mode", choices=("card", "greedy"), default="card",
+                    help="card = the Qwen3.5 model-card sampling recipe (default); "
+                         "greedy collapses to immediate EOS on this backbone")
     args = ap.parse_args()
 
     import torch
@@ -45,6 +48,8 @@ def main() -> int:
         _resolve_positions_mode,
     )
     from vision_adapter.manifest import load_manifest
+
+    from scripts.colab_unsloth_test import build_gen_kwargs
 
     ck = Path(args.ckpt)
     sd = torch.load(ck, map_location="cpu", weights_only=False)
@@ -125,8 +130,12 @@ def main() -> int:
             out = model.generate(
                 inputs_embeds=inp["inputs_embeds"],
                 attention_mask=inp["attention_mask"],
-                max_new_tokens=args.max_new, do_sample=False,
+                max_new_tokens=args.max_new,
                 pad_token_id=tok.pad_token_id, **kw,
+                # Greedy collapses to immediate EOS on Qwen3.5 — the model card
+                # prescribes sampling for VL tasks. `card` is the prod default;
+                # `greedy` is kept as an A/B on the sampler itself.
+                **build_gen_kwargs(args.gen_mode),
             )
         got = tok.decode(out[0][cut:], skip_special_tokens=True)
         outputs.append(got)
