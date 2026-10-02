@@ -137,7 +137,11 @@ def main() -> int:
                 # `greedy` is kept as an A/B on the sampler itself.
                 **build_gen_kwargs(args.gen_mode),
             )
-        got = tok.decode(out[0][cut:], skip_special_tokens=True)
+        new_ids = out[0][cut:].tolist()
+        got = tok.decode(new_ids, skip_special_tokens=True)
+        print(f"DEBUG out.shape={tuple(out.shape)} cut={cut} new_ids[:8]={new_ids[:8]}")
+        if all(i == tok.eos_token_id for i in new_ids[:3]) if new_ids else False:
+            print(f"DEBUG all-EOS: eos={tok.eos_token_id}")
         outputs.append(got)
         print(f"\nUSER   : {r['user'][:90]}")
         print(f"EXPECT : {r['assistant']}")
