@@ -458,6 +458,24 @@ MEASURED_MANIFEST_FILE = "train_manifest_grids.jsonl"
 PLAIN_MANIFEST_FILE = "train_manifest.jsonl"
 
 
+def resolve_lr_horizon(steps: int | None, explicit: int | None = None) -> int:
+    """The step the cosine LR decays toward.
+
+    A bounded run *is* its own horizon. An unbounded one has to name one,
+    because a cosine with no end never decays — so it is rejected here, at
+    budget resolution, instead of crashing in `lr_at` on the first step
+    (which is how it surfaced on a real 200-step run).
+    """
+    if explicit is not None:
+        return int(explicit)
+    if steps is not None:
+        return int(steps)
+    raise ValueError(
+        "max_steps=None runs until stopped, but the cosine LR schedule needs "
+        "an end: pass lr_horizon (the step the LR decays toward)"
+    )
+
+
 def resolve_step_budget(max_steps: int | None, lr_horizon: int | None = None) -> int | None:
     """Normalise max_steps into a step budget, or None for unbounded.
 
@@ -1167,6 +1185,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     else:
         steps = resolve_step_budget(max_steps, lr_horizon=lr_horizon)
         start_step = 1
+        lr_horizon = resolve_lr_horizon(steps, lr_horizon)
         if steps is None:
             print(f"[train] unbounded run (max_steps=None) — LR decays toward "
                   f"step {lr_horizon}, checkpoints every {cfg.save_every} steps, "
