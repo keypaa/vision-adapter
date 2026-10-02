@@ -23,6 +23,86 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
+def _load_real_embeddings(args, picks):
+    """The actual MoonViT embedding per row, from a local or streamed shard.
+
+    One shard at a time, reading only the wanted rows, so this costs a single
+    shard rather than the corpus.
+    """
+    import numpy as np
+    import pyarrow.parquet as pq
+    import torch
+
+    print("[real-emb] loading key index for the emb -> (shard,row) lookup ...",
+          flush=True)
+    index, ok = _key_index(args)
+    assert ok, "key index unavailable"
+
+    by_shard: dict[str, dict[int, dict]] = {}
+    for r in picks:
+        loc = index.get(r["emb"])
+        if loc and len(loc) == 3:
+            by_shard.setdefault(loc[0], {})[loc[1]] = r
+
+    out: dict[str, torch.Tensor] = {}
+    import tempfile
+
+    from vision_adapter.data.stream import _download_shard_hf_transfer
+
+    cache_dir = tempfile.mkdtemp(prefix="abl_shards_")
+    for sf in sorted(by_shard):
+        local = _download_shard_hf_transfer(sf, cache_dir=cache_dir)
+        if not local:
+            print(f"[real-emb] could not fetch {sf}", flush=True)
+            continue
+        pf = pq.ParquetFile(local)
+        tbl = pf.read(columns=["key", "n_vis", "vis_bytes"])
+        keys = tbl.column("key").to_pylist()
+        nvs = tbl.column("n_vis").to_pylist()
+        vbs = tbl.column("vis_bytes").to_pylist()
+        for row_idx, r in by_shard[sf].items():
+            if row_idx >= len(keys):
+                continue
+            nv = int(nvs[row_idx])
+            buf = bytearray(vbs[row_idx])
+            t = (
+                torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
+                .view(torch.bfloat16)
+                .reshape(-1, 4096)
+                .float()
+            )
+            grid = r.get("grid_thw")
+            want = int(grid[0]) * int(grid[1]) * int(grid[2]) // 4 if grid else nv
+            if t.shape[0] != want:
+                print(f"[real-emb] {keys[row_idx]}: n_vis={nv} but grid says "
+                      f"{want} — using the stored n_vis", flush=True)
+            out[r["emb"]] = t
+        del tbl, vbs
+    print(f"[real-emb] loaded {len(out)}/{len(picks)} real embeddings", flush=True)
+    if not out:
+        return None
+    return [out.get(r["emb"], torch.zeros(1, 4096)) for r in picks]
+
+
+def _key_index(args):
+    """Load the embedding key index, from a local cache when present."""
+    from vision_adapter.data.stream import load_key_index
+
+    cand = Path(args.shard).parent if args.shard else None
+    if cand and cand.is_dir():
+        hits = sorted(cand.glob("key_index_cache*.json"))
+        if hits:
+            return load_key_index(str(hits[0]))
+
+    for repo_file in ("emb_cache/cache", "./emb_cache/cache", "."):
+        p = Path(repo_file)
+        if p.is_dir():
+            hits = sorted(p.glob("key_index_cache*.json"))
+            if hits:
+                return load_key_index(str(hits[0]))
+    return {}, False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ckpt", required=True)
@@ -30,6 +110,12 @@ def main() -> int:
     ap.add_argument("--group", default="agentic")
     ap.add_argument("--n", type=int, default=8, help="rows to average over")
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--real-emb", action="store_true",
+                    help="use the actual MoonViT embedding instead of noise; "
+                         "slower (streams a shard) but removes the objection "
+                         "that a projector may have learned to ignore noise")
+    ap.add_argument("--shard", default=None,
+                    help="local parquet shard for --real-emb (default: stream)")
     args = ap.parse_args()
 
     import torch
@@ -68,13 +154,20 @@ def main() -> int:
         return 1
     coll = make_collate(tok, tok.pad_token_id, max_len=4096, vision_dim=4096)
 
+    real_pool = None
+    if args.real_emb:
+        real_pool = _load_real_embeddings(args, picks)
+
     reals, zeros, shufs, contribs = [], [], [], []
     for i, r in enumerate(picks):
         grid = r.get("grid_thw")
         n_vis = int(grid[0]) * int(grid[1]) * int(grid[2]) // 4 if grid else 364
-        # noise, not the real embedding: this measures whether the loss PATH
-        # reads the span, not whether the image content is informative
-        vis = torch.randn(n_vis, 4096)
+        if real_pool is not None:
+            vis = real_pool[i]           # the actual MoonViT output
+        else:
+            # noise, not the real embedding: this measures whether the loss
+            # PATH reads the span, not whether the image content is useful
+            vis = torch.randn(n_vis, 4096)
         batch = coll([{"vis": vis, "user": r["user"], "assistant": "",
                        "g": args.group, "grid_thw": grid}])
         out = visual_ablation(model, proj, batch, args.device)
