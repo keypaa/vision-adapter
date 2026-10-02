@@ -137,11 +137,13 @@ def main() -> int:
                 # `greedy` is kept as an A/B on the sampler itself.
                 **build_gen_kwargs(args.gen_mode),
             )
-        new_ids = out[0][cut:].tolist()
+        # generate() with inputs_embeds returns ONLY the new tokens — there is
+        # no prefix to skip. Slicing at `cut` (the prefix length) returned an
+        # empty slice every time, which is why every prompt read ''.
+        new_ids = out[0].tolist()
         got = tok.decode(new_ids, skip_special_tokens=True)
-        print(f"DEBUG out.shape={tuple(out.shape)} cut={cut} new_ids[:8]={new_ids[:8]}")
-        if all(i == tok.eos_token_id for i in new_ids[:3]) if new_ids else False:
-            print(f"DEBUG all-EOS: eos={tok.eos_token_id}")
+        if new_ids and all(i == tok.eos_token_id for i in new_ids[:3]):
+            got = "<EOS immediately>"
         outputs.append(got)
         print(f"\nUSER   : {r['user'][:90]}")
         print(f"EXPECT : {r['assistant']}")
