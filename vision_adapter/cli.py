@@ -110,6 +110,9 @@ def _apply_cfg_overrides(cfg, args: argparse.Namespace):
     if getattr(args, "val_every", None) is not None:
         cfg = cfg.replace(val_every=args.val_every)
         print(f"[train] override val_every={cfg.val_every} steps", flush=True)
+    if getattr(args, "save_every", None) is not None:
+        cfg = cfg.replace(save_every=args.save_every)
+        print(f"[train] override save_every={cfg.save_every} steps", flush=True)
     return cfg
 
 
@@ -283,6 +286,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "--max-steps is omitted")
     p.add_argument("--val-every", type=int, default=None,
                    help="held-out probe interval in steps (default 250; must be >0)")
+    p.add_argument("--save-every", type=int, default=None,
+                   help="checkpoint interval in steps (default 200; a 302 MB "
+                        "projector every 10 steps fills a small disk)")
     p.add_argument("--allow-synthetic", dest="allow_synthetic", action="store_true",
                    help="train on the synthetic geometry stand-in (inverts orientation "
                         "on ~18%% of rows) as a deliberate A/B baseline")
@@ -312,6 +318,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "--max-steps is omitted")
     p.add_argument("--val-every", type=int, default=None,
                    help="held-out probe interval in steps (default 250; must be >0)")
+    p.add_argument("--save-every", type=int, default=None,
+                   help="checkpoint interval in steps (default 200; a 302 MB "
+                        "projector every 10 steps fills a small disk)")
     p.add_argument("--allow-synthetic", dest="allow_synthetic", action="store_true",
                    help="train on the synthetic geometry stand-in (inverts orientation "
                         "on ~18%% of rows) as a deliberate A/B baseline")
