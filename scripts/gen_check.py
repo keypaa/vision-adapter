@@ -81,11 +81,19 @@ def main() -> int:
 
     outputs = []
     for r in picks:
+        # n_vis must agree with the row's grid_thw: the mismatch guard in
+        # core.py rejects the pair otherwise. Derive it from the grid when the
+        # manifest carries one, so a real row works rather than a fixture.
+        grid = r.get("grid_thw")
+        if grid:
+            n_vis = int(grid[0]) * int(grid[1]) * int(grid[2]) // 4
+        else:
+            n_vis = args.n_vis
         # noise stands in for the MoonViT embedding: this checks the wiring and
         # the positions, not the image content
-        vis = torch.randn(args.n_vis, 4096)
+        vis = torch.randn(n_vis, 4096)
         batch = coll([{"vis": vis, "user": r["user"], "assistant": "",
-                       "g": args.group, "grid_thw": r.get("grid_thw")}])
+                       "g": args.group, "grid_thw": grid}])
         with torch.no_grad():
             inp = embeds_for(model, batch, proj, args.device)
             kw = {}
