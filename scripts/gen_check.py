@@ -76,6 +76,28 @@ def main() -> int:
         return 1
 
     coll = make_collate(tok, tok.pad_token_id, max_len=4096, vision_dim=4096)
+
+    def _strip_trailing_eos(batch, eos_id):
+        """Cut the prefix before its first EOS.
+
+        make_collate always terminates the training layout with EOS
+        ([user][answer][EOS]); generating after an EOS yields an empty string
+        every time, which looks exactly like a broken adapter. The production
+        generator in colab_unsloth_test.py does the same cut.
+        """
+        import copy as _copy
+
+        ids = batch["input_ids"][0]
+        hits = (ids == eos_id).nonzero(as_tuple=False)
+        if not len(hits):
+            return batch, int(ids.shape[0])
+        cut = int(hits[0].item())
+        out = _copy.deepcopy(batch)
+        out["input_ids"] = batch["input_ids"][:, :cut]
+        out["attention_mask"] = batch["attention_mask"][:, :cut]
+        out["labels"] = batch["labels"][:, :cut]
+        return out, cut
+
     print(f"positions mode: {_resolve_positions_mode()}"
           f"{'  (FORCED OFF: reproducing the pre-fix path)' if args.no_positions else ''}")
 
@@ -94,18 +116,18 @@ def main() -> int:
         vis = torch.randn(n_vis, 4096)
         batch = coll([{"vis": vis, "user": r["user"], "assistant": "",
                        "g": args.group, "grid_thw": grid}])
+        gen_batch, cut = _strip_trailing_eos(batch, tok.eos_token_id)
         with torch.no_grad():
-            inp = embeds_for(model, batch, proj, args.device)
+            inp = embeds_for(model, gen_batch, proj, args.device)
             kw = {}
             if not args.no_positions:
-                kw["position_ids"] = train_position_ids(batch).to(args.device)
+                kw["position_ids"] = train_position_ids(gen_batch).to(args.device)
             out = model.generate(
                 inputs_embeds=inp["inputs_embeds"],
                 attention_mask=inp["attention_mask"],
                 max_new_tokens=args.max_new, do_sample=False,
                 pad_token_id=tok.pad_token_id, **kw,
             )
-        cut = inp["attention_mask"].shape[1]
         got = tok.decode(out[0][cut:], skip_special_tokens=True)
         outputs.append(got)
         print(f"\nUSER   : {r['user'][:90]}")
