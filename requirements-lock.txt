@@ -1,0 +1,19 @@
+# Runtime pins for a training run — the versions a 200-step run on a T4
+# actually completed with. Install torch FIRST from the CUDA index that
+# matches your driver, then the rest:
+#
+#   pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cu130
+#   pip install -r requirements-lock.txt
+#
+# torch is pinned without a local version suffix because the +cuXXX build tag
+# is chosen by the index above, not by the requirement.
+
+torch==2.13.0
+transformers==5.12.1
+safetensors==0.8.0
+tokenizers==0.22.2
+numpy==2.5.1
+pyarrow==25.0.1
+pillow==12.3.0
+huggingface_hub==1.25.1
+accelerate==1.14.0

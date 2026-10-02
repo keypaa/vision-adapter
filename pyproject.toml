@@ -6,10 +6,28 @@ build-backend = "setuptools.build_meta"
 name = "vision-adapter"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["torch", "pyarrow", "pillow", "accelerate", "sentencepiece", "hf_transfer"]
+# Everything `pip install -e .` must provide for `vision-adapter train` to
+# run. These are floors, not pins — the exact versions a known-good run used
+# are in requirements-lock.txt. numpy and safetensors were used by the code
+# but unlisted here, so a fresh install failed at import time.
+dependencies = [
+    "torch>=2.6",
+    "transformers>=5.0",   # Qwen3.5 support
+    "safetensors>=0.4",
+    "numpy>=1.26",
+    "pyarrow>=15",
+    "pillow>=10",
+    "huggingface_hub>=0.30",
+    "accelerate>=0.30",
+    "sentencepiece",
+]
 
 [project.optional-dependencies]
-train = ["transformers", "safetensors", "accelerate", "sentencepiece", "huggingface_hub", "datasets", "hf_transfer"]
+# hf_transfer gives the ~1 GiB/s whole-shard download instead of the HTTP
+# Range path (~28 MiB/s). Optional so a missing wheel degrades to the slower
+# transport rather than failing the install.
+transfer = ["hf_transfer>=0.1.8"]
+datasets = ["datasets>=2.18"]
 
 [project.scripts]
 vision-adapter = "vision_adapter.cli:main"

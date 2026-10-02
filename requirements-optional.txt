@@ -1,0 +1,19 @@
+# Optional: faster kernels and whole-shard transfer.
+#
+# Without these the run is CORRECT but slower — transformers falls back to the
+# reference PyTorch implementation and prints:
+#   `chunk_gated_delta_rule` is falling back to its reference PyTorch
+#   implementation because `flash-linear-attention` is not installed
+#
+# They are kept out of requirements-lock.txt on purpose: both compile or ship
+# CUDA-version-specific wheels, so pinning them makes `pip install` fail on
+# any GPU whose CUDA version differs from the one they were built for.
+
+# Whole-shard download (~1 GiB/s) instead of the HTTP Range path (~28 MiB/s).
+# Note: huggingface_hub >= 1.0 deprecates HF_HUB_ENABLE_HF_TRANSFER in favour
+# of Xet, which is enabled by HF_XET_HIGH_PERFORMANCE=1.
+hf_transfer==0.1.9
+
+# Fast Qwen3.5 attention + conv. Both fall back silently if absent.
+flash-linear-attention
+causal-conv1d
