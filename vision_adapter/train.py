@@ -607,6 +607,29 @@ def materialize_val(batches, data_dir, sample_size: int, rebuild: bool = False) 
     return out
 
 
+def _val_progress_lines(
+    step: int,
+    n_rows: int,
+    n_shards: int,
+    elapsed_s: float,
+    first: bool = False,
+) -> tuple[str, str]:
+    """Two lines announcing a val probe, so a streaming wait is not a hang.
+
+    The first probe streams the whole split and can take many minutes during
+    which the terminal is silent — indistinguishable from a dead process.
+    The start line quantifies the work so the wait can be judged.
+    """
+    tag = " (first probe — streaming the split)" if first else ""
+    stamp = time.strftime("%H:%M:%S")
+    start = (
+        f"[{stamp}] [train] VAL step={step} — {n_rows} rows across {n_shards} "
+        f"shards{tag}, materializing (~{elapsed_s:.1f}s last shard)"
+    )
+    done = f"[{stamp}] [train] VAL step={step} done in {elapsed_s:.1f}s"
+    return start, done
+
+
 def _val_due(
     step: int,
     val_every: int,
@@ -1288,10 +1311,17 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 step, cfg.val_every, steps, has_run_before=_val_has_run
             ):
                 _vt = time.time()
+                _start_line, _done_line = _val_progress_lines(
+                    step, _n_val_planned, len(val_plan),
+                    0.0, first=not _val_has_run,
+                )
+                print(_start_line, flush=True)
                 try:
                     _vloss, _vn = _val_probe(
                         _batch_loss, model, proj, _val_batches(), dev
                     )
+                    print(f"[{time.strftime('%H:%M:%S')}] [train] VAL step={step} "
+                          f"done in {time.time() - _vt:.1f}s", flush=True)
                     lf.write(json.dumps(
                         _val_record(step, _vloss, _vn, (time.time() - _vt) / 60)
                     ) + "\n")
