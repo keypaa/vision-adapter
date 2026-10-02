@@ -54,7 +54,10 @@ def main() -> int:
     model = AutoModelForCausalLM.from_pretrained(
         "Qwen/Qwen3.5-2B", dtype=torch.bfloat16, device_map=args.device
     ).eval()
-    proj = build_projector(4096, int(model.config.text_config.hidden_size))
+    # Qwen3.5's config IS the text config on some transformers versions and
+    # wraps one on others — same getattr fallback train.py uses.
+    llm_cfg = getattr(model.config, "text_config", model.config)
+    proj = build_projector(4096, int(llm_cfg.hidden_size))
     proj.load_state_dict(sd["proj"])
     proj = proj.to(args.device).float().eval()
 
