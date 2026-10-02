@@ -354,6 +354,33 @@ def _val_rows_from_file(path) -> list[dict]:
     return rows
 
 
+def visual_ablation(model, proj, batch: dict, device: str) -> dict[str, float]:
+    """Loss with the real visual span, zeroed, and shuffled.
+
+    The gap between `real` and `zero` is what the image is worth to the
+    loss. A tiny gap means the projector is not using the image, and no
+    amount of further training will teach it to — which ranks every other
+    suspect (target_rms, the sequence layout) below this one.
+
+    The caller's batch is not mutated: each variant gets its own copy.
+    """
+    import copy as _copy
+
+    out: dict[str, float] = {}
+    real_vis = batch["vis"].detach().clone()
+    for name, vis in (
+        ("real", real_vis),
+        ("zero", torch.zeros_like(real_vis)),
+        ("shuffled", real_vis.flip(0)),
+    ):
+        probe = _copy.deepcopy(batch)
+        probe["vis"] = vis.clone()
+        loss = _batch_loss(model, proj, probe, device, None)
+        out[name] = float(loss.item()) if loss is not None else float("nan")
+    out["image_contribution"] = out["real"] - out["zero"]
+    return out
+
+
 def _batch_loss(model, proj, batch, device, position_ids=None):
     """Cross-entropy on the supervised tokens, exactly as the train step does.
 
