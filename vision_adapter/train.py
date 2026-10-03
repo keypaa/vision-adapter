@@ -371,13 +371,22 @@ def visual_ablation(model, proj, batch: dict, device: str) -> dict[str, float]:
     for name, vis in (
         ("real", real_vis),
         ("zero", torch.zeros_like(real_vis)),
-        ("shuffled", real_vis.flip(0)),
+        # permute ALONG THE VISUAL SPAN. flip(0) flipped the batch axis,
+        # which has one row, so the variant was a no-op and reported
+        # shuffled == real on every row.
+        ("shuffled", real_vis.flip(1) if real_vis.shape[1] > 1 else real_vis.flip(0)),
     ):
         probe = _copy.deepcopy(batch)
         probe["vis"] = vis.clone()
         loss = _batch_loss(model, proj, probe, device, None)
         out[name] = float(loss.item()) if loss is not None else float("nan")
     out["image_contribution"] = out["real"] - out["zero"]
+    # Negative means the image HELPS. Report the magnitude so the sign of the
+    # difference does not read as a -171% failure.
+    out["image_contribution_pct"] = (
+        100.0 * abs(out["image_contribution"]) / max(1e-9, abs(out["real"]))
+    )
+    out["image_helps"] = out["image_contribution"] < 0
     return out
 
 
@@ -1284,7 +1293,9 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         for step in _step_iter:
             for g in opt.param_groups:
                 g["lr"] = lr_at(step, lr_horizon, cfg.lr, cfg.warmup_steps)
+            _wt = time.time()
             batch = next(it)
+            wait_ms = (time.time() - _wt) * 1000.0
             # Cost-aware micro-batching: gate on B·L² vs COST_MAX (bl2)
             # not B·L. Keeps VISION_ADAPTER_COST_MAX env override via
             # _resolve_ckpt_budget and derives micro from cost.
@@ -1319,7 +1330,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             if not out["finite"]:
                 print(f"[train][WARN] non-finite at {step}, skipping", flush=True)
                 continue
-            rec = {"type":"train","step":step,"loss":round(out["loss"],5),"gnorm":round(out["gnorm"],4),"lr":float(opt.param_groups[0]["lr"]),"tokens":out["tokens"],"L":out.get("L"),"bl2":out.get("bl2"),"ckpt_on":out.get("ckpt_on", False),"samples_seen":step*cfg.batch_size,"step_ms":out["step_ms"],"ts": round(time.time(),1)}
+            rec = {"type":"train","step":step,"loss":round(out["loss"],5),"gnorm":round(out["gnorm"],4),"lr":float(opt.param_groups[0]["lr"]),"tokens":out["tokens"],"L":out.get("L"),"bl2":out.get("bl2"),"ckpt_on":out.get("ckpt_on", False),"samples_seen":step*cfg.batch_size,"step_ms":out["step_ms"],"wait_ms":round(wait_ms,1),"ts": round(time.time(),1)}
             if step % 20 == 0:
                 _mem = _cuda_mem_snapshot()
                 if _mem is not None:

@@ -108,3 +108,37 @@ def test_the_ablation_reports_a_signed_image_contribution():
     out = visual_ablation(model, proj, _batch(), "cpu")
     assert set(out) >= {"real", "zero", "shuffled"}
     assert out["real"] != out["zero"]
+
+
+def test_shuffled_variant_is_actually_different_from_real():
+    """Regression: the shuffle flipped the batch axis, which has one row.
+
+    `real_vis.flip(0)` on a (1, n_vis, dim) tensor is a no-op, so shuffled
+    equalled real on every row and the variant tested nothing.
+    """
+    from vision_adapter.train import visual_ablation
+
+    torch.manual_seed(3)
+    model = _TinyModel()
+    proj = torch.nn.Linear(8, 8)
+    out = visual_ablation(model, proj, _batch(), "cpu")
+    assert out["shuffled"] != out["real"], (
+        "shuffled == real: the permutation is a no-op on a single-row batch"
+    )
+
+
+def test_contribution_is_reported_with_a_magnitude_not_a_signed_ratio():
+    """`real - zero` is negative when the image HELPS; that is a gain.
+
+    The old print divided by the loss without the sign, reporting -171% for
+    a case where the image cut the loss by 63%.
+    """
+    from vision_adapter.train import visual_ablation
+
+    torch.manual_seed(4)
+    out = visual_ablation(_TinyModel(), torch.nn.Linear(8, 8), _batch(), "cpu")
+    assert out["image_contribution"] == pytest.approx(out["real"] - out["zero"])
+    assert "image_contribution_pct" in out
+    assert out["image_contribution_pct"] == pytest.approx(
+        100 * abs(out["image_contribution"]) / max(1e-9, abs(out["real"]))
+    )

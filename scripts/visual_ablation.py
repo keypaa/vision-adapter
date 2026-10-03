@@ -186,8 +186,10 @@ def main() -> int:
     print(f"real              {mr:.4f}")
     print(f"zeroed visual     {mz:.4f}")
     print(f"shuffled visual   {ms:.4f}")
+    helps = mc < 0    # real < zero -> the image lowers the loss
     print(f"image contribution (real - zero)  {mc:+.4f}  "
-          f"({100 * mc / max(1e-9, mr):+.1f}% of the loss)")
+          f"({100 * abs(mc) / max(1e-9, abs(mr)):.1f}% of |loss|)")
+    print(f"direction: {'the image HELPS' if helps else 'the image HURTS'}")
 
     verdict = (
         "the projector IS using the image — the problem is convergence"
