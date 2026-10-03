@@ -1173,7 +1173,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             print(f"[train] geometry: {_have}/{_have + _missing} manifest rows carry "
                   f"grid_thw (grid_source={_grid_source})", flush=True)
             geometry_guard(_grid_source, allow_synthetic=allow_synthetic)
-            hdr = config_header(cfg, manifest_path=str(local_manifest) if local_manifest.is_file() else None, extra={"run":"train-stream","device":dev,"dtype":str(dtype),"sample_size":sample_size,"grid_source":_grid_source,"manifest":manifest_name or MEASURED_MANIFEST_FILE})
+            hdr = config_header(cfg, manifest_path=str(local_manifest) if (local_manifest is not None and local_manifest.is_file()) else None, extra={"run":"train-stream","device":dev,"dtype":str(dtype),"sample_size":sample_size,"grid_source":_grid_source,"manifest":manifest_name or MEASURED_MANIFEST_FILE})
             run_id = hdr.get("run_id")
             with open(log_path, "w", buffering=1) as lf:
                 lf.write(json.dumps(hdr)+"\n")
