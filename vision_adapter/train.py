@@ -1330,7 +1330,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             if not out["finite"]:
                 print(f"[train][WARN] non-finite at {step}, skipping", flush=True)
                 continue
-            rec = {"type":"train","step":step,"loss":round(out["loss"],5),"gnorm":round(out["gnorm"],4),"lr":float(opt.param_groups[0]["lr"]),"tokens":out["tokens"],"L":out.get("L"),"bl2":out.get("bl2"),"ckpt_on":out.get("ckpt_on", False),"samples_seen":step*cfg.batch_size,"step_ms":out["step_ms"],"wait_ms":round(wait_ms,1),"ts": round(time.time(),1)}
+            rec = {"type":"train","step":step,"loss":round(out["loss"],5),"gnorm":round(out["gnorm"],4),"lr":float(opt.param_groups[0]["lr"]),"tokens":out["tokens"],"L":out.get("L"),"bl2":out.get("bl2"),"ckpt_on":out.get("ckpt_on", False),"samples_seen":step*cfg.batch_size,"step_ms":out["step_ms"],"wait_ms":round(wait_ms,1),"ts": round(time.time(),1),
+                    "groups":sorted({g for g in batch.get("g",[]) if g})}
             if step % 20 == 0:
                 _mem = _cuda_mem_snapshot()
                 if _mem is not None:

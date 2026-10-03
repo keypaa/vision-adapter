@@ -20,6 +20,33 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
+def _real_embeddings(args, picks):
+    """The stored MoonViT embedding per row, so the action verb is judgeable.
+
+    Reuses visual_ablation's shard reader — one shard, one pass, only the
+    wanted rows. Returns None when the embeddings cannot be reached, and the
+    caller falls back to noise with a warning rather than failing silently.
+    """
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from visual_ablation import _load_real_embeddings
+    except Exception as exc:  # pragma: no cover - import shape only
+        print(f"[real-emb] unavailable ({exc}); falling back to noise", flush=True)
+        return None
+
+    class _Args:
+        shard = None
+    try:
+        out = _load_real_embeddings(_Args(), picks)
+    except Exception as exc:
+        print(f"[real-emb] could not stream ({exc}); falling back to noise", flush=True)
+        return None
+    if not out or all(t.numel() <= 1 for t in out):
+        print("[real-emb] no embeddings loaded; falling back to noise", flush=True)
+        return None
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--ckpt", required=True)
@@ -35,6 +62,9 @@ def main() -> int:
     ap.add_argument("--gen-mode", choices=("card", "greedy"), default="card",
                     help="card = the Qwen3.5 model-card sampling recipe (default); "
                          "greedy collapses to immediate EOS on this backbone")
+    ap.add_argument("--no-real-emb", action="store_true",
+                    help="fill the visual span with noise instead of the stored "
+                         "MoonViT embedding (streams one shard; default is real)")
     args = ap.parse_args()
 
     import torch
@@ -107,7 +137,8 @@ def main() -> int:
           f"{'  (FORCED OFF: reproducing the pre-fix path)' if args.no_positions else ''}")
 
     outputs = []
-    for r in picks:
+    real = _real_embeddings(args, picks) if not args.no_real_emb else None
+    for i, r in enumerate(picks):
         # n_vis must agree with the row's grid_thw: the mismatch guard in
         # core.py rejects the pair otherwise. Derive it from the grid when the
         # manifest carries one, so a real row works rather than a fixture.
@@ -116,9 +147,15 @@ def main() -> int:
             n_vis = int(grid[0]) * int(grid[1]) * int(grid[2]) // 4
         else:
             n_vis = args.n_vis
-        # noise stands in for the MoonViT embedding: this checks the wiring and
-        # the positions, not the image content
-        vis = torch.randn(n_vis, 4096)
+        if real is not None:
+            vis = real[i]
+        else:
+            # Only with --no-real-emb: noise makes the action verb
+            # unpredictable, so the model falls back to its narrative prior and
+            # the output looks broken. That measured 10.15 nats of apparent
+            # "format not learned" on a checkpoint that formats correctly.
+            print("[WARN] noise visual span — the verb cannot be judged", flush=True)
+            vis = torch.randn(n_vis, 4096)
         batch = coll([{"vis": vis, "user": r["user"], "assistant": "",
                        "g": args.group, "grid_thw": grid}])
         gen_batch, cut = _strip_trailing_eos(batch, tok.eos_token_id)
@@ -152,7 +189,31 @@ def main() -> int:
     if len(outputs) > 1:
         uniq = len(set(outputs))
         print(f"\n{uniq}/{len(outputs)} distinct outputs across prompts")
+    _report_scores(picks, outputs)
     return 0
+
+
+def _report_scores(picks, outputs) -> None:
+    """Correct-verb / syntax / grounding, so a `[500,300]` default reads as
+    a failure rather than as a success."""
+    import re
+    import statistics
+
+    verb = sum(o.startswith(p["assistant"].split("(")[0]) for p, o in zip(picks, outputs))
+    syn = sum(("start_box" in o) == ("start_box" in p["assistant"])
+              for p, o in zip(picks, outputs))
+    dists = []
+    for p, o in zip(picks, outputs):
+        mg = re.search(r"start_box=\[(-?\d+),\s*(-?\d+)\]", o)
+        me = re.search(r"start_box=\[(-?\d+),\s*(-?\d+)\]", p["assistant"])
+        if mg and me:
+            dists.append(((int(mg.group(1)) - int(me.group(1))) ** 2 +
+                          (int(mg.group(2)) - int(me.group(2))) ** 2) ** 0.5)
+    n = len(outputs)
+    print(f"\nverb correct {verb}/{n}   syntax correct {syn}/{n}")
+    if dists:
+        print(f"coordinates: {sum(d < 100 for d in dists)}/{n} within 100 px, "
+              f"median error {statistics.median(dists):.0f} px")
 
 
 if __name__ == "__main__":
