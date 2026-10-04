@@ -20,7 +20,7 @@ def _write_pack(tmp_path, source_keys, source_to_emb, index):
 
     from vision_adapter.data.pack import SCHEMA
 
-    pack = tmp_path / "val_pack.parquet"
+    pack = tmp_path / "val_pack_agentic.parquet"
     pq.write_table(
         pa.Table.from_pylist(
             [{"key": k, "n_vis": 374, "vis_bytes": b"\x00" * 8} for k in source_keys],
@@ -53,9 +53,9 @@ def test_pack_is_used_when_present(tmp_path):
     )
 
     assert n == 2
-    assert order == ["val_pack.parquet"]
-    assert local == {"val_pack.parquet": str(tmp_path / "val_pack.parquet")}
-    assert [r["_row"] for r in plan["val_pack.parquet"]] == [0, 1], \
+    assert order == ["val_pack_agentic.parquet"]
+    assert local == {"val_pack_agentic.parquet": str(tmp_path / "val_pack_agentic.parquet")}
+    assert [r["_row"] for r in plan["val_pack_agentic.parquet"]] == [0, 1], \
         "_row must be the position in the pack, since the reader indexes by it"
 
 
@@ -73,7 +73,9 @@ def test_a_leaky_pack_falls_back_and_says_why(tmp_path, capsys):
     )
 
     assert local == {}, "a rejected pack must not be wired in"
-    assert "val pack unusable" in capsys.readouterr().out
+    printed = capsys.readouterr().out
+    assert "val packs unusable" in printed
+    assert "resolve to a train shard" in printed
 
 
 def test_a_pack_whose_map_does_not_match_its_keys_is_refused(tmp_path):
@@ -93,7 +95,7 @@ def test_a_pack_whose_map_does_not_match_its_keys_is_refused(tmp_path):
 
 def test_a_missing_sidecar_refuses_the_pack(tmp_path):
     index = {"a.pt": ("data/emb_0002.parquet", 0, 374)}
-    pack = tmp_path / "val_pack.parquet"
+    pack = tmp_path / "val_pack_agentic.parquet"
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -168,14 +170,14 @@ def test_local_shards_skip_the_download(monkeypatch, tmp_path):
     monkeypatch.setattr(st, "_download_shard_hf_transfer", _boom)
 
     payload = torch.zeros(2, 4096, dtype=torch.bfloat16).view(torch.uint8).numpy().tobytes()
-    local = tmp_path / "val_pack.parquet"
+    local = tmp_path / "val_pack_agentic.parquet"
     pq.write_table(pa.Table.from_pylist(
         [{"key": "k", "n_vis": 2, "vis_bytes": payload}], schema=SCHEMA), local)
 
     rows = [{"emb": "e", "user": "u", "assistant": "a", "g": "g",
              "grid_thw": [1, 27, 27], "_row": 0}]
-    ds = st.EmbStreamDataset({"val_pack.parquet": rows}, ["val_pack.parquet"],
-                             local_shards={"val_pack.parquet": str(local)})
+    ds = st.EmbStreamDataset({"val_pack_agentic.parquet": rows}, ["val_pack_agentic.parquet"],
+                             local_shards={"val_pack_agentic.parquet": str(local)})
     got = list(ds.__iter__())
 
     assert len(got) == 1, "the local pack must actually be read"

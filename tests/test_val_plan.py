@@ -135,9 +135,42 @@ def test_val_probe_returns_mean_loss_and_row_count():
         calls.append(batch)
         return torch.tensor(float(len(calls)))
 
-    loss, n = _val_probe(fake_loss, None, None, batches, "cpu")
+    loss, n, _by = _val_probe(fake_loss, None, None, batches, "cpu")
     assert n == 3
     assert loss == 1.5          # mean of batch losses 1.0 and 2.0
+
+
+def test_val_probe_reports_the_loss_per_group():
+    """The corpus is 73% agentic, so a blended number can hide a group that
+    stopped learning. The per-group split is the whole point of the probe."""
+    import torch
+
+    from vision_adapter.train import _val_probe
+
+    def collate(n, g):
+        return {"input_ids": torch.zeros(n, 6, dtype=torch.long),
+                "attention_mask": torch.ones(n, 6, dtype=torch.long),
+                "g": [g] * n}
+
+    losses = iter([1.0, 3.0, 5.0])
+    batches = [collate(2, "agentic"), collate(1, "doc"), collate(1, "doc")]
+    _, _, bg = _val_probe(lambda *a: torch.tensor(next(losses)),
+                          None, None, batches, "cpu")
+    assert bg["agentic"] == 1.0, "one agentic batch at 1.0"
+    assert bg["doc"] == 4.0, "two doc batches at 3.0 and 5.0"
+
+
+def test_a_mixed_group_is_attributed_to_every_row_it_contains():
+    """A batch may hold two groups; its loss counts toward both."""
+    import torch
+
+    from vision_adapter.train import _val_probe
+
+    batches = [{"input_ids": torch.zeros(2, 6, dtype=torch.long),
+                "attention_mask": torch.ones(2, 6, dtype=torch.long),
+                "g": ["agentic", "doc"]}]
+    _, _, bg = _val_probe(lambda *a: torch.tensor(2.0), None, None, batches, "cpu")
+    assert bg == {"agentic": 2.0, "doc": 2.0}
 
 
 def test_val_probe_skips_batches_with_no_supervised_token():
@@ -147,8 +180,9 @@ def test_val_probe_skips_batches_with_no_supervised_token():
     from vision_adapter.train import _val_probe
 
     batches = [{"input_ids": torch.zeros(1, 4, dtype=torch.long)}]
-    loss, n = _val_probe(lambda *a: None, None, None, batches, "cpu")
+    loss, n, by = _val_probe(lambda *a: None, None, None, batches, "cpu")
     assert n == 1 and loss == 0.0
+    assert by == {}, "a batch with no loss contributes to no group"
 
 
 def test_val_loss_reuses_the_train_step_recipe():

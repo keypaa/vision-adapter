@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pack the val split into ONE parquet, so a probe costs one fetch not 21.
+"""Pack the val split, one parquet per group, so a probe costs one fetch not 21.
 
 The disjoint manifest (`train_manifest_val_disjoint.jsonl`) already guarantees
 that no val row's `emb` key appears in the train manifest — verified by an
@@ -9,14 +9,19 @@ the val plan with `excluded_shards=set(plan.keys())`, which drops 1272 rows to
 77 spread over 21 shards. Streaming 21 shards for 77 rows costs ~10 min per
 probe against ~2 min of training between probes.
 
-This packs ~N rows, chosen to reproduce the corpus's g mix and n_vis bucket
-mix, into a single parquet. One fetch, ~1000 rows, every domain represented.
+**One pack per group**, not one blended pack. The corpus is 73% agentic
+(measured on the train manifest, not the 45/45/10 of the dataset card), so a
+blended val_loss can hold steady while one group stops learning — and the
+Baseten threshold only means anything on agentic. Splitting also exposes the
+shortfall instead of absorbing it: the val split holds ~60 doc rows against a
+quota of 270.
 
-RAM-bounded: reads one row group at a time, two columns at a time.
+Within each pack the corpus bucket mix is preserved. RAM-bounded: one row group
+at a time, two columns at a time.
 
 Usage:
-    python scripts/pack_val.py --out emb_cache/val_pack.parquet --n 1000
-    python scripts/pack_val.py --out ... --n 1000 --dry-run   # quotas only
+    python scripts/pack_val.py --n 1000
+    python scripts/pack_val.py --n 1000 --dry-run   # quotas only
 """
 from __future__ import annotations
 
@@ -29,7 +34,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-# The six buckets from the dataset card, and the 45/45/10 g mix.
+# The six n_vis buckets from the dataset card.
 BUCKETS = [(0, 100), (101, 500), (501, 1000), (1001, 2000), (2001, 4900), (4901, 10**9)]
 
 
@@ -96,89 +101,52 @@ def quotas_from_corpus(train_rows, index, n_total: int) -> tuple[dict, dict]:
     return g_q, b_q
 
 
-def pick_rows(val_rows, index, g_q, b_q, seed=0):
-    """Draw N rows so the g marginal AND the n_vis bucket marginal both match.
+def pick_per_group(val_rows, index, g_quota, bucket_share, seed=0):
+    """One pack per group, each shaped to the corpus bucket mix.
 
-    Taking `min(g_q[g], b_q[b])` per (g, bucket) cell does not work: the
-    (agentic, 101-500) cell alone is 828 rows and swamps everything, while
-    every other cell is capped by whichever of its two quotas is smaller. The
-    measured result was agentic 828 against a target of 730 and doc 103 against
-    179 — a full pack, deformed.
+    Splitting the val is the point: the corpus is 73% agentic, so a blended
+    val_loss can hold steady while one group stops learning — and the Baseten
+    threshold only means anything on agentic. Separate packs also expose the
+    measured shortfall instead of absorbing it: the val split holds ~60 doc
+    rows against a quota of 270.
 
-    So: fill each cell to its fair share of the *two* marginals, then correct
-    each marginal independently against the corpus proportions. A cell can only
-    overshoot its g share if the g has too few rows in other buckets, and the
-    report says so.
+    Within each group the corpus bucket mix is preserved, so a doc pack still
+    spans small and large images.
     """
     import random
 
     rng = random.Random(seed)
-    seen_keys = set()
-    cells: dict[tuple, list] = defaultdict(list)
+    by_group: dict[str, list] = defaultdict(list)
+    seen: set[str] = set()
     for r in val_rows:
         e = r.get("emb")
-        if not e or e in seen_keys:
+        if not e or e in seen:
             continue
         loc = index.get(e)
         if not loc or len(loc) != 3:
             continue
-        seen_keys.add(e)
-        cells[(r.get("g", "?"), bucket_of(int(loc[2])))].append(r)
+        seen.add(e)
+        by_group[r.get("g", "?")].append(r)
 
-    target = max(1, round(sum(g_q.values()) or sum(b_q.values())))
-    g_tot = sum(g_q.values()) or 1
-    b_tot = sum(b_q.values()) or 1
+    packs: dict[str, list] = {}
+    for g, want_total in g_quota.items():
+        pool = by_group.get(g, [])
+        if not pool or want_total <= 0:
+            packs[g] = []
+            continue
+        cells: dict[int, list] = defaultdict(list)
+        for r in pool:
+            cells[bucket_of(int(index[r["emb"]][2]))].append(r)
 
-    chosen = []
-    for (g, b), pool in cells.items():
-        # a cell may not claim more than its group needs overall, nor more
-        # than its bucket needs overall
-        want = min(len(pool), round(target * g_q.get(g, 0) / g_tot),
-                   round(target * b_q.get(b, 0) / b_tot))
-        if want > 0:
-            rng.shuffle(pool)
-            chosen.extend(pool[:want])
-
-    # trim the largest groups back to their corpus share, keeping the spread
-    def _trim(by, quota, key):
-        nonlocal chosen
-        counts: Counter = Counter(key(r) for r in chosen)
-        want_tot = sum(quota.values()) or 1
-        for k in sorted(counts, key=lambda k: -counts[k]):
-            allow = round(target * quota.get(k, 0) / want_tot)
-            if counts[k] > allow:
-                drop = counts[k] - allow
-                keep, seen_k = [], 0
-                for r in chosen:
-                    if key(r) == k and seen_k < drop:
-                        seen_k += 1
-                        continue
-                    keep.append(r)
-                chosen = keep
-
-    _trim(None, g_q, lambda r: r.get("g", "?"))
-    _trim(None, b_q, lambda r: bucket_of(int(index[r["emb"]][2])))
-
-    rng.shuffle(chosen)
-    deficit = target - len(chosen)
-    if deficit > 0:
-        # top up from what is left, but not past the group quota — otherwise the
-        # plentiful group silently refills the pack it just gave up
-        picked = {id(r) for r in chosen}
-        counts: Counter = Counter(r.get("g", "?") for r in chosen)
-        g_tot = sum(g_q.values()) or 1
-        rest = [r for pool in cells.values() for r in pool if id(r) not in picked]
-        rng.shuffle(rest)
-        for r in rest:
-            if len(chosen) >= target:
-                break
-            g = r.get("g", "?")
-            allow = round(target * g_q.get(g, 0) / g_tot)
-            if counts[g] >= allow:
-                continue
-            chosen.append(r)
-            counts[g] += 1
-    return chosen[:target], max(0, target - len(chosen))
+        chosen = []
+        for b, rows in sorted(cells.items()):
+            take = min(len(rows), round(want_total * bucket_share.get(b, 0.0)))
+            rng.shuffle(rows)
+            chosen.extend(rows[:take])
+        # bucket order, so the streamed batches stay size-homogeneous
+        chosen.sort(key=lambda r: index[r["emb"]][2])
+        packs[g] = chosen
+    return packs
 
 
 def pack(args) -> int:
@@ -205,31 +173,52 @@ def pack(args) -> int:
 
     index = key_index(args)
     g_q, b_q = quotas_from_corpus(train_rows, index, args.n)
-    chosen, deficit = pick_rows(val_rows, index, g_q, b_q, seed=args.seed)
+    b_tot = sum(b_q.values()) or 1
+    bucket_share = {b: c / b_tot for b, c in b_q.items()}
+    packs = pick_per_group(val_rows, index, g_q, bucket_share, seed=args.seed)
 
     # the invariant the whole script exists to preserve
     train_embs = {r["emb"] for r in train_rows if r.get("emb")}
-    overlap = [r["emb"] for r in chosen if r["emb"] in train_embs]
-    assert not overlap, f"val pack overlaps train on {len(overlap)} keys — abort"
-    assert len({r["emb"] for r in chosen}) == len(chosen), "duplicate keys in the pack"
+    for g, rows in packs.items():
+        overlap = [r["emb"] for r in rows if r["emb"] in train_embs]
+        assert not overlap, (f"val pack '{g}' overlaps train on {len(overlap)} keys"
+                             f" — abort")
+        assert len({r["emb"] for r in rows}) == len(rows), f"duplicate keys in '{g}'"
 
-    gb = Counter(r.get("g", "?") for r in chosen)
-    bb = Counter(bucket_of(int(index[r["emb"]][2])) for r in chosen)
-    print(f"[pack-val] chose {len(chosen)} rows (deficit {deficit})")
-    print(f"[pack-val]   g      {dict(gb)}   target {g_q}")
-    print(f"[pack-val]   bucket {dict(sorted(bb.items()))}   target {b_q}")
-    print(f"[pack-val]   shards {len({index[r['emb']][0] for r in chosen})} distinct")
+    chosen = [r for rows in packs.values() for r in rows]
+    print(f"[pack-val] chose {len(chosen)} rows across {len(packs)} packs")
+    for g, rows in sorted(packs.items()):
+        bb = Counter(bucket_of(int(index[r["emb"]][2])) for r in rows)
+        deficit = g_q.get(g, 0) - len(rows)
+        print(f"[pack-val]   {g:8s} {len(rows):4d}/{g_q.get(g, 0):4d} rows"
+              f"{f'  (short {deficit})' if deficit > 0 else ''}"
+              f"  buckets {dict(sorted(bb.items()))}"
+              f"  shards {len({index[r['emb']][0] for r in rows})}")
 
     if args.dry_run:
         print("[pack-val] dry run — nothing written")
         return 0
+
+    cache_dir = tempfile.mkdtemp(prefix="valpack_")
+    for g, rows in sorted(packs.items()):
+        if not rows:
+            continue
+        _write_pack(args, g, rows, index, cache_dir)
+    return 0
+
+
+def _write_pack(args, group, chosen, index, cache_dir):
+    """Write one group's parquet plus its source_key -> emb map."""
+    import pyarrow.parquet as pq
+
+    from vision_adapter.data.pack import pack_rows
+    from vision_adapter.data.stream import _download_shard_hf_transfer
 
     by_shard: dict[str, dict] = defaultdict(dict)
     for r in chosen:
         sf, row = index[r["emb"]][0], index[r["emb"]][1]
         by_shard[sf][row] = r
 
-    cache_dir = tempfile.mkdtemp(prefix="valpack_")
     out_rows = []
     # the parquet's `key` is the SOURCE key, which is not the manifest's `emb`
     # — they only meet through the key index. This table is how the trainer
@@ -266,24 +255,27 @@ def pack(args) -> int:
             del tbl, vbs
         print(f"[pack-val]   {sf}: {n_done}/{len(wanted)} rows", flush=True)
 
-    out = Path(args.out)
+    out = Path(args.out_dir) / f"val_pack_{group}.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
     pack_rows(out_rows, str(out), batch_size=64,
-              progress=lambda n: print(f"[pack-val]   wrote {n}", flush=True))
+              progress=lambda n: print(f"[pack-val]   {group}: wrote {n}", flush=True))
     size_gb = out.stat().st_size / 2**30
     print(f"[pack-val] wrote {out} ({len(out_rows)} rows, {size_gb:.2f} GiB)")
 
     side = out.with_suffix(".map.json")
     side.write_text(json.dumps(source_to_emb, indent=1, sort_keys=True))
-    print(f"[pack-val] source_key -> emb map: {side} ({len(source_to_emb)} entries)")
+    print(f"[pack-val] {group} source_key -> emb map: {side} "
+          f"({len(source_to_emb)} entries)")
     return 0
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--out", default="emb_cache/val_pack.parquet")
-    ap.add_argument("--n", type=int, default=1000, help="rows to pack")
+    ap.add_argument("--out-dir", default="emb_cache",
+                    help="one val_pack_<group>.parquet is written per group")
+    ap.add_argument("--n", type=int, default=1000,
+                    help="total rows, split across groups by corpus proportion")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--key-index", default=None)
     ap.add_argument("--manifest", default=None, help="val manifest; HF when absent")

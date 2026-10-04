@@ -344,64 +344,79 @@ def _cuda_mem_snapshot() -> dict | None:
 
 
 VAL_MANIFEST_FILE = "train_manifest_val_disjoint.jsonl"
-VAL_PACK_FILE = "val_pack.parquet"
+# one packed parquet per group, written by scripts/pack_val.py
+VAL_PACK_GLOB = "val_pack_*.parquet"
 
 
 def build_val_plan(val_rows, index, stream_order, train_shards, data_dir,
                    excluded, seed, build_plan):
     """Choose how the val probe gets its embeddings.
 
-    A packed parquet is one fetch for ~1000 representative rows. Without it the
-    fallback excludes every train shard and is left with whatever survives —
-    measured 77 rows spread over 21 shards, i.e. ~10 min of streaming per
-    probe against ~2 min of training between probes.
+    Packed parquets — one per group — are local reads. Without them the
+    fallback excludes every train shard and is left with whatever survives:
+    measured 77 rows spread over 21 shards, i.e. ~10 min of streaming per probe
+    against ~2 min of training between probes.
 
-    The pack's disjointness is guaranteed by how it was built
-    (scripts/pack_val.py asserts no key is in the train manifest), so it needs
+    The packs' disjointness is guaranteed by how they were built
+    (scripts/pack_val.py asserts no key is in the train manifest), so they need
     no shard exclusion. We re-check anyway: a pack rebuilt by hand after the
     train plan changed must not be able to leak.
     """
-    pack = data_dir / VAL_PACK_FILE
-    if pack.is_file():
+    packs = sorted(data_dir.glob(VAL_PACK_GLOB))
+    if packs:
         try:
             import json as _json
 
             import pyarrow.parquet as pq
 
-            side = pack.with_suffix(".map.json")
-            if not side.is_file():
-                raise ValueError(f"{side.name} missing — rebuild with scripts/pack_val.py")
-            source_to_emb = _json.loads(side.read_text())
-            keys = pq.ParquetFile(pack).read(columns=["key"]).column("key").to_pylist()
-            if set(keys) != set(source_to_emb):
-                raise ValueError(
-                    f"pack has {len(keys)} keys but the map has {len(source_to_emb)} — "
-                    f"they were written by different runs")
+            order, plan, local, n_total = [], {}, {}, 0
+            for pack in packs:
+                side = pack.with_suffix(".map.json")
+                if not side.is_file():
+                    raise ValueError(f"{side.name} missing — rebuild with scripts/pack_val.py")
+                source_to_emb = _json.loads(side.read_text())
+                keys = pq.ParquetFile(pack).read(columns=["key"]).column("key").to_pylist()
+                if set(keys) != set(source_to_emb):
+                    raise ValueError(
+                        f"{pack.name}: {len(keys)} keys but the map has "
+                        f"{len(source_to_emb)} — written by different runs")
 
-            rows_by_emb = {r["emb"]: r for r in val_rows if r.get("emb")}
-            plan_rows = []
-            for k in keys:
-                r = rows_by_emb.get(source_to_emb.get(k))
-                if r is not None:
-                    # `_row` is the position inside the pack; the reader indexes
-                    # row groups by it
-                    plan_rows.append({**r, "_row": len(plan_rows)})
-            if len(plan_rows) < 0.9 * len(keys):
-                raise ValueError(
-                    f"only {len(plan_rows)}/{len(keys)} packed keys are in the val manifest")
+                rows_by_emb = {r["emb"]: r for r in val_rows if r.get("emb")}
+                plan_rows = []
+                for k in keys:
+                    r = rows_by_emb.get(source_to_emb.get(k))
+                    if r is not None:
+                        # `_row` is the position inside the pack; the reader
+                        # indexes row groups by it
+                        plan_rows.append({**r, "_row": len(plan_rows)})
+                if len(plan_rows) < 0.9 * len(keys):
+                    raise ValueError(
+                        f"{pack.name}: only {len(plan_rows)}/{len(keys)} keys "
+                        f"are in the val manifest")
 
-            # disjoint by key — not by shard. The pack was built that way and we
-            # re-check, because a pack rebuilt by hand after the train plan
-            # changed must not be able to leak.
-            leak = [r["emb"] for r in plan_rows if index.get(r["emb"], (None,))[0] in train_shards]
-            if leak:
-                raise ValueError(f"{len(leak)} packed val rows resolve to a train shard")
+                # disjoint by key — not by shard. The pack was built that way
+                # and we re-check, because a pack rebuilt by hand after the
+                # train plan changed must not be able to leak.
+                leak = [r["emb"] for r in plan_rows
+                        if index.get(r["emb"], (None,))[0] in train_shards]
+                if leak:
+                    raise ValueError(
+                        f"{pack.name}: {len(leak)} rows resolve to a train shard")
 
-            print(f"[train] val pack: {len(plan_rows)} rows in {pack.name} "
-                  f"(1 local read, disjoint by key verified)", flush=True)
-            return [pack.name], {pack.name: plan_rows}, len(plan_rows), {pack.name: str(pack)}
+                order.append(pack.name)
+                plan[pack.name] = plan_rows
+                local[pack.name] = str(pack)
+                n_total += len(plan_rows)
+
+            per_g = {}
+            for rows in plan.values():
+                for r in rows:
+                    per_g[r.get("g", "?")] = per_g.get(r.get("g", "?"), 0) + 1
+            print(f"[train] val packs: {n_total} rows in {len(packs)} local files "
+                  f"({per_g}), disjoint by key verified", flush=True)
+            return order, plan, n_total, local
         except Exception as e:  # noqa: BLE001
-            print(f"[train][WARN] val pack unusable ({e}) — falling back to "
+            print(f"[train][WARN] val packs unusable ({e}) — falling back to "
                   f"the multi-shard plan", flush=True)
 
     val_order = [s for s in stream_order if s not in excluded]
@@ -508,10 +523,17 @@ def _val_probe(loss_fn, model, proj, batches, device):
     ``loss_fn(model, proj, batch, device) -> loss tensor or None`` (None for a
     batch with no supervised token). Grad-free; the projector is returned to
     its previous train/eval mode afterwards.
+
+    Also returns the same split per ``g`` group. The corpus is 73 % agentic, so
+    a single blended number can hide a group that stopped learning while the
+    others carried the average — and the Baseten threshold only means anything
+    on agentic anyway.
     """
     import torch
+    from collections import defaultdict
 
     total, n_batches, n_rows = 0.0, 0, 0
+    per_group: dict[str, list] = defaultdict(list)
     prev_training = proj.training if hasattr(proj, "training") else None
     if prev_training is not None:
         proj.eval()
@@ -520,13 +542,19 @@ def _val_probe(loss_fn, model, proj, batches, device):
             for batch in batches:
                 loss = loss_fn(model, proj, batch, device)
                 n_batches += 1
-                n_rows += int(batch["input_ids"].shape[0])
+                rows = int(batch["input_ids"].shape[0])
+                n_rows += rows
+                groups = batch.get("g") or ["?"] * rows
                 if loss is not None:
-                    total += float(loss.item())
+                    v = float(loss.item())
+                    total += v
+                    for g in groups:
+                        per_group[g].append(v)
     finally:
         if prev_training is not None:
             proj.train(prev_training)
-    return total / max(1, n_batches), n_rows
+    by_group = {g: sum(v) / len(v) for g, v in per_group.items() if v}
+    return total / max(1, n_batches), n_rows, by_group
 
 
 def resolve_dtype(capability: int, dtype_arg: str = "auto"):
@@ -1426,18 +1454,21 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 )
                 print(_start_line, flush=True)
                 try:
-                    _vloss, _vn = _val_probe(
+                    _vloss, _vn, _vby = _val_probe(
                         _batch_loss, model, proj, _val_batches(), dev
                     )
                     print(f"[{time.strftime('%H:%M:%S')}] [train] VAL step={step} "
                           f"done in {time.time() - _vt:.1f}s", flush=True)
                     lf.write(json.dumps(
                         _val_record(step, _vloss, _vn, (time.time() - _vt) / 60)
+                        | {"val_by_group": {g: round(v, 5) for g, v in _vby.items()}}
                     ) + "\n")
                     _val_has_run = True
+                    _per_g = "  ".join(f"{g}={v:.4f}" for g, v in sorted(_vby.items()))
                     print(f"[{time.strftime('%H:%M:%S')} {(time.time()-t0)/60:.1f}min] "
                           f"[train] VAL step={step} loss={_vloss:.5f} "
-                          f"n={_vn} ({(time.time()-_vt)/60:.1f}min)", flush=True)
+                          f"n={_vn} ({(time.time()-_vt)/60:.1f}min)"
+                          + (f"  | {_per_g}" if _per_g else ""), flush=True)
                 except Exception as e:  # noqa: BLE001 — a failed probe must not kill the run
                     print(f"[train][WARN] val probe failed at step {step}: {e}", flush=True)
             # save every 10 steps for probe (200) to avoid losing $ on interrupt; hero uses cfg.save_every 500

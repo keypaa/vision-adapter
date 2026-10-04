@@ -94,11 +94,47 @@ def test_a_manifest_with_no_indexable_rows_fails_loudly():
 
 # ---------------------------------------------------------------- picking
 
-def test_pick_never_exceeds_a_quota():
-    val = [{"emb": f"v{i}", "g": "agentic"} for i in range(500)]
+
+def _share(*vals):
+    """Bucket shares by bucket index, zeros for the buckets not given."""
+    tot = sum(vals) or 1
+    return {i: v / tot for i, v in enumerate(vals)}
+
+
+def _all_in(bucket, n):
+    """Every row lands in `bucket` — the common case in these fixtures."""
+    return _share(*(n if i == bucket else 0 for i in range(6)))
+
+
+def test_each_group_gets_its_own_quota():
+    val = ([{"emb": f"a{i}", "g": "agentic"} for i in range(900)]
+           + [{"emb": f"d{i}", "g": "doc"} for i in range(400)])
     index = _index([(r["emb"], 374) for r in val])
-    chosen, _ = pv.pick_rows(val, index, {"agentic": 100}, {1: 100}, seed=0)
-    assert len(chosen) == 100
+
+    packs = pv.pick_per_group(val, index, {"agentic": 750, "doc": 250},
+                              _all_in(1, 1000), seed=0)
+    assert len(packs["agentic"]) == 750
+    assert len(packs["doc"]) == 250
+
+
+def test_a_group_shorter_than_its_quota_is_not_topped_up_from_another():
+    """The live shortfall: the val split holds ~60 doc rows against a quota of
+    270. Stealing agentic rows to fill doc would make both numbers fiction."""
+    val = ([{"emb": f"a{i}", "g": "agentic"} for i in range(900)]
+           + [{"emb": f"d{i}", "g": "doc"} for i in range(60)])
+    index = _index([(r["emb"], 374) for r in val])
+
+    packs = pv.pick_per_group(val, index, {"agentic": 750, "doc": 270},
+                              _all_in(1, 1000), seed=0)
+    assert len(packs["agentic"]) == 750, "agentic keeps its own quota"
+    assert len(packs["doc"]) == 60, "doc takes what exists, no more"
+
+
+def test_a_group_with_no_rows_yields_an_empty_pack_not_a_crash():
+    index = _index([("a", 374)])
+    packs = pv.pick_per_group([{"emb": "a", "g": "agentic"}], index,
+                              {"agentic": 10, "doc": 5}, _all_in(1, 1000), seed=0)
+    assert packs["doc"] == [], "a missing group must be empty, not fatal"
 
 
 def test_repeated_emb_keys_are_deduplicated():
@@ -107,64 +143,60 @@ def test_repeated_emb_keys_are_deduplicated():
     val = [{"emb": "dup", "g": "agentic"}, {"emb": "dup", "g": "agentic"},
            {"emb": "other", "g": "agentic"}]
     index = _index([("dup", 374), ("other", 374)])
-    chosen, _ = pv.pick_rows(val, index, {"agentic": 10}, {1: 10}, seed=0)
-    embs = [r["emb"] for r in chosen]
+    packs = pv.pick_per_group(val, index, {"agentic": 10}, _all_in(1, 1000), seed=0)
+    embs = [r["emb"] for r in packs["agentic"]]
     assert len(embs) == len(set(embs)), "a duplicated key must not appear twice"
-    assert "dup" in embs, "the first occurrence is kept"
 
 
-def test_pick_has_no_duplicate_keys():
-    val = [{"emb": f"v{i}", "g": "doc"} for i in range(300)]
-    index = _index([(r["emb"], 200) for r in val])
-    chosen, _ = pv.pick_rows(val, index, {"doc": 200}, {1: 200}, seed=0)
-    assert len({r["emb"] for r in chosen}) == len(chosen)
-
-
-def test_a_rare_bucket_is_not_starved_by_an_abundant_one():
-    """11 317 rows sit in 0-100 and 92 801 in 101-500. If the plentiful cell is
-    filled first, the rare bucket is never reached."""
-    small = [{"emb": f"s{i}", "g": "agentic"} for i in range(5)]
-    big = [{"emb": f"b{i}", "g": "agentic"} for i in range(400)]
+def test_each_pack_keeps_the_corpus_bucket_mix():
+    """A doc pack must still span small and large images."""
+    small = [{"emb": f"s{i}", "g": "doc"} for i in range(40)]
+    big = [{"emb": f"b{i}", "g": "doc"} for i in range(400)]
     val = small + big
-    index = _index([(r["emb"], 50 if r["emb"].startswith("s") else 374) for r in val])
+    index = _index([(r["emb"], 50 if r["emb"].startswith("s") else 374)
+                    for r in val])
 
-    chosen, _ = pv.pick_rows(val, index, {"agentic": 10}, {0: 5, 1: 5}, seed=0)
-    got = [pv.bucket_of(int(index[r["emb"]][2])) for r in chosen]
-    assert got.count(0) == 5, "all five small rows must be taken"
-    assert got.count(1) == 5
-
-
-def test_a_dominant_cell_cannot_swamp_the_others():
-    """The live failure: (agentic, 101-500) has 828 rows and took the whole
-    pack, giving agentic 828 against a target of 730 and doc 103 against 179."""
-    val = ([{"emb": f"a{i}", "g": "agentic"} for i in range(900)]
-           + [{"emb": f"d{i}", "g": "doc"} for i in range(60)])
-    index = _index([(r["emb"], 374) for r in val])   # all in one bucket
-
-    chosen, deficit = pv.pick_rows(val, index,
-                                    {"agentic": 730, "doc": 270},
-                                    {1: 1000}, seed=0)
-
-    n_agentic = sum(1 for r in chosen if r["g"] == "agentic")
-    assert n_agentic == 730, f"agentic must land on its quota, got {n_agentic}"
-    # doc only has 60 rows available, so the pack is short and must say so
-    assert sum(1 for r in chosen if r["g"] == "doc") == 60
-    assert deficit == 210, "a shortfall must be reported, not absorbed silently"
+    packs = pv.pick_per_group(val, index, {"doc": 100}, _share(0.1, 0.9), seed=0)
+    got = [pv.bucket_of(int(index[r["emb"]][2])) for r in packs["doc"]]
+    assert got.count(0) == 10, "10% of the pack must be small"
+    assert got.count(1) == 90
 
 
-def test_deficit_is_reported_when_the_val_split_cannot_fill_the_quota():
-    val = [{"emb": "only1", "g": "agentic"}]
-    index = _index([("only1", 374)])
-    chosen, deficit = pv.pick_rows(val, index, {"agentic": 500}, {1: 500}, seed=0)
-    assert len(chosen) == 1
-    assert deficit > 0, "a shortfall must be visible, not silently shrink the pack"
+def test_a_bucket_absent_from_the_val_split_does_not_break_the_pack():
+    """The val split holds 77 usable rows; a 6-bucket quota cannot be met."""
+    val = [{"emb": f"v{i}", "g": "agentic"} for i in range(100)]
+    index = _index([(r["emb"], 374) for r in val])
+    packs = pv.pick_per_group(val, index, {"agentic": 100},
+                              _all_in(1, 1000), seed=0)
+    assert len(packs["agentic"]) == 100, "the pack fills from the bucket it has"
 
 
-def test_rows_without_grid_or_index_are_skipped():
+def test_rows_without_an_index_entry_are_skipped():
     val = [{"emb": "ghost", "g": "agentic"}, {"emb": "real", "g": "agentic"}]
     index = _index([("real", 374)])
-    chosen, _ = pv.pick_rows(val, index, {"agentic": 10}, {1: 10}, seed=0)
-    assert [r["emb"] for r in chosen] == ["real"]
+    packs = pv.pick_per_group(val, index, {"agentic": 10}, _all_in(1, 1000), seed=0)
+    assert [r["emb"] for r in packs["agentic"]] == ["real"]
+
+
+def test_rows_come_out_in_bucket_order():
+    """Batches must stay size-homogeneous; sorted n_vis is how the plan does it."""
+    import random
+
+    rng = random.Random(0)
+    val = [{"emb": f"v{i}", "g": "agentic"} for i in range(100)]
+    index = {f"v{i}": (f"data/emb_0002.parquet", i, rng.randint(50, 4000))
+             for i in range(100)}
+    packs = pv.pick_per_group(val, index, {"agentic": 100}, _all_in(1, 1000), seed=0)
+    sizes = [index[r["emb"]][2] for r in packs["agentic"]]
+    assert sizes == sorted(sizes)
+
+
+def test_the_same_seed_gives_the_same_pack():
+    val = [{"emb": f"v{i}", "g": "agentic"} for i in range(200)]
+    index = _index([(r["emb"], 50 if i % 2 else 374) for i, r in enumerate(val)])
+    a = pv.pick_per_group(val, index, {"agentic": 100}, _share(1, 1), seed=3)
+    b = pv.pick_per_group(val, index, {"agentic": 100}, _share(1, 1), seed=3)
+    assert [r["emb"] for r in a["agentic"]] == [r["emb"] for r in b["agentic"]]
 
 
 # ---------------------------------------------------------------- CLI shape
