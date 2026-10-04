@@ -344,6 +344,72 @@ def _cuda_mem_snapshot() -> dict | None:
 
 
 VAL_MANIFEST_FILE = "train_manifest_val_disjoint.jsonl"
+VAL_PACK_FILE = "val_pack.parquet"
+
+
+def build_val_plan(val_rows, index, stream_order, train_shards, data_dir,
+                   excluded, seed, build_plan):
+    """Choose how the val probe gets its embeddings.
+
+    A packed parquet is one fetch for ~1000 representative rows. Without it the
+    fallback excludes every train shard and is left with whatever survives —
+    measured 77 rows spread over 21 shards, i.e. ~10 min of streaming per
+    probe against ~2 min of training between probes.
+
+    The pack's disjointness is guaranteed by how it was built
+    (scripts/pack_val.py asserts no key is in the train manifest), so it needs
+    no shard exclusion. We re-check anyway: a pack rebuilt by hand after the
+    train plan changed must not be able to leak.
+    """
+    pack = data_dir / VAL_PACK_FILE
+    if pack.is_file():
+        try:
+            import json as _json
+
+            import pyarrow.parquet as pq
+
+            side = pack.with_suffix(".map.json")
+            if not side.is_file():
+                raise ValueError(f"{side.name} missing — rebuild with scripts/pack_val.py")
+            source_to_emb = _json.loads(side.read_text())
+            keys = pq.ParquetFile(pack).read(columns=["key"]).column("key").to_pylist()
+            if set(keys) != set(source_to_emb):
+                raise ValueError(
+                    f"pack has {len(keys)} keys but the map has {len(source_to_emb)} — "
+                    f"they were written by different runs")
+
+            rows_by_emb = {r["emb"]: r for r in val_rows if r.get("emb")}
+            plan_rows = []
+            for k in keys:
+                r = rows_by_emb.get(source_to_emb.get(k))
+                if r is not None:
+                    # `_row` is the position inside the pack; the reader indexes
+                    # row groups by it
+                    plan_rows.append({**r, "_row": len(plan_rows)})
+            if len(plan_rows) < 0.9 * len(keys):
+                raise ValueError(
+                    f"only {len(plan_rows)}/{len(keys)} packed keys are in the val manifest")
+
+            # disjoint by key — not by shard. The pack was built that way and we
+            # re-check, because a pack rebuilt by hand after the train plan
+            # changed must not be able to leak.
+            leak = [r["emb"] for r in plan_rows if index.get(r["emb"], (None,))[0] in train_shards]
+            if leak:
+                raise ValueError(f"{len(leak)} packed val rows resolve to a train shard")
+
+            print(f"[train] val pack: {len(plan_rows)} rows in {pack.name} "
+                  f"(1 local read, disjoint by key verified)", flush=True)
+            return [pack.name], {pack.name: plan_rows}, len(plan_rows), {pack.name: str(pack)}
+        except Exception as e:  # noqa: BLE001
+            print(f"[train][WARN] val pack unusable ({e}) — falling back to "
+                  f"the multi-shard plan", flush=True)
+
+    val_order = [s for s in stream_order if s not in excluded]
+    plan = build_plan(
+        val_rows, index, sample_size=len(val_rows), seed=seed,
+        excluded_shards=train_shards,
+    )
+    return val_order, plan, sum(len(v) for v in plan.values()), {}
 
 
 def _val_rows_from_file(path) -> list[dict]:
@@ -1127,6 +1193,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     # loudly rather than silently training unmonitored.
     val_plan, val_order = None, []
     _n_val_planned = 0
+    # plan-shard -> a parquet already on disk; empty unless the val pack is used
+    _val_local: dict[str, str] = {}
     if cfg.val_every > 0:
         _val_rows: list[dict] = []
         _local_val = data_dir / VAL_MANIFEST_FILE
@@ -1146,17 +1214,19 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         except Exception as e:  # noqa: BLE001
             print(f"[train][WARN] val manifest unavailable ({e}) — val probe OFF", flush=True)
         if _val_rows:
-            # exclude every shard the train plan already draws from, so a val
-            # row can never be served by a shard the trainer is streaming
-            val_order = [s for s in stream_order if s not in EXCLUDED]
-            val_plan = _build_plan(
-                _val_rows, index, sample_size=len(_val_rows), seed=_plan_seed,
-                excluded_shards=set(plan.keys()),
+            val_order, val_plan, _n_val, _val_local = build_val_plan(
+                val_rows=_val_rows,
+                index=index,
+                stream_order=stream_order,
+                train_shards=set(plan.keys()),
+                data_dir=data_dir,
+                excluded=EXCLUDED,
+                seed=_plan_seed,
+                build_plan=_build_plan,
             )
-            _n_val = sum(len(v) for v in val_plan.values())
             _n_val_planned = _n_val
             print(f"[train] val plan: {_n_val}/{len(_val_rows)} rows "
-                  f"from {len(val_plan)} shards (every {cfg.val_every} steps)", flush=True)
+                  f"from {len(val_plan)} source(s), every {cfg.val_every} steps", flush=True)
         else:
             print("[train][WARN] no val rows — val probe OFF for this run", flush=True)
     # Logging
@@ -1232,7 +1302,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     def _val_batches():
         """Collate the held-out split. Materialized on the first call."""
         ds = _EmbDS(val_plan, val_order, rg_cache_dir=str(data_dir / "cache" / "rg_cache"),
-                    vision_dim=cfg.vision_dim)
+                    vision_dim=cfg.vision_dim, local_shards=_val_local)
         loader = _torch.utils.data.DataLoader(
             ds, batch_size=cfg.batch_size, drop_last=False, collate_fn=collate, num_workers=0
         )

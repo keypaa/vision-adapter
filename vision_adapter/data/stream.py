@@ -684,12 +684,17 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
         start_pos: int = 0,
         rg_cache_dir: str | None = None,
         vision_dim: int = VISION_DIM,
+        local_shards: dict[str, str] | None = None,
     ):
         super().__init__()
         self.plan, self.order = plan, stream_order
         self.start_pos = start_pos
         self.rg_cache_dir = rg_cache_dir
         self.vision_dim = vision_dim
+        # plan-shard name -> a parquet already on this disk. The val pack uses
+        # this: one file, no fetch, no prefetch daemon. Rows still carry `_row`
+        # because the reader indexes row groups by position either way.
+        self.local_shards = local_shards or {}
         if rg_cache_dir:
             os.makedirs(rg_cache_dir, exist_ok=True)
 
@@ -714,7 +719,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                 cur = shard_idx[sf]
                 if cur + 1 < len(shard_list) and (next_shard_fut is None or next_shard_fut.done()):
                     nxt = shard_list[cur + 1]
-                    nxt_path = _get_hf_shard_path(nxt, cache_dir=self.rg_cache_dir)
+                    nxt_path = self.local_shards.get(nxt) or _get_hf_shard_path(nxt, cache_dir=self.rg_cache_dir)
                     if nxt_path is None:
                         try:
                             next_shard_fut = shard_prefetch.submit(_download_shard_hf_transfer, nxt, self.rg_cache_dir)
@@ -723,7 +728,9 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
             # Phase 2 fast path: whole-shard hf_transfer (~1 GiB/s) — local
             # parquet read, no Range. Not Modal-gated any more: the target is a
             # rented instance, and the Range path measures 1.5-28 MiB/s.
-            local_path: str | None = _get_hf_shard_path(sf, cache_dir=self.rg_cache_dir)
+            local_path: str | None = self.local_shards.get(sf)
+            if local_path is None:
+                local_path = _get_hf_shard_path(sf, cache_dir=self.rg_cache_dir)
             if local_path is None:
                 local_path = _download_shard_hf_transfer(sf, cache_dir=self.rg_cache_dir)
             if local_path and os.path.exists(local_path):
