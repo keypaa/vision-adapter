@@ -101,18 +101,25 @@ def pick_rows(val_rows, index, g_q, b_q, seed=0):
 
     Cells are filled in order of scarcity (fewest candidates first) so a rare
     bucket is not starved by a common one that happens to be enumerated first.
+
+    The live val manifest repeats `emb` keys across rows (measured 2026-10-04:
+    1272 rows, fewer unique keys). Deduplicate first — two rows sharing an
+    embedding are the same val sample twice, which would make the loss look
+    steadier than it is.
     """
     import random
 
     rng = random.Random(seed)
+    seen_keys = set()
     cells: dict[tuple, list] = defaultdict(list)
     for r in val_rows:
         e = r.get("emb")
-        if not e:
+        if not e or e in seen_keys:
             continue
         loc = index.get(e)
         if not loc or len(loc) != 3:
             continue
+        seen_keys.add(e)
         cells[(r.get("g", "?"), bucket_of(int(loc[2])))].append(r)
 
     chosen, deficit = [], 0

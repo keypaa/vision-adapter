@@ -101,6 +101,18 @@ def test_pick_never_exceeds_a_quota():
     assert len(chosen) == 100
 
 
+def test_repeated_emb_keys_are_deduplicated():
+    """The live val manifest repeats emb keys. Two rows sharing an embedding
+    are the same sample twice — the loss would look steadier than it is."""
+    val = [{"emb": "dup", "g": "agentic"}, {"emb": "dup", "g": "agentic"},
+           {"emb": "other", "g": "agentic"}]
+    index = _index([("dup", 374), ("other", 374)])
+    chosen, _ = pv.pick_rows(val, index, {"agentic": 10}, {1: 10}, seed=0)
+    embs = [r["emb"] for r in chosen]
+    assert len(embs) == len(set(embs)), "a duplicated key must not appear twice"
+    assert "dup" in embs, "the first occurrence is kept"
+
+
 def test_pick_has_no_duplicate_keys():
     val = [{"emb": f"v{i}", "g": "doc"} for i in range(300)]
     index = _index([(r["emb"], 200) for r in val])
