@@ -121,17 +121,35 @@ def test_pick_has_no_duplicate_keys():
 
 
 def test_a_rare_bucket_is_not_starved_by_an_abundant_one():
-    """11 317 rows sit in 0-100 and 92 801 in 101-500. If the filler took from
-    the plentiful cell first, the rare cell would never be reached."""
+    """11 317 rows sit in 0-100 and 92 801 in 101-500. If the plentiful cell is
+    filled first, the rare bucket is never reached."""
     small = [{"emb": f"s{i}", "g": "agentic"} for i in range(5)]
     big = [{"emb": f"b{i}", "g": "agentic"} for i in range(400)]
     val = small + big
     index = _index([(r["emb"], 50 if r["emb"].startswith("s") else 374) for r in val])
 
     chosen, _ = pv.pick_rows(val, index, {"agentic": 10}, {0: 5, 1: 5}, seed=0)
-    got = Counter_of = [pv.bucket_of(int(index[r["emb"]][2])) for r in chosen]
-    assert Counter_of.count(0) == 5, "all five small rows must be taken"
-    assert Counter_of.count(1) == 5
+    got = [pv.bucket_of(int(index[r["emb"]][2])) for r in chosen]
+    assert got.count(0) == 5, "all five small rows must be taken"
+    assert got.count(1) == 5
+
+
+def test_a_dominant_cell_cannot_swamp_the_others():
+    """The live failure: (agentic, 101-500) has 828 rows and took the whole
+    pack, giving agentic 828 against a target of 730 and doc 103 against 179."""
+    val = ([{"emb": f"a{i}", "g": "agentic"} for i in range(900)]
+           + [{"emb": f"d{i}", "g": "doc"} for i in range(60)])
+    index = _index([(r["emb"], 374) for r in val])   # all in one bucket
+
+    chosen, deficit = pv.pick_rows(val, index,
+                                    {"agentic": 730, "doc": 270},
+                                    {1: 1000}, seed=0)
+
+    n_agentic = sum(1 for r in chosen if r["g"] == "agentic")
+    assert n_agentic == 730, f"agentic must land on its quota, got {n_agentic}"
+    # doc only has 60 rows available, so the pack is short and must say so
+    assert sum(1 for r in chosen if r["g"] == "doc") == 60
+    assert deficit == 210, "a shortfall must be reported, not absorbed silently"
 
 
 def test_deficit_is_reported_when_the_val_split_cannot_fill_the_quota():

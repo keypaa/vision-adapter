@@ -97,15 +97,18 @@ def quotas_from_corpus(train_rows, index, n_total: int) -> tuple[dict, dict]:
 
 
 def pick_rows(val_rows, index, g_q, b_q, seed=0):
-    """One row per (g, bucket) cell until the quota is met.
+    """Draw N rows so the g marginal AND the n_vis bucket marginal both match.
 
-    Cells are filled in order of scarcity (fewest candidates first) so a rare
-    bucket is not starved by a common one that happens to be enumerated first.
+    Taking `min(g_q[g], b_q[b])` per (g, bucket) cell does not work: the
+    (agentic, 101-500) cell alone is 828 rows and swamps everything, while
+    every other cell is capped by whichever of its two quotas is smaller. The
+    measured result was agentic 828 against a target of 730 and doc 103 against
+    179 — a full pack, deformed.
 
-    The live val manifest repeats `emb` keys across rows (measured 2026-10-04:
-    1272 rows, fewer unique keys). Deduplicate first — two rows sharing an
-    embedding are the same val sample twice, which would make the loss look
-    steadier than it is.
+    So: fill each cell to its fair share of the *two* marginals, then correct
+    each marginal independently against the corpus proportions. A cell can only
+    overshoot its g share if the g has too few rows in other buckets, and the
+    report says so.
     """
     import random
 
@@ -122,24 +125,60 @@ def pick_rows(val_rows, index, g_q, b_q, seed=0):
         seen_keys.add(e)
         cells[(r.get("g", "?"), bucket_of(int(loc[2])))].append(r)
 
-    chosen, deficit = [], 0
-    order = sorted(cells, key=lambda c: (len(cells[c]), c))
-    for cell in order:
-        want = min(g_q.get(cell[0], 0), b_q.get(cell[1], 0))
-        pool = cells[cell]
-        rng.shuffle(pool)
-        chosen.extend(pool[:want])
+    target = max(1, round(sum(g_q.values()) or sum(b_q.values())))
+    g_tot = sum(g_q.values()) or 1
+    b_tot = sum(b_q.values()) or 1
 
-    # quotas rarely divide evenly; top up from whatever is left, rarest first
-    if len(chosen) < sum(g_q.values()):
-        picked = {id(r) for r in chosen}
-        rest = [r for cell in order for r in cells[cell] if id(r) not in picked]
-        rng.shuffle(rest)
-        chosen.extend(rest[: sum(g_q.values()) - len(chosen)])
+    chosen = []
+    for (g, b), pool in cells.items():
+        # a cell may not claim more than its group needs overall, nor more
+        # than its bucket needs overall
+        want = min(len(pool), round(target * g_q.get(g, 0) / g_tot),
+                   round(target * b_q.get(b, 0) / b_tot))
+        if want > 0:
+            rng.shuffle(pool)
+            chosen.extend(pool[:want])
+
+    # trim the largest groups back to their corpus share, keeping the spread
+    def _trim(by, quota, key):
+        nonlocal chosen
+        counts: Counter = Counter(key(r) for r in chosen)
+        want_tot = sum(quota.values()) or 1
+        for k in sorted(counts, key=lambda k: -counts[k]):
+            allow = round(target * quota.get(k, 0) / want_tot)
+            if counts[k] > allow:
+                drop = counts[k] - allow
+                keep, seen_k = [], 0
+                for r in chosen:
+                    if key(r) == k and seen_k < drop:
+                        seen_k += 1
+                        continue
+                    keep.append(r)
+                chosen = keep
+
+    _trim(None, g_q, lambda r: r.get("g", "?"))
+    _trim(None, b_q, lambda r: bucket_of(int(index[r["emb"]][2])))
 
     rng.shuffle(chosen)
-    deficit = sum(g_q.values()) - len(chosen)
-    return chosen, deficit
+    deficit = target - len(chosen)
+    if deficit > 0:
+        # top up from what is left, but not past the group quota — otherwise the
+        # plentiful group silently refills the pack it just gave up
+        picked = {id(r) for r in chosen}
+        counts: Counter = Counter(r.get("g", "?") for r in chosen)
+        g_tot = sum(g_q.values()) or 1
+        rest = [r for pool in cells.values() for r in pool if id(r) not in picked]
+        rng.shuffle(rest)
+        for r in rest:
+            if len(chosen) >= target:
+                break
+            g = r.get("g", "?")
+            allow = round(target * g_q.get(g, 0) / g_tot)
+            if counts[g] >= allow:
+                continue
+            chosen.append(r)
+            counts[g] += 1
+    return chosen[:target], max(0, target - len(chosen))
 
 
 def pack(args) -> int:
