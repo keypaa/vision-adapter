@@ -195,3 +195,16 @@ def test_loader_resume_skips_the_first_rows(tmp_path):
     expected = [want[0][p][qi]["assistant"]
                 for p, qi in interleaved_positions(want[0])][5:]
     assert [r["assistant"] for r in got] == expected
+
+
+def test_daemon_task_satisfies_the_drain_contract():
+    """The prefetch result is consumed by drain_row_group_prefetch, which calls
+    .result() -- a daemon task that only had .value() would silently break the
+    adopt path (the prefetched bytes would be discarded and re-downloaded)."""
+    from vision_adapter.data.stream import _DaemonTask, drain_row_group_prefetch
+
+    t = _DaemonTask(lambda: b"hello")
+    assert drain_row_group_prefetch(t) == b"hello"
+    boom = _DaemonTask(lambda: 1 / 0)
+    assert drain_row_group_prefetch(boom) is None      # errors are swallowed
+    assert boom.done()

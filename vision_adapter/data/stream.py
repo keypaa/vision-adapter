@@ -390,13 +390,13 @@ class _DaemonTask:
     """
 
     def __init__(self, fn, *args, **kwargs):
-        self.result = None
+        self._value = None
         self.error: Exception | None = None
         self._done = threading.Event()
 
         def _run():
             try:
-                self.result = fn(*args, **kwargs)
+                self._value = fn(*args, **kwargs)
             except Exception as e:      # noqa: BLE001 - reported, not raised
                 self.error = e
             finally:
@@ -411,10 +411,17 @@ class _DaemonTask:
     def wait(self, timeout: float | None = None) -> bool:
         return self._done.wait(timeout)
 
+    def result(self, timeout: float | None = None):
+        """Future-compatible: block for the value, re-raise the error."""
+        self._done.wait(timeout)
+        if self.error is not None:
+            raise self.error
+        return self._value
+
     def value(self):
         if self.error is not None:
             raise self.error
-        return self.result
+        return self._value
 
 
 def drain_row_group_prefetch(fut):
