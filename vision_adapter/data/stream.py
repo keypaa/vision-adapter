@@ -17,6 +17,7 @@ import io
 import json
 import os
 import random
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -28,15 +29,16 @@ from vision_adapter.backends.auth import get_hf_token as _get_hf_token
 
 EMB_REPO = "keypa/vision-adapter-embeddings"
 MANIFEST_REPO = "keypa/vision-adapter-manifests"
-# Shape of the row stream the loader serves, recorded in every checkpoint.
-#   v1 = one row per image position (the manifest's extra questions were dropped)
-#   v2 = every plan row is served (questions for an image are consecutive)
-# A resume across versions is refused: the row at a given offset is a different
-# row, so the "data continues where it left off" contract would be broken.
-STREAM_VERSION = 2# The backfilled manifest, which carries grid_thw on every row (verified
+# The backfilled manifest, which carries grid_thw on every row (verified
 # 117600/117600 against the stored n_vis). Preferred over the plain one
 # when present; see train.resolve_manifest_name.
 MANIFEST_FILE = "train_manifest_grids.jsonl"
+# Shape of the row stream the loader serves, recorded in every checkpoint.
+#   v1 = one row per image position (the manifest's extra questions were dropped)
+#   v2 = every plan row is served (the questions of an image are interleaved)
+# A resume across versions is refused: the row at a given offset is a different
+# row, so the "data continues where it left off" contract would be broken.
+STREAM_VERSION = 2
 KEY_INDEX_CACHE = "key_index_cache.json"
 
 # Vision dim is fixed by MoonViT 2x2 merge flatten — matches config TrainConfig.vision_dim
@@ -308,21 +310,25 @@ def _in_modal() -> bool:
 
 
 def _get_hf_shard_path(shard: str, cache_dir: str | None = None) -> str | None:
-    """If HF_HUB_CACHE-stored shard exists locally, return its path; else None."""
-    # Check hf_transfer / huggingface_hub cache for the shard file
-    candidates = []
-    if cache_dir:
-        candidates.append(os.path.join(cache_dir, os.path.basename(shard)))
-    # Global HF cache mirrors hf_hub_download local_dir behavior
-    for base in (os.environ.get("HF_HUB_CACHE"), os.path.expanduser("~/.cache/huggingface/hub")):
-        if base:
-            # Search for emb_XXXX.parquet under any snapshot
-            import glob
+    """If a whole shard is already on this disk, return its path.
 
-            candidates.extend(glob.glob(os.path.join(base, "**", os.path.basename(shard)), recursive=True))
-    for c in candidates:
-        if os.path.exists(c):
-            return c
+    The download keeps the repo-relative path, so the file lands at
+    <cache_dir>/data/emb_XXXX.parquet -- the same place _shard_cache_path
+    looks. (The old lookup only looked at <cache_dir>/emb_*.parquet, so
+    every shard looked "missing" and cost an extra round trip.)
+    """
+    if cache_dir:
+        p = _shard_cache_path(cache_dir, shard)
+        if p:
+            return p
+    for base in (os.environ.get("HF_HUB_CACHE"), os.path.expanduser("~/.cache/huggingface/hub")):
+        if not base:
+            continue
+        import glob
+
+        hits = glob.glob(os.path.join(base, "**", os.path.basename(shard)), recursive=True)
+        if hits:
+            return hits[0]
     return None
 
 
@@ -373,6 +379,42 @@ def _download_shard_hf_transfer(shard: str, cache_dir: str | None = None, token:
         return p if os.path.exists(p) else None
     except Exception:
         return None
+
+
+class _DaemonTask:
+    """A single background task on a DAEMON thread.
+
+    ThreadPoolExecutor registers an atexit hook that JOINS its workers, so a
+    60 GB shard download still in flight when the trainer stops would hang
+    the process for minutes. A daemon thread can be abandoned.
+    """
+
+    def __init__(self, fn, *args, **kwargs):
+        self.result = None
+        self.error: Exception | None = None
+        self._done = threading.Event()
+
+        def _run():
+            try:
+                self.result = fn(*args, **kwargs)
+            except Exception as e:      # noqa: BLE001 - reported, not raised
+                self.error = e
+            finally:
+                self._done.set()
+
+        self._thread = threading.Thread(target=_run, daemon=True)
+        self._thread.start()
+
+    def done(self) -> bool:
+        return self._done.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._done.wait(timeout)
+
+    def value(self):
+        if self.error is not None:
+            raise self.error
+        return self.result
 
 
 def drain_row_group_prefetch(fut):
@@ -557,7 +599,10 @@ def _rg_cache_budget(cache_dir: str) -> int:
 
         free = shutil.disk_usage(cache_dir).free
         by_disk = int(free * RG_CACHE_FREE_FRACTION)
-        return max(RG_CACHE_MIN_BYTES, min(RG_CACHE_MAX_BYTES, by_disk))
+        # never more than a quarter of the free space (the 12 GiB floor is for
+        # a big disk; on a small one the budget shrinks with it)
+        return max(min(256 * 2**20, free // 8),
+                    min(RG_CACHE_MAX_BYTES, by_disk, free // 4))
     except Exception:
         return RG_CACHE_MIN_BYTES
 
@@ -769,13 +814,34 @@ def group_rows_by_span(rows_here, g0: int) -> dict[int, dict[int, list[dict]]]:
     per position, so 45,393 of the 117,600 manifest rows (39%) were silently
     never served while `samples_seen` counted them.
 
-    The list preserves plan order, so the questions for one image are served
-    consecutively and the stream is deterministic.
+    The list preserves plan order. The loader serves the questions of a group
+    INTERLEAVED (question 1 of every position, then question 2 of every
+    position, ...): serving them consecutively would put up to 54 questions
+    about the SAME image in one batch, and the batch loss is a token-mean, so
+    one image could dominate the gradient.
     """
     want: dict[int, dict[int, list[dict]]] = {}
     for r in rows_here:
         want.setdefault(r["_row"] // g0, {}).setdefault(r["_row"] % g0, []).append(r)
     return want
+
+
+def interleaved_positions(want_rg: dict[int, list[dict]]) -> list[tuple[int, int]]:
+    """(position, question index) in serve order, spread across the positions.
+
+    Round-robin over the questions of a row group so that consecutive rows
+    belong to DIFFERENT images.
+    """
+    positions = sorted(want_rg)
+    if not positions:
+        return []
+    max_q = max(len(want_rg[p]) for p in positions)
+    out: list[tuple[int, int]] = []
+    for qi in range(max_q):
+        for p in positions:
+            if qi < len(want_rg[p]):
+                out.append((p, qi))
+    return out
 
 
 def rows_in_span(want_rg: dict[int, list[dict]]) -> int:
@@ -833,23 +899,20 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
         # ~1GiB/s). Not Modal-gated — the whole-shard path is open everywhere.
         shard_list = [s for s in self.order if self.plan.get(s)]
         shard_idx = {s: i for i, s in enumerate(shard_list)}
-        shard_prefetch: ThreadPoolExecutor | None = None
-        next_shard_fut = None
-        if self.rg_cache_dir:
-            shard_prefetch = ThreadPoolExecutor(max_workers=1)
+        next_shard_fut: _DaemonTask | None = None
         for sf in self.order:
             rows_here = self.plan.get(sf)
             if not rows_here:
                 continue
             # Schedule next shard download while GPU trains current shard (pipelined 12min cold over 33h)
-            if shard_prefetch is not None and sf in shard_idx:
+            if self.rg_cache_dir and sf in shard_idx:
                 cur = shard_idx[sf]
                 if cur + 1 < len(shard_list) and (next_shard_fut is None or next_shard_fut.done()):
                     nxt = shard_list[cur + 1]
                     nxt_path = self.local_shards.get(nxt) or _get_hf_shard_path(nxt, cache_dir=self.rg_cache_dir)
                     if nxt_path is None:
                         try:
-                            next_shard_fut = shard_prefetch.submit(_download_shard_hf_transfer, nxt, self.rg_cache_dir)
+                            next_shard_fut = _DaemonTask(_download_shard_hf_transfer, nxt, self.rg_cache_dir)
                         except Exception:
                             pass
             # Phase 2 fast path: whole-shard hf_transfer (~1 GiB/s) — local
@@ -876,33 +939,33 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                         emitted += rows_in_span(want[rgi])
                         continue
                     tbl = pq.ParquetFile(local_path).read_row_group(rgi, columns=["key", "n_vis", "vis_bytes"])
-                    for j in sorted(want[rgi]):
-                        for row in want[rgi][j]:
-                            if emitted < self.start_pos:
-                                emitted += 1
-                                continue
-                            vb = tbl.column("vis_bytes")[j].as_py()
-                            nv = int(tbl.column("n_vis")[j].as_py())
-                            buf = bytearray(vb)
-                            del vb
-                            vis = (
-                                torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
-                                .view(torch.bfloat16)
-                                .reshape(-1, self.vision_dim)
-                                .float()
-                            )
-                            del buf
-                            assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
-                            yield {
-                                "vis": vis, "user": row["user"],
-                                "assistant": row["assistant"], "g": row.get("g", "?"),
-                                "grid_thw": row.get("grid_thw"),
-                            }
+                    for j, qi in interleaved_positions(want[rgi]):
+                        row = want[rgi][j][qi]
+                        if emitted < self.start_pos:
                             emitted += 1
+                            continue
+                        vb = tbl.column("vis_bytes")[j].as_py()
+                        nv = int(tbl.column("n_vis")[j].as_py())
+                        buf = bytearray(vb)
+                        del vb
+                        vis = (
+                            torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
+                            .view(torch.bfloat16)
+                            .reshape(-1, self.vision_dim)
+                            .float()
+                        )
+                        del buf
+                        assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
+                        yield {
+                            "vis": vis, "user": row["user"],
+                            "assistant": row["assistant"], "g": row.get("g", "?"),
+                            "grid_thw": row.get("grid_thw"),
+                        }
+                        emitted += 1
                 _enforce_lru_cache(self.rg_cache_dir)
                 if next_shard_fut is not None and next_shard_fut.done():
                     try:
-                        next_shard_fut.result()
+                        next_shard_fut.value()
                     except Exception:
                         pass
                     next_shard_fut = None
@@ -937,10 +1000,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
             # rgis[idx] is adopted by IDENTITY (lo, hi) at the top of
             # iteration idx+1. Same rows, same order, same bytes -- only WHEN
             # the transfer happens changes.
-            prefetch: ThreadPoolExecutor | None = None
-            pending: tuple[int, int, object] | None = None   # (lo, hi, future)
-            if self.rg_cache_dir and len(rgis) > 1:
-                prefetch = ThreadPoolExecutor(max_workers=1)
+            pending: tuple[int, int, object] | None = None   # (lo, hi, task)
 
             def _start_prefetch(n_rgi: int):
                 """Submit the fetch for n_rgi; returns (lo, hi, future) or None."""
@@ -962,7 +1022,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                               f"({(n_hi-n_lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
                     return rs2._span[1] if rs2._span else None
 
-                return (n_lo, n_hi, prefetch.submit(_bg))
+                return (n_lo, n_hi, _DaemonTask(_bg))
 
             try:
                 for idx, rgi in enumerate(rgis):
@@ -998,63 +1058,47 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                             print(f"[stream] streamed {Path(sf).name} rg{rgi} "
                                   f"({(hi-lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
                     # 2) start the NEXT group's fetch now, so it overlaps this group's training
-                    pending = (_start_prefetch(rgis[idx + 1]) if (prefetch is not None
-                              and idx + 1 < len(rgis)) else None)
+                    pending = (_start_prefetch(rgis[idx + 1])
+                              if (self.rg_cache_dir and idx + 1 < len(rgis)) else None)
 
                     tbl = pf.read_row_group(rgi, columns=["key", "n_vis", "vis_bytes"])
                     try:
-                        for j in sorted(want[rgi]):
-                            for row in want[rgi][j]:
-                                if emitted < self.start_pos:
-                                    emitted += 1
-                                    continue
-                                vb = tbl.column("vis_bytes")[j].as_py()
-                                nv = int(tbl.column("n_vis")[j].as_py())
-                                buf = bytearray(vb)
-                                del vb
-                                vis = (
-                                    torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
-                                    .view(torch.bfloat16)
-                                    .reshape(-1, self.vision_dim)
-                                    .float()
-                                )
-                                del buf
-                                assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
-                                yield {
-                                    "vis": vis, "user": row["user"],
-                                    "assistant": row["assistant"], "g": row.get("g", "?"),
-                                    "grid_thw": row.get("grid_thw"),
-                                }
+                        for j, qi in interleaved_positions(want[rgi]):
+                            row = want[rgi][j][qi]
+                            if emitted < self.start_pos:
                                 emitted += 1
+                                continue
+                            vb = tbl.column("vis_bytes")[j].as_py()
+                            nv = int(tbl.column("n_vis")[j].as_py())
+                            buf = bytearray(vb)
+                            del vb
+                            vis = (
+                                torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
+                                .view(torch.bfloat16)
+                                .reshape(-1, self.vision_dim)
+                                .float()
+                            )
+                            del buf
+                            assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
+                            yield {
+                                "vis": vis, "user": row["user"],
+                                "assistant": row["assistant"], "g": row.get("g", "?"),
+                                "grid_thw": row.get("grid_thw"),
+                            }
+                            emitted += 1
                     finally:
                         del tbl
                         rs._span = None
             finally:
-                if prefetch is not None:
-                    # Cancel the outstanding prefetch (best-effort)
-                    if pending is not None:
-                        try:
-                            pending[2].cancel()  # type: ignore[attr-defined]
-                        except Exception:
-                            pass
-                    prefetch.shutdown(wait=False, cancel_futures=True)
+                # The prefetch runs on a daemon thread: an in-flight fetch can be
+                # abandoned at exit (an executor worker would block the process).
                 rs._span = None  # type: ignore[assignment]
             _enforce_lru_cache(self.rg_cache_dir)
             if next_shard_fut is not None and next_shard_fut.done():
                 try:
-                    next_shard_fut.result()
+                    next_shard_fut.value()
                 except Exception:
                     pass
                 next_shard_fut = None
-        # Shutdown shard-level prefetch daemon
-        if shard_prefetch is not None:
-            if next_shard_fut is not None:
-                try:
-                    next_shard_fut.result(timeout=5)
-                except Exception:
-                    pass
-                try:
-                    next_shard_fut.cancel()
-                except Exception:
-                    pass
-            shard_prefetch.shutdown(wait=False, cancel_futures=True)
+        # The shard prefetch runs on a daemon thread: an in-flight download can
+        # be abandoned at exit (a worker thread would block the process).

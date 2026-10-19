@@ -111,12 +111,22 @@ def test_rg_cache_budget_has_a_floor_and_a_ceiling(tmp_path, monkeypatch):
 
     from vision_adapter.data import stream
 
+    # a huge disk -> the ceiling
     monkeypatch.setattr(shutil, "disk_usage",
                         lambda p: shutil._ntuple_diskusage(10**12, 10**12, 10**12))
     assert stream._rg_cache_budget(str(tmp_path)) == stream.RG_CACHE_MAX_BYTES
+    # a small disk -> the budget shrinks with it (never more than a quarter of
+    # the free space, so the cache cannot fill the disk)
     monkeypatch.setattr(shutil, "disk_usage",
                         lambda p: shutil._ntuple_diskusage(1, 1, 10**9))
-    assert stream._rg_cache_budget(str(tmp_path)) == stream.RG_CACHE_MIN_BYTES
+    b = stream._rg_cache_budget(str(tmp_path))
+    assert 0 < b <= 10**9 // 4, b
+    # ...and it scales with the disk rather than sitting at the 12 GiB floor
+    monkeypatch.setattr(shutil, "disk_usage",
+                        lambda p: shutil._ntuple_diskusage(1, 1, 40 * 2**30))
+    b2 = stream._rg_cache_budget(str(tmp_path))
+    assert b2 > b, (b, b2)
+    assert b2 <= 40 * 2**30 // 4, b2
 
 
 def test_shard_cache_budget_is_a_byte_budget(tmp_path, monkeypatch):

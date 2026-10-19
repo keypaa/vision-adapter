@@ -192,15 +192,36 @@ def _recipe_mismatch(ckpt_plan: dict) -> str | None:
     supervision of a row, so a resume across it would silently train on
     different data. That is not a plan-metadata warning — it is a different
     experiment. Returns None when the checkpoint matches.
+
+    A checkpoint with NO version keys predates both changes, so it is v1 by
+    definition and is refused. Set VISION_ADAPTER_ALLOW_LEGACY_RESUME=1 to
+    override (the resume then continues on a different row stream, which the
+    caller has explicitly accepted).
     """
     ckpt_plan = ckpt_plan or {}
+    if os.environ.get("VISION_ADAPTER_ALLOW_LEGACY_RESUME") == "1":
+        return None
     cs = ckpt_plan.get("stream_version")
-    if cs is not None and int(cs) != _STREAM_VERSION:
-        return (f"row-stream v{cs} -> v{_STREAM_VERSION} (every manifest question is now "
+    if cs is None:
+        return ("the checkpoint has no stream_version: it predates the loader "
+                "change that serves every manifest question (stream v1)")
+    try:
+        cs_int = int(cs)
+    except (TypeError, ValueError):
+        return f"the checkpoint has an unreadable stream_version ({cs!r})"
+    if cs_int != _STREAM_VERSION:
+        return (f"row-stream v{cs_int} -> v{_STREAM_VERSION} (every manifest question is now "
                 f"served; the row at a given offset is a different row)")
     cc = ckpt_plan.get("collate_version")
-    if cc is not None and int(cc) != _COLLATE_VERSION:
-        return (f"collate v{cc} -> v{_COLLATE_VERSION} (answer > question > image budget; "
+    if cc is None:
+        return ("the checkpoint has no collate_version: it predates the collate "
+                "budget change (collate v1, image > answer > question)")
+    try:
+        cc_int = int(cc)
+    except (TypeError, ValueError):
+        return f"the checkpoint has an unreadable collate_version ({cc!r})"
+    if cc_int != _COLLATE_VERSION:
+        return (f"collate v{cc_int} -> v{_COLLATE_VERSION} (answer > question > image budget; "
                 f"the supervision of the affected rows changed)")
     return None
 
@@ -609,6 +630,7 @@ def resolve_dtype(capability: int, dtype_arg: str = "auto"):
 
 MEASURED_MANIFEST_FILE = "train_manifest_grids.jsonl"
 PLAIN_MANIFEST_FILE = "train_manifest.jsonl"
+FILTERED_MANIFEST_FILE = "train_manifest_filtered.jsonl"   # scripts/filter_manifest.py
 
 
 def resolve_lr_horizon(steps: int | None, explicit: int | None = None) -> int:
@@ -703,23 +725,28 @@ def geometry_guard(grid_source: str, allow_synthetic: bool = False) -> None:
 
 
 def resolve_manifest_name(data_dir) -> str:
-    """Which train manifest to use: the measured-geometry one if present.
+    """Which train manifest to use: the filtered one, else the measured-geometry one.
 
-    The backfilled manifest carries grid_thw on every row (verified 117600/
-    117600 against the stored n_vis). It coexists with the original rather
-    than replacing it, because existing checkpoints recorded a
-    manifest_sha256 against the old file and a resume that silently saw a
-    different one would be unverifiable.
-
-    Raises rather than defaulting when neither exists — an empty plan should
-    fail loudly, not train on nothing.
+    Order:
+      1. ``train_manifest_filtered.jsonl`` — written by
+         ``scripts/filter_manifest.py`` (drops the long-answer rows, which the
+         source recipe says prevent the grokking event). It keeps the measured
+         grid_thw of the manifest it was derived from.
+      2. ``train_manifest_grids.jsonl`` — the measured-geometry manifest.
+      3. ``train_manifest.jsonl`` — the PLAIN manifest: no grid_thw, so the
+         position ids fall back to the synthetic grid, which differs from the
+         true geometry on ~37% of rows and transposes the orientation on ~17%
+         of them. It is still accepted (a box may only have it) but the
+         trainer logs a warning, because those position ids are wrong.
+      4. nothing -> raise (an empty plan should fail loudly, not train on
+         nothing).
     """
-    for name in (MEASURED_MANIFEST_FILE, PLAIN_MANIFEST_FILE):
+    for name in (FILTERED_MANIFEST_FILE, MEASURED_MANIFEST_FILE, PLAIN_MANIFEST_FILE):
         if (Path(data_dir) / name).is_file():
             return name
     raise FileNotFoundError(
         f"no train manifest in {data_dir}: expected "
-        f"{MEASURED_MANIFEST_FILE} or {PLAIN_MANIFEST_FILE}"
+        f"{FILTERED_MANIFEST_FILE} or {MEASURED_MANIFEST_FILE} or {PLAIN_MANIFEST_FILE}"
     )
 
 
@@ -1129,6 +1156,14 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         is_fake = any("fake" in r.get("emb","") for r in rows[:10])
         if is_fake and len(rows) <= 200:
             return _smoke_train_with_fake_data(data_dir, cfg, max_steps, device)
+        if not rows or "grid_thw" not in (rows[0] if rows else {}):
+            n = sum(1 for r in rows if "grid_thw" in r)
+            print(f"[train][WARN] manifest {manifest_name} carries no grid_thw on "
+                  f"{n}/{len(rows)} rows: the position ids fall back to the SYNTHETIC "
+                  f"grid, which differs from the true geometry on ~37% of rows and "
+                  f"transposes portrait/landscape on ~17% of them. Use "
+                  f"{FILTERED_MANIFEST_FILE} or {MEASURED_MANIFEST_FILE} if the "
+                  f"measured geometry is available.", flush=True)
     else:
         rows = _fetch_manifest(cache_dir=str(data_dir / "cache"), token=tok_hf)
         try:
@@ -1378,6 +1413,21 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                   f"step {lr_horizon}, checkpoints every {cfg.save_every} steps, "
                   f"stop with Ctrl-C", flush=True)
     if _resume_info is not None and isinstance(resume_ckpt, dict):
+        _ckpt_plan = resume_ckpt.get("plan", {}) or {}
+        # A recipe change (row stream shape, collate budget) moves the rows
+        # at a given offset or changes the supervision of a row, so a resume
+        # across it would silently train on different data. That is not a
+        # "plan mismatch" warning — it is a different experiment.
+        _why = _recipe_mismatch(_ckpt_plan)
+        if _why:
+            print(f"[train][FATAL] resume refused: {_why}. The checkpoint was trained "
+                  f"under a different recipe, so the row at step offset "
+                  f"{_resume_info.get('start_pos_rows')} is not the same row "
+                  f"(and the labels may differ). Start a new run, check out the "
+                  f"revision that matches the checkpoint, or set "
+                  f"VISION_ADAPTER_ALLOW_LEGACY_RESUME=1 to accept the difference.",
+                  flush=True)
+            return 1
         try:
             import hashlib as _phash
 
@@ -1392,24 +1442,9 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 "stream_version": _STREAM_VERSION,
                 "collate_version": _COLLATE_VERSION,
             }
-            _ckpt_plan = resume_ckpt.get("plan", {}) or {}
-            # A recipe change (row stream shape, collate budget) moves the rows
-            # at a given offset or changes the supervision of a row, so a
-            # resume across it would silently train on different data. That is
-            # not a "plan mismatch" warning — it is a different experiment.
-            _why = _recipe_mismatch(_ckpt_plan)
-            if _why:
-                print(f"[train][FATAL] resume refused: {_why}. The checkpoint was trained "
-                      f"under a different recipe, so the row at step offset "
-                      f"{_resume_info.get('start_pos_rows')} is not the same row "
-                      f"(and the labels may differ). Start a new run, or check out the "
-                      f"revision that matches the checkpoint.", flush=True)
-                return 1
             _diffs = _diff_plan_meta(_cur_meta, _ckpt_plan)
             if _diffs:
                 print(f"[train][WARN] resume plan mismatch on {', '.join(_diffs)} — continuing with ckpt-pinned extent (dataset is static)", flush=True)
-        except SystemExit:
-            raise
         except Exception:
             pass
     recs: list[dict] = []

@@ -99,6 +99,15 @@ def main() -> int:
     print(f"[filter] dropped by group: {dict(by_g)}")
     kept_g = collections.Counter(r.get("g") for r in kept)
     print(f"[filter] kept by group:    {dict(kept_g)}")
+    # the trainer only reads these names (vision_adapter.train.resolve_manifest_name)
+    from vision_adapter.train import (FILTERED_MANIFEST_FILE, MEASURED_MANIFEST_FILE,
+                                      PLAIN_MANIFEST_FILE)
+    known = {FILTERED_MANIFEST_FILE, MEASURED_MANIFEST_FILE, PLAIN_MANIFEST_FILE}
+    if args.out.name not in known:
+        print(f"[filter][WARN] {args.out.name} is not a manifest the trainer reads "
+              f"(it looks for {sorted(known)}). Write it to "
+              f"{FILTERED_MANIFEST_FILE} or overwrite the input file in place.",
+              flush=True)
     print(f"[filter] wrote {args.out}")
     if dropped:
         keys = [r.get("emb") for r in dropped]

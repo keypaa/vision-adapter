@@ -123,8 +123,9 @@ def wasted_section(tr, p) -> None:
 
 
 def slice_section(tr, p) -> None:
-    p("\n## loss by slice (the batch loss is a token-mean; the mix is what "
-      "makes a slice comparable)")
+    p("\n## loss by slice (the batch loss is a token-mean over the whole batch;")
+    p("  this is the batch loss on the steps where the slice holds >=50% of the ROWS --")
+    p("  it is not a per-slice token-mean loss, and the two can differ)")
     if not tr or "g_mix" not in tr[0]:
         p("  NOT AVAILABLE (this log predates the g_mix field)")
         return

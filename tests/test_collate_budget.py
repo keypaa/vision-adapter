@@ -137,3 +137,59 @@ def test_labels_and_mask_stay_consistent():
     assert all(ids[j] >= 0 for j in sup)
     assert batch["attention_mask"][0, : sup[-1] + 1].all()
     assert batch["vis"].shape[0] == 1
+
+
+# ---------------------------------------------------------------- the grid ---
+# The gap that let a crash through: the collate may crop the visual span, and
+# the mRoPE position path requires a grid whose placeholder count equals the
+# number of visual tokens. The crop is therefore row-aligned and the grid is
+# cropped with it (core.crop_to_grid).
+
+
+def _grid_item(n_vis, grid, user="q", assistant="ans"):
+    return {"vis": torch.randn(n_vis, 8), "user": user, "assistant": assistant,
+            "g": "t", "grid_thw": list(grid)}
+
+
+def test_measured_grid_stays_consistent_with_a_cropped_span():
+    """A row whose image is cropped must still satisfy the grid contract."""
+    from vision_adapter.core import placeholder_count, train_position_ids
+
+    tok = StubTok()
+    # grid 1x8x2030 patches -> 4x1015 = 4060 merged tokens, over a 64-token budget
+    grid = [1, 8, 2030]
+    n_vis = 4060
+    batch = make_collate(tok, tok.pad_token_id, max_len=64, vision_dim=8)(
+        [_grid_item(n_vis, grid)]
+    )
+    kept = int(batch["n_vis"][0])
+    assert kept < n_vis, "the image must have been cropped"
+    g = batch["grid_thw"][0]
+    assert g is not None, "the cropped grid must be reported"
+    assert placeholder_count(torch.tensor(g)) == kept, (g, kept, n_vis)
+    # and the position code must accept it
+    pos = train_position_ids(batch, merge_size=2)
+    assert pos.shape[-1] == batch["input_ids"].shape[-1]
+
+
+def test_crop_is_row_aligned():
+    from vision_adapter.core import crop_to_grid
+
+    # a 4x1015 merged grid (8x2030 patches): a crop must land on a row boundary
+    kept, grid = crop_to_grid([1, 8, 2030], 4052)
+    assert kept % 1015 == 0, kept
+    assert kept == 4055 or kept == 3045 or kept == 2029, kept
+    assert grid[1] % 2 == 0 and grid[1] // 2 == kept // 1015, (grid, kept)
+
+
+def test_no_measured_grid_is_fine():
+    """Rows without a measured grid fall back to the synthetic one."""
+    from vision_adapter.core import train_position_ids
+
+    tok = StubTok()
+    batch = make_collate(tok, tok.pad_token_id, max_len=64, vision_dim=8)(
+        [_item(n_vis=50, user="q", assistant="ans")]
+    )
+    assert batch["grid_thw"][0] is None
+    pos = train_position_ids(batch, merge_size=2)
+    assert pos.shape[-1] == batch["input_ids"].shape[-1]

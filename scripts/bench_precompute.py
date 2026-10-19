@@ -109,20 +109,22 @@ def iter_repo_images(repo: str, shard: int, n: int, cache_dir: Path, shards=None
         path = hf_hub_download(repo, fname, repo_type="dataset", local_dir=str(cache_dir))
         pf = pq.ParquetFile(path)
         taken = 0
+        global_row = 0
+        stride = max(1, (pf.metadata.num_rows // max(per, 1)))
         for batch in pf.iter_batches(batch_size=256, columns=["filename", "image"]):
             names = batch.column("filename").to_pylist()
             blobs = batch.column("image").to_pylist()
             for i, (nm, blob) in enumerate(zip(names, blobs)):
-                if spread:
-                    # deterministic spread across the shard
-                    if i % max(1, (pf.metadata.num_rows // max(per, 1))) != 0:
-                        continue
+                row = global_row + i
+                if spread and (row % stride) != 0:
+                    continue
                 yield nm, blob
                 taken += 1
                 if taken >= per:
-                    break
+                    return
+            global_row += len(names)
             if taken >= per:
-                break
+                return
 
 
 def sample_source(args):

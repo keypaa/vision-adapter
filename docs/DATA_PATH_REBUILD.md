@@ -55,8 +55,10 @@ records), `train_4000.log` (14,606 console lines), `train_manifest.jsonl`
 | M28 | **Precompute bench, measured on the rental box** (95 GiB card, `scripts/bench_precompute.py`) | Per-patch costs from the 300-image spread sample (shards 0/13/16, mean 6,205 patches/img): ViT **14.2 µs/patch**, preprocess 7.5, decode 1.7, per-image `.pt` write 2.5, cat 0.6, h2d 0.3. VRAM: **20,991 patches per GiB** (the auto constant is now 20,000). The two earlier samples bracketed the truth: shard-16-only (already-capped images) projected 1.2 h, the spread sample (2 of 3 shards are the big cauldron ones) projected 6.4 h |
 | M28b | **Corpus-weighted precompute projection** (the bench's per-patch costs × the real n_vis distribution over all 136,267 corpus rows: mean 850, median 364, p90 2,691, p99 5,544, max 16,653) | **as-is: ViT 1.83 h + CPU 1.63 h → 3.46 h serial, 1.83 h overlapped.** Capped at 383: **1.35 h serial, 0.71 h overlapped** (2.6×). Capped at 1,024: 1.91 h / 1.01 h. Corpus bytes: **884 GiB → 344 GiB @383 → 489 GiB @1,024** |
 | M24 | **Served vs manifest composition** (the loader collapses duplicate `emb` rows) | agentic 52,924 manifest → **52,924 served (73.3%)** · doc 52,908 → **12,780 (17.7%)** · conv 11,768 → 6,503 (9.0%). The doc slice asks **up to 54 questions per image** (3,983 images with ≥6 questions, all chart/figure QA: *"What is the difference between the Balance of Payment (as % of commercial service exports)"* → answers `No.`/`Yes.`/`0.`/`2.`) |
-| M25 | **Collate budget pathology A** — `core.py:305-318` | for `n_vis ≥ 4,090`: `budget_text = max_len - nv - 2 ≤ 2` → **the answer is cut to ≤2 tokens and the question to 1**. **1,986 rows (1.69%)**, all `doc`, carrying **27.7% of all answer words**. Present at HEAD *and* in the 4,000-step run's revision |
+| M25 | **Collate budget, v1 (what the probe ran)** — `core.py:305-318` at `a020e486` | for `n_vis ≥ 4,090`: `budget_text = max_len - nv - 2 ≤ 2` → **the answer is cut to ≤2 tokens and the question to 1**. **1,986 rows (1.69%)**, all `doc`, carrying **30.9% of all answer words**. Present at HEAD *and* in the 4,000-step run's revision |
 | M26 | **Collate budget, mechanism (code-level)** | the run's revision (`a020e486`) capped only the *text*: `budget_text = max_len - nv - 2`, so for `n_vis ≥ 4,090` the answer → ≤4 tokens and the question → ≤1-3, and the sequence could exceed `max_len` (L reached 16,602 with max_len=4,096 → the 117 steps, 45% of GPU time). At HEAD the image is also capped, so the answer is still crushed to ≤2 tokens. **The image is never cropped in either revision** — an earlier claim here (that long questions cropped the image) was wrong and is withdrawn |
+| M30 | **THE PROBE RAN ON THE PLAIN MANIFEST** — no `grid_thw` → the position ids came from the **synthetic** `grid_for_nvis` | the run's header says `manifest_path=data/train_manifest.jsonl` (no `grid_thw` on any row) → measured against the *measured* grids on 4,000 live rows: the synthetic grid **differs on 36.6%** of rows and **transposes portrait/landscape on 17.0%** (aspect error p90 ×1.44, max ×3.36). A projector whose whole job is placing image tokens correctly trained on a third of its data with distorted positions and a sixth flipped. The repo's own audit said 38.1% / 18.3% — this reproduces it. **The next probe uses the measured geometry** (`train_manifest_grids.jsonl`, which the trainer prefers; a warning is now logged when the plain manifest is used) |
+| M31 | **Collate budget, v2, re-measured from the COMMITTED code** (11,105 live rows with measured grids) | **0 rows** have their answer truncated (was 1,986 rows carrying 30.9% of all answer words); **216 rows (1.95%)** get their image cropped, keeping **77.2%** of their visual tokens (the head crop); **0 rows** end with the image gone. The earlier "3,477 rows with <64 visual tokens" was measured on a different implementation and was impossible — withdrawn |
 | M27 | **Loss by group / by image size** — **WITHDRAWN** | a per-step attribution was attempted (replay the served stream + join the log), but the replay does not reproduce the run's per-step `L` (2/3,600 steps match), so the join is not trustworthy. The index itself is fine (64/64 keys+n_vis match the live corpus) and the manifest matches the run's byte-for-byte at the head; the residual mismatch is the per-step plan reconstruction, which is not reproducible from the artifacts on hand. What survives: the loss plateaued at ≈1.1 for 3,800 steps, the 117 long-sequence steps had mean loss 3.27 vs 1.17, and the 45% of GPU time they took. **Which slice learns is still an open question** → P0.5 |
 
 Replay validation: shard order, row-group geometry (1,088/1,109 console fetch
@@ -93,9 +95,9 @@ One divergence, four consequences:
 | consequence | mechanism | evidence |
 |---|---|---|
 | 45% of GPU time in 3.2% of steps | doc rows are 3–40× the reference token count → batch cost = longest row (padded L) | M12, M28 |
-| Those steps carry ~3× the loss | at HEAD the collate **starves the answer** for `n_vis ≥ 4,090` (≤2 tokens) and **crops the image** when the text is long | M25, M26, M13 |
+| Those steps carry ~3× the loss | at the probe's revision the collate **starved the answer** for `n_vis ≥ 4,090` (≤2 tokens) and left the sequence unbounded (L up to 16,602) | M25, M26, M13 |
 | 883.8 GiB corpus, 3 GiB row groups, 29% of wall on I/O | the same rows are 3–40× bigger than they need to be | M7, M9, M23 |
-| no grok collapse | **not** the projector's token-count range (it is per-token; M27 shows the loss is flat across sizes) — the candidates are the **unserved 39% of questions** (M15/M24), the **collate budget bugs** (M25/M26), and the **recipe** (D4: batch 16 vs 64, 2B vs 304B backbone) | M14, M27 |
+| **no grok collapse** | the strongest candidate found so far is **not** the corpus size but the **position ids**: the probe ran on the manifest without `grid_thw`, so 36.6% of its rows had a distorted spatial grid and 17.0% had portrait/landscape transposed (M30). Then: the collate budget (M25/M26), the unserved 39% of questions (M15/M24), and the recipe (D4) | M14, M30 |
 
 **Corollary: fix the payload and the transport problem largely disappears.**
 At the reference budget the corpus is ~182 GiB (served, dedup'd) or ~394 GiB
@@ -174,6 +176,11 @@ and one that does not. All of them change the *order* of the work.
    invalidate the experiment either way. Fixing the known defects first costs
    ~1 day of code and ~5 GPU-hours, and its outcome **cancels or confirms** the
    2–4 week rebuild.
+4. **The probe also ran with the WRONG GEOMETRY** (M30): the manifest it used
+   has no `grid_thw`, so the position ids came from the synthetic grid —
+   distorted on 36.6% of rows, transposed on 17.0%. This is now the leading
+   candidate for the plateau, ahead of the corpus size, and it is fixed for
+   free by using the measured-geometry manifest the trainer already prefers.
 
 **Rejected (with reasons):**
 

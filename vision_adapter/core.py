@@ -278,12 +278,51 @@ def strip_text_image_markers(text):
 # ---------------------------------------------------------------------------
 
 MIN_VIS_TOKENS = 64        # below this the visual span carries no usable signal
-MAX_ANSWER_TOKENS = 256    # answers are short by design; longer ones are a data bug
+MAX_ANSWER_TOKENS = 1024   # guard for an unfiltered manifest (the manifest
+                            # filter drops the long targets; real answers are
+                            # ~10 tokens)
 # Shape of the supervision the collate produces, recorded in every checkpoint.
 #   v1 = image-first budget (the answer was crushed to <=2 tokens for n_vis>=4090)
 #   v2 = answer > question > image
 # A resume across versions is refused: the labels of the affected rows changed.
 COLLATE_VERSION = 2
+SPATIAL_MERGE_SIZE = 2      # the 2x2 patch merge (see ARCHITECTURE.md)
+
+
+def crop_to_grid(grid, kept: int, merge_size: int = SPATIAL_MERGE_SIZE):
+    """Round a head crop down to whole grid rows and crop the grid with it.
+
+    The visual tokens of a row are the merged patches of its grid in
+    row-major order, so the first `kept` of them are the TOP of the image.
+    A crop that is not row-aligned would leave a partial row, which no grid
+    can express -- and the position code needs a grid whose placeholder
+    count equals the number of visual tokens (core.row_grids_for_batch
+    raises otherwise, and the native path scatters one slot per token).
+
+    Returns (kept, grid): `kept` tokens and the matching rectangle, or the
+    input grid unchanged when nothing was cropped. `grid=None` means "no
+    measured grid" -> the position code falls back to the synthetic grid
+    derived from the kept token count.
+    """
+    if grid is None:
+        return kept, None
+    try:
+        g = [int(x) for x in grid]
+    except (TypeError, ValueError):
+        return kept, None
+    if len(g) != 3:
+        return kept, None
+    t, h, w = g
+    llm_h, llm_w = h // merge_size, w // merge_size
+    if llm_h <= 0 or llm_w <= 0:
+        return kept, g
+    total = llm_h * llm_w
+    if kept >= total:
+        return kept, g
+    rows_kept = max(0, kept // llm_w)
+    if rows_kept == 0:
+        return 0, [t, 0, w]
+    return rows_kept * llm_w, [t, rows_kept * merge_size, w]
 
 
 def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
@@ -300,9 +339,15 @@ def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
     * a long question pushed the sequence past max_len (the 4,000-step run
       reached L=16,602 with max_len=4,096; 117 steps, 45% of all GPU time).
 
-    Now: the answer is never truncated (it is the loss target), the question
-    takes what the answer leaves, and the **image absorbs the remainder** — it
-    is cropped (head kept) only as the last resort. L never exceeds max_len.
+    Now: the answer is protected (it is truncated only if it alone exceeds
+    MAX_ANSWER_TOKENS or the text budget), the question takes what the answer
+    leaves, and the **image absorbs the remainder** — it is cropped (head
+    kept) only as the last resort. L never exceeds max_len.
+
+    A cropped image keeps its geometry: the crop is rounded DOWN to a whole
+    number of grid rows and the grid is cropped with it (crop_to_grid), so
+    the position code still sees a grid whose placeholder count equals the
+    number of visual tokens.
 
     Layout contract (unchanged):
     - labels -100 everywhere except answer+EOS; BOS/img/user/pad never contribute
@@ -322,6 +367,7 @@ def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
         u_ids = [tok(strip_text_image_markers(b["user"]), add_special_tokens=False)["input_ids"]
                  for b in batch]
         a_ids = [tok(b["assistant"], add_special_tokens=False)["input_ids"] for b in batch]
+        grids = [b.get("grid_thw") for b in batch]
         # Text budget: BOS + EOS + the answer + the question. The answer has
         # priority, then the question; whatever is left belongs to the image.
         # The visual reserve scales with max_len so a small max_len (tests, short
@@ -329,20 +375,27 @@ def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
         min_vis = min(MIN_VIS_TOKENS, max(0, max_len // 8))
         text_budget = max(2, max_len - 2 - min_vis)
         seq_lens, parts = [], []
-        for u, a, nv in zip(u_ids, a_ids, n_vis):
+        for u, a, nv, grid in zip(u_ids, a_ids, n_vis, grids):
             a = a[: min(len(a), MAX_ANSWER_TOKENS, text_budget)]
             u = u[: max(0, text_budget - len(a))]
             # The image takes the rest (head kept). It is the elastic resource.
-            nv = max(0, min(nv, max_len - len(u) - len(a) - 2))
-            parts.append((nv, u, a))
+            budget = max_len - len(u) - len(a) - 2
+            if nv > budget:
+                # We cropped: the crop must stay row-aligned to the grid, and
+                # the grid is cropped with it so the position code (which
+                # requires placeholder_count(grid) == n_vis) stays consistent.
+                nv, grid = crop_to_grid(grid, budget)
+            else:
+                nv = max(0, nv)
+            parts.append((nv, u, a, grid))
             seq_lens.append(1 + nv + len(u) + len(a) + 1)
-        kept = [nv for nv, _, _ in parts]
+        kept = [nv for nv, _, _, _ in parts]
         max_v = max(kept)
         L = max(max_v, max(seq_lens))
         input_ids = torch.full((B, L), pad_id, dtype=torch.long)
         labels = torch.full((B, L), -100, dtype=torch.long)
         attn = torch.zeros((B, L), dtype=torch.long)
-        for i, (nv, u, a) in enumerate(parts):
+        for i, (nv, u, a, _g) in enumerate(parts):
             if tok.bos_token_id is not None:
                 input_ids[i, 0] = tok.bos_token_id
             pos = 1 + nv
@@ -358,7 +411,9 @@ def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
             vis_pad[i, : kept[i]] = b["vis"][: kept[i]]
         return {"input_ids": input_ids, "attention_mask": attn, "labels": labels,
                 "vis": vis_pad, "n_vis": torch.tensor(kept, dtype=torch.long),
-                "grid_thw": [b.get("grid_thw") for b in batch],
+                # the CROPPED grid: its placeholder count equals the kept
+                # visual tokens, so the position code stays consistent
+                "grid_thw": [p[3] for p in parts],
                 "g": [b.get("g", "?") for b in batch]}
 
     return collate

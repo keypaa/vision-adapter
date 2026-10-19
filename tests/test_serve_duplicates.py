@@ -72,7 +72,8 @@ def test_resume_refuses_a_stream_version_change():
 
 
 def test_resume_refuses_a_collate_version_change():
-    why = _recipe_mismatch({"collate_version": COLLATE_VERSION - 1})
+    why = _recipe_mismatch({"stream_version": STREAM_VERSION,
+                             "collate_version": COLLATE_VERSION - 1})
     assert why is not None and "collate" in why
 
 
@@ -81,10 +82,19 @@ def test_resume_accepts_a_matching_recipe():
                              "collate_version": COLLATE_VERSION}) is None
 
 
-def test_resume_accepts_a_legacy_checkpoint_without_versions():
-    """Old checkpoints have no version keys: they are resumable (the loader
-    change is the only difference and it is the caller's choice to resume)."""
-    assert _recipe_mismatch({"manifest_sha256": "abc", "seed": 0}) is None
+def test_resume_refuses_a_legacy_checkpoint_without_versions():
+    """A checkpoint with no version keys predates BOTH changes, so it is v1 by
+    definition: resuming it under the v2 loader would silently train on a
+    different row stream with different labels. It must be refused (the
+    operator can override with VISION_ADAPTER_ALLOW_LEGACY_RESUME=1)."""
+    why = _recipe_mismatch({"manifest_sha256": "abc", "seed": 0})
+    assert why is not None and "stream_version" in why
+
+
+def test_resume_mismatch_check_survives_a_malformed_version(monkeypatch):
+    """A malformed version must not silently disable the guard."""
+    monkeypatch.delenv("VISION_ADAPTER_ALLOW_LEGACY_RESUME", raising=False)
+    assert _recipe_mismatch({"stream_version": "not-a-number"}) is not None
 
 
 def test_rows_in_span_counts_every_question():
