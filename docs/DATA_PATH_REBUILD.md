@@ -482,8 +482,27 @@ the served order (`train.py:1208` at the run's revision `a020e486`).
 
 ---
 
-## 7. Open questions for the human
+## 6b. OPEN DEFECTS (from the round-2 adversarial review, 2026-10-19)
 
+State: **a FRESH probe is safe on this diff; do NOT resume any checkpoint**
+(none of the v2 checkpoints exist — the probe has not been run since the
+recipe changed). Fix these before the next resume or before the hero run.
+
+| # | defect | severity | smallest fix |
+|---|---|---|---|
+| O1 | `STREAM_VERSION` was not bumped for the question-interleaving: the row at a given offset changed, but a v2 checkpoint would resume onto the new order with the guard silent | silent wrong results | bump `STREAM_VERSION` to 3 |
+| O2 | `MAX_ANSWER_TOKENS` 256 → 1024 changed the labels without a `COLLATE_VERSION` bump | silent wrong results | bump `COLLATE_VERSION` to 3 (or revert the cap) |
+| O3 | `crop_to_grid` omits `t` from the total and assumes even dims: a `t>1` or odd-dim grid would raise the mismatch ValueError (the original showstopper, latent for today's corpus) | crash (latent) | `total = t*llm_h*llm_w`; crop t-frames; reject odd dims |
+| O4 | a crop MASKS a grid/n_vis mismatch: a wrong measured grid on a cropped row no longer raises | silent wrong positions | validate `placeholder_count(grid) == nv` BEFORE cropping, then crop |
+| O5 | a cropped row can lose the image entirely (`n_vis = 0` when `llm_w > budget`), and up to `llm_w-1` tokens of budget are wasted (≈25% of a wide image) | silent wrong results | crop columns too: `rows = max(1, budget//llm_w)`, `cols = budget//rows` |
+| O6 | the whole-shard LRU never evicts the LAST file (`len(shards) > 1`), and a failed `HEAD` skips the size check → an unbounded download | disk fill | evict down to zero; treat a failed HEAD as "refuse" |
+| O7 | `train.py`'s first-shard prefetch still uses a `ThreadPoolExecutor` → its atexit hook joins the worker, so an in-flight 60 GB download hangs the process at exit | hang | use `_DaemonTask` there too |
+| O8 | `_shard_lru_limit` / `_biggest_cached_shard` are dead code | cosmetic | delete |
+| O9 | `analyze_probe.py`: "wall (ts span)" excludes startup and the final save; the "other" bucket silently contains the val probes; the `L > 4096` threshold is hardcoded | reporting | label them; take max_seq_len from the header |
+
+---
+
+## 7. Open questions for the human
 **Resolved 2026-10-19**
 
 1. **Cap → 383** (W1). Validated reference point; matches the agentic slice;
