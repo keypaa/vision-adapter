@@ -1,9 +1,13 @@
-"""Overflow guard: make_collate must never emit L > max_len.
+"""Overflow guard: make_collate must never emit L > max_len, and must not
+starve the text to achieve it.
 
-Live data has n_vis up to 16653 with max_len=4096. Today the visual span is
-never truncated, so a huge-n_vis row yields L ~= n_vis+4 (OOM/attention
-instability) with answer+user crushed to 1 token each. Hermetic: stub
-tokenizer + tiny vision_dim, no HF. Run:
+Live data has n_vis up to 16653 with max_len=4096. The first guard trimmed the
+visual span only, which left the *text* budget at 2 tokens — so a huge-n_vis
+row crushed its answer to 1-2 tokens and its question to 1 (1,986 rows in the
+manifest, 27.7% of all answer words). The budget is now answer > question >
+image: the image is the elastic resource (see tests/test_collate_budget.py).
+
+Hermetic: stub tokenizer + tiny vision_dim, no HF. Run:
     python -m pytest tests/test_collate_overflow.py -q
 """
 
@@ -42,11 +46,11 @@ def test_overflow_row_capped_at_max_len():
     # n_vis contract follows the kept span (splice + positions use it)
     kept = int(batch["n_vis"][0])
     assert kept <= 60, f"visual span must be trimmed to fit, kept={kept}"
-    # answer keeps priority: first answer tokens survive, EOS present
+    # answer keeps priority: the WHOLE answer survives, EOS present
     ids = batch["input_ids"][0].tolist()
     a = tok("ans")["input_ids"]
     eos_pos = ids.index(tok.eos_token_id)
-    assert ids[eos_pos - len(a[:2]) : eos_pos] == a[:2]
+    assert ids[eos_pos - len(a) : eos_pos] == a, "the answer must not be truncated"
     # labels stay consistent: supervised span is answer+EOS within L
     labels = batch["labels"][0].tolist()
     sup = [i for i, lab in enumerate(labels) if lab != -100]

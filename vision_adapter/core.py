@@ -277,17 +277,34 @@ def strip_text_image_markers(text):
 # make_collate — [BOS?][img × n_vis][user][answer][EOS] with answer priority
 # ---------------------------------------------------------------------------
 
-def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
-    """Identical to modal_train.make_collate but with the Qwen bos=None guard.
+MIN_VIS_TOKENS = 64        # below this the visual span carries no usable signal
+MAX_ANSWER_TOKENS = 256    # answers are short by design; longer ones are a data bug
 
-    Layout per example: [BOS?][img × n_vis][user][answer][EOS]
-    - answer has PRIORITY on the text budget (it is the loss target)
+
+def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
+    """Sequence layout [BOS?][img × n_vis][user][answer][EOS] + the text budget.
+
+    Budget policy (2026-10-19, W0): **answer > question > image**.
+
+    The previous policy was image > answer > question, which broke two ways on
+    live data (docs/DATA_PATH_REBUILD.md M25/M26):
+
+    * a large image (n_vis >= 4090) squeezed the *text* budget to 2 tokens, so
+      the answer was crushed to <=2 tokens and the question to 1 — 1,986 rows
+      (1.7% of the manifest) carrying 27.7% of all answer words;
+    * a long question pushed the sequence past max_len (the 4,000-step run
+      reached L=16,602 with max_len=4,096; 117 steps, 45% of all GPU time).
+
+    Now: the answer is never truncated (it is the loss target), the question
+    takes what the answer leaves, and the **image absorbs the remainder** — it
+    is cropped (head kept) only as the last resort. L never exceeds max_len.
+
+    Layout contract (unchanged):
     - labels -100 everywhere except answer+EOS; BOS/img/user/pad never contribute
     - attention_mask covers BOS..EOS (incl. img span), not right-pad
     - vis tokens padded to batch max with zeros, dtype float32
-    - overflow guard: rows with n_vis alone past max_len get the visual span
-      trimmed (head kept) so L <= max_len (max_len >= 4); fitting rows are
-      byte-identical to the unguarded layout
+    - rows that fit are byte-identical to the unguarded layout
+    - `n_vis` reports the KEPT visual span (splice + position ids use it)
 
     The bos guard (`if tok.bos_token_id is not None`) is the fix ported from
     grok_probe/modal_probe — DeepSeek has BOS, Qwen3.5 has None. Without it
@@ -300,20 +317,18 @@ def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
         u_ids = [tok(strip_text_image_markers(b["user"]), add_special_tokens=False)["input_ids"]
                  for b in batch]
         a_ids = [tok(b["assistant"], add_special_tokens=False)["input_ids"] for b in batch]
+        # Text budget: BOS + EOS + the answer + the question. The answer has
+        # priority, then the question; whatever is left belongs to the image.
+        # The visual reserve scales with max_len so a small max_len (tests, short
+        # contexts) does not starve the text.
+        min_vis = min(MIN_VIS_TOKENS, max(0, max_len // 8))
+        text_budget = max(2, max_len - 2 - min_vis)
         seq_lens, parts = [], []
         for u, a, nv in zip(u_ids, a_ids, n_vis):
-            # Overflow guard (audit 2026-09-30: live n_vis max 16653 > max_len):
-            # the visual span alone must never push L past max_len. Reserve
-            # BOS + EOS + 1 user + 1 answer token (answer-priority floor).
-            nv = min(nv, max(0, max_len - 4))
-            budget_text = max_len - nv - 2
-            a = a[: max(1, budget_text)]
-            u = u[: max(1, budget_text - len(a))]
-            # Close the +1 edge (answer longer than budget leaves the 1-token
-            # user floor one past max_len) by trimming the visual tail, never text.
-            excess = (1 + nv + len(u) + len(a) + 1) - max_len
-            if excess > 0:
-                nv = max(0, nv - excess)
+            a = a[: min(len(a), MAX_ANSWER_TOKENS, text_budget)]
+            u = u[: max(0, text_budget - len(a))]
+            # The image takes the rest (head kept). It is the elastic resource.
+            nv = max(0, min(nv, max_len - len(u) - len(a) - 2))
             parts.append((nv, u, a))
             seq_lens.append(1 + nv + len(u) + len(a) + 1)
         kept = [nv for nv, _, _ in parts]
