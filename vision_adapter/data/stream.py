@@ -28,7 +28,12 @@ from vision_adapter.backends.auth import get_hf_token as _get_hf_token
 
 EMB_REPO = "keypa/vision-adapter-embeddings"
 MANIFEST_REPO = "keypa/vision-adapter-manifests"
-# The backfilled manifest, which carries grid_thw on every row (verified
+# Shape of the row stream the loader serves, recorded in every checkpoint.
+#   v1 = one row per image position (the manifest's extra questions were dropped)
+#   v2 = every plan row is served (questions for an image are consecutive)
+# A resume across versions is refused: the row at a given offset is a different
+# row, so the "data continues where it left off" contract would be broken.
+STREAM_VERSION = 2# The backfilled manifest, which carries grid_thw on every row (verified
 # 117600/117600 against the stored n_vis). Preferred over the plain one
 # when present; see train.resolve_manifest_name.
 MANIFEST_FILE = "train_manifest_grids.jsonl"
@@ -665,6 +670,24 @@ def build_epoch_plan(
     return plan
 
 
+def group_rows_by_span(rows_here, g0: int) -> dict[int, dict[int, list[dict]]]:
+    """Group plan rows by (row_group, position) -> the rows served for it.
+
+    A position can hold **several** plan rows: the manifest asks several
+    different questions about the same image (8,653 images carry 2-54 of them
+    — chart/figure QA mostly). The previous mapping kept only the last row
+    per position, so 45,393 of the 117,600 manifest rows (39%) were silently
+    never served while `samples_seen` counted them.
+
+    The list preserves plan order, so the questions for one image are served
+    consecutively and the stream is deterministic.
+    """
+    want: dict[int, dict[int, list[dict]]] = {}
+    for r in rows_here:
+        want.setdefault(r["_row"] // g0, {}).setdefault(r["_row"] % g0, []).append(r)
+    return want
+
+
 class EmbStreamDataset(torch.utils.data.IterableDataset):
     """Shard-by-shard streaming with next-RG prefetch.
 
@@ -741,34 +764,32 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                     f"{sf}: row group {biggest} rows (~9 GiB) not streamable — exclude smoke shards"
                 )
                 g0 = md.row_group(0).num_rows or 64
-                want: dict[int, dict[int, dict]] = {}
-                for r in rows_here:
-                    want.setdefault(r["_row"] // g0, {})[r["_row"] % g0] = r
+                want = group_rows_by_span(rows_here, g0)
                 for rgi in sorted(want):
                     tbl = pq.ParquetFile(local_path).read_row_group(rgi, columns=["key", "n_vis", "vis_bytes"])
                     for j in sorted(want[rgi]):
-                        row = want[rgi][j]
-                        if emitted < self.start_pos:
+                        for row in want[rgi][j]:
+                            if emitted < self.start_pos:
+                                emitted += 1
+                                continue
+                            vb = tbl.column("vis_bytes")[j].as_py()
+                            nv = int(tbl.column("n_vis")[j].as_py())
+                            buf = bytearray(vb)
+                            del vb
+                            vis = (
+                                torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
+                                .view(torch.bfloat16)
+                                .reshape(-1, self.vision_dim)
+                                .float()
+                            )
+                            del buf
+                            assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
+                            yield {
+                                "vis": vis, "user": row["user"],
+                                "assistant": row["assistant"], "g": row.get("g", "?"),
+                                "grid_thw": row.get("grid_thw"),
+                            }
                             emitted += 1
-                            continue
-                        vb = tbl.column("vis_bytes")[j].as_py()
-                        nv = int(tbl.column("n_vis")[j].as_py())
-                        buf = bytearray(vb)
-                        del vb
-                        vis = (
-                            torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
-                            .view(torch.bfloat16)
-                            .reshape(-1, self.vision_dim)
-                            .float()
-                        )
-                        del buf
-                        assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
-                        yield {
-                            "vis": vis, "user": row["user"],
-                            "assistant": row["assistant"], "g": row.get("g", "?"),
-                            "grid_thw": row.get("grid_thw"),
-                        }
-                        emitted += 1
                 _enforce_lru_cache(self.rg_cache_dir, max_shards=4)
                 if next_shard_fut is not None and next_shard_fut.done():
                     try:
@@ -789,9 +810,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                 f"{sf}: row group {biggest} rows (~9 GiB) not streamable — exclude smoke shards"
             )
             g0 = md.row_group(0).num_rows or 64
-            want: dict[int, dict[int, dict]] = {}
-            for r in rows_here:
-                want.setdefault(r["_row"] // g0, {})[r["_row"] % g0] = r
+            want = group_rows_by_span(rows_here, g0)
             rgis = sorted(want)
 
             # Prefetch next RG on a side thread; current RG loads on main thread.
@@ -849,28 +868,28 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                     tbl = pf.read_row_group(rgi, columns=["key", "n_vis", "vis_bytes"])
                     try:
                         for j in sorted(want[rgi]):
-                            row = want[rgi][j]
-                            if emitted < self.start_pos:
+                            for row in want[rgi][j]:
+                                if emitted < self.start_pos:
+                                    emitted += 1
+                                    continue
+                                vb = tbl.column("vis_bytes")[j].as_py()
+                                nv = int(tbl.column("n_vis")[j].as_py())
+                                buf = bytearray(vb)
+                                del vb
+                                vis = (
+                                    torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
+                                    .view(torch.bfloat16)
+                                    .reshape(-1, self.vision_dim)
+                                    .float()
+                                )
+                                del buf
+                                assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
+                                yield {
+                                    "vis": vis, "user": row["user"],
+                                    "assistant": row["assistant"], "g": row.get("g", "?"),
+                                    "grid_thw": row.get("grid_thw"),
+                                }
                                 emitted += 1
-                                continue
-                            vb = tbl.column("vis_bytes")[j].as_py()
-                            nv = int(tbl.column("n_vis")[j].as_py())
-                            buf = bytearray(vb)
-                            del vb
-                            vis = (
-                                torch.from_numpy(np.frombuffer(buf, dtype=np.uint8))
-                                .view(torch.bfloat16)
-                                .reshape(-1, self.vision_dim)
-                                .float()
-                            )
-                            del buf
-                            assert vis.shape == (nv, self.vision_dim), f"schema mismatch {row['emb']}"
-                            yield {
-                                "vis": vis, "user": row["user"],
-                                "assistant": row["assistant"], "g": row.get("g", "?"),
-                                "grid_thw": row.get("grid_thw"),
-                            }
-                            emitted += 1
                     finally:
                         del tbl
                         rs._span = None

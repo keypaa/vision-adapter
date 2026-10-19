@@ -20,6 +20,8 @@ import torch
 
 from vision_adapter.backends.gpu import require_gpu
 from vision_adapter.config import TrainConfig, config_header, get_git_sha
+from vision_adapter.core import COLLATE_VERSION as _COLLATE_VERSION
+from vision_adapter.data.stream import STREAM_VERSION as _STREAM_VERSION
 from vision_adapter.manifest import load_manifest
 
 def _stats_str() -> str:
@@ -180,6 +182,26 @@ def _resolve_resume(ckpt_plan: dict, cli_max_steps: int | None, cli_seed: int = 
 
 
 PLAN_META_KEYS = ("manifest_sha256", "seed", "sample_size", "stream_order_hash", "max_steps")
+
+def _recipe_mismatch(ckpt_plan: dict) -> str | None:
+    """Why this checkpoint cannot be resumed under the current recipe.
+
+    A recipe change (the shape of the served row stream, or the collate's
+    text/visual budget) moves the rows at a given offset or changes the
+    supervision of a row, so a resume across it would silently train on
+    different data. That is not a plan-metadata warning — it is a different
+    experiment. Returns None when the checkpoint matches.
+    """
+    ckpt_plan = ckpt_plan or {}
+    cs = ckpt_plan.get("stream_version")
+    if cs is not None and int(cs) != _STREAM_VERSION:
+        return (f"row-stream v{cs} -> v{_STREAM_VERSION} (every manifest question is now "
+                f"served; the row at a given offset is a different row)")
+    cc = ckpt_plan.get("collate_version")
+    if cc is not None and int(cc) != _COLLATE_VERSION:
+        return (f"collate v{cc} -> v{_COLLATE_VERSION} (answer > question > image budget; "
+                f"the supervision of the affected rows changed)")
+    return None
 
 
 def _diff_plan_meta(current: dict, ckpt_plan: dict) -> list[str]:
@@ -1366,10 +1388,27 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 "sample_size": sample_size,
                 "stream_order_hash": _phash.sha1(json.dumps(list(stream_order)).encode()).hexdigest(),
                 "max_steps": steps,
+                "stream_version": _STREAM_VERSION,
+                "collate_version": _COLLATE_VERSION,
             }
-            _diffs = _diff_plan_meta(_cur_meta, resume_ckpt.get("plan", {}) or {})
+            _ckpt_plan = resume_ckpt.get("plan", {}) or {}
+            # A recipe change (row stream shape, collate budget) moves the rows
+            # at a given offset or changes the supervision of a row, so a
+            # resume across it would silently train on different data. That is
+            # not a "plan mismatch" warning — it is a different experiment.
+            _why = _recipe_mismatch(_ckpt_plan)
+            if _why:
+                print(f"[train][FATAL] resume refused: {_why}. The checkpoint was trained "
+                      f"under a different recipe, so the row at step offset "
+                      f"{_resume_info.get('start_pos_rows')} is not the same row "
+                      f"(and the labels may differ). Start a new run, or check out the "
+                      f"revision that matches the checkpoint.", flush=True)
+                return 1
+            _diffs = _diff_plan_meta(_cur_meta, _ckpt_plan)
             if _diffs:
                 print(f"[train][WARN] resume plan mismatch on {', '.join(_diffs)} — continuing with ckpt-pinned extent (dataset is static)", flush=True)
+        except SystemExit:
+            raise
         except Exception:
             pass
     recs: list[dict] = []
@@ -1500,6 +1539,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                         "batch_size": cfg.batch_size,
                         "stream_order_hash": _order_hash,
                         "max_steps": steps,
+                        "stream_version": _STREAM_VERSION,
+                        "collate_version": _COLLATE_VERSION,
                     }
                     _payload = build_ckpt_payload(
                         proj.state_dict(),

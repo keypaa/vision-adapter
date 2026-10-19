@@ -279,6 +279,11 @@ def strip_text_image_markers(text):
 
 MIN_VIS_TOKENS = 64        # below this the visual span carries no usable signal
 MAX_ANSWER_TOKENS = 256    # answers are short by design; longer ones are a data bug
+# Shape of the supervision the collate produces, recorded in every checkpoint.
+#   v1 = image-first budget (the answer was crushed to <=2 tokens for n_vis>=4090)
+#   v2 = answer > question > image
+# A resume across versions is refused: the labels of the affected rows changed.
+COLLATE_VERSION = 2
 
 
 def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
