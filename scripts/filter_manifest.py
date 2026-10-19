@@ -18,6 +18,9 @@ a corpus re-pack later.
 Usage:
     python scripts/filter_manifest.py --manifest data/train_manifest_grids.jsonl \
         --out data/train_manifest_filtered.jsonl --max-answer-words 20
+    # the manifest is not on the box yet -> fetch it from the manifests repo first
+    python scripts/filter_manifest.py --manifest data/train_manifest_grids.jsonl \
+        --out data/train_manifest_filtered.jsonl --max-answer-words 20 --fetch
 """
 from __future__ import annotations
 
@@ -44,7 +47,19 @@ def main() -> int:
     ap.add_argument("--drop-html", action="store_true", default=True,
                     help="drop rows whose answer is HTML (the grokking blocker)")
     ap.add_argument("--keep-html", dest="drop_html", action="store_false")
+    ap.add_argument("--fetch", action="store_true",
+                    help="fetch the manifest from the manifests repo if it is missing")
     args = ap.parse_args()
+
+    if args.fetch and not args.manifest.exists():
+        from huggingface_hub import hf_hub_download
+
+        from vision_adapter.data.stream import MANIFEST_FILE, MANIFEST_REPO
+
+        args.manifest.parent.mkdir(parents=True, exist_ok=True)
+        p = hf_hub_download(MANIFEST_REPO, MANIFEST_FILE, repo_type="dataset",
+                            local_dir=str(args.manifest.parent))
+        print(f"[filter] fetched manifest -> {p}")
 
     raw = [json.loads(line) for line in open(args.manifest) if line.strip()]
     header = raw[0] if raw and raw[0].get("type") == "manifest_header" else None
