@@ -51,7 +51,8 @@ records), `train_4000.log` (14,606 console lines), `train_manifest.jsonl`
 | M20 | Corpus size at each cap — three different numbers, do not mix them | **manifest rows** (117,600, with duplicates): 609 GiB now → 312 GiB @383 · 363 @512 · 527 @1,024. **served positions** (71,051, dedup'd): **291 GiB now → 182 GiB @383**. **all images embedded** (138,987, "do all"): ~394 GiB @383 |
 | M21 | `process_image` cost, same 12.8 Mpx image: **OLD geometry vs 383 cap** | already-resized image 11 ms vs full-res 461 ms (43×); fp32 canvas 3 MiB vs 147 MiB. **But** the real precompute must *do* the resize: patching the real `MAX_PATCHES` constant gives 419 ms → 96 ms (**4.4×**, the resize itself is ~85 ms) — `scripts/bench_precompute.py --synthetic-old` measures both on the target host |
 | M22 | Current precompute CPU/GPU balance (sandbox, stubbed ViT) | CPU-side ≈ 30 ms/img vs GPU-side 0.6–8 ms/img → **the CPU is the bottleneck by 3.6–48×**; decode 9.4 ms, preprocess 18.6 ms, per-image `torch.save` 1.7 ms |
-| M23 | **Images repo, per-subset encoded size** (read via Range on the `size` column only, ~100 KB/shard) | 138,987 images, **33.80 GiB** (mean 255 KiB). Full-res-looking: `websight` 1,096 KiB mean / 11,160 KiB max · `textvqa` 949 / 25,078 · `docvqa` 932 / 11,625 · `infographic_vqa` 815 / 3,866 · `screen2words` 500 / 3,663 · `vqav2` 468 · `visual7w` 325 · `okvqa`/`aokvqa` 404 · `ocrvqa` 248 · `waveui` 196 (lossless PNG of a capped image). Small: `miniwob` 7.5 · `aitw` 39 · `mind2web` 52 · `guiact-web-multi` 56 · `plotqa` 29 · `chartqa` 39. **93% of the bytes are in subsets >120 KiB/img** |
+| M23 | **Images repo, per-subset encoded size** (read via Range on the `size` column only, ~100 KB/shard) | 138,987 images, **33.80 GiB** (mean 255 KiB). Largest files: `websight` 1,096 KiB mean / 11,160 KiB max · `textvqa` 949 / 25,078 · `docvqa` 932 / 11,625 · `infographic_vqa` 815 / 3,866 · `screen2words` 500 / 3,663 · `vqav2` 468 · `visual7w` 325 · `okvqa`/`aokvqa` 404 · `ocrvqa` 248 · `waveui` 196. Smallest: `miniwob` 7.5 · `aitw` 39 · `mind2web` 52 · `guiact-web-multi` 56 · `plotqa` 29 · `chartqa` 39. **93% of the bytes are in the >120 KiB subsets** — **but byte size ≠ resolution** (the cauldron images are PNG at ~4 B/px, so 1.1 MB can still be 274k px). Resolution must be measured in pixels: the audit decoded shard 13 → **74.9% > 300k px, median 637,650 px**; shard 16's first 200 rows are **already ≤ 300k px** (median 274k, n_vis 368) |
+| M28 | **Precompute bench, measured on the rental box** (95 GiB card, `scripts/bench_precompute.py`, shard 16 / shard 0, 200 images) | ViT **13.9 ms/img** at 1,464 patches (9.5 µs/patch) · CPU **13.7 ms/img** (decode 7.2, preprocess 4.5, write 1.9) · GPU **16.5 ms/img** → **CPU and GPU are balanced (0.8×)**, so overlapping gives 33 → 61 img/s. **Corpus projection: 1.16 h serial → 0.64 h overlapped.** Cap on a 12.8 Mpx image: preprocess 592 → 82 ms (**7.2×**), ViT 2,402 → 22 ms (**110×**). VRAM: **20,262 patches per GiB** (peak 15.15 GiB for a 307k-patch batch) |
 | M24 | **Served vs manifest composition** (the loader collapses duplicate `emb` rows) | agentic 52,924 manifest → **52,924 served (73.3%)** · doc 52,908 → **12,780 (17.7%)** · conv 11,768 → 6,503 (9.0%). The doc slice asks **up to 54 questions per image** (3,983 images with ≥6 questions, all chart/figure QA: *"What is the difference between the Balance of Payment (as % of commercial service exports)"* → answers `No.`/`Yes.`/`0.`/`2.`) |
 | M25 | **Collate budget pathology A** — `core.py:305-318` | for `n_vis ≥ 4,090`: `budget_text = max_len - nv - 2 ≤ 2` → **the answer is cut to ≤2 tokens and the question to 1**. **1,986 rows (1.69%)**, all `doc`, carrying **27.7% of all answer words**. Present at HEAD *and* in the 4,000-step run's revision |
 | M26 | **Collate budget pathology B** — long text squeezes the image | `excess` trimming removes the *visual* span when text is long → the model sees a cropped image. The 8 worst-loss steps (loss 5.4–7.0) all have `n_vis ≈ 350-414` and **zero** rows with `n_vis > 4,090`: their length comes from long *questions*, and the visual span is what gets cut |
@@ -90,10 +91,10 @@ One divergence, four consequences:
 
 | consequence | mechanism | evidence |
 |---|---|---|
-| 45% of GPU time in 3.9% of steps | doc rows are 3–40× the reference token count → batch cost = longest row (padded L) | M12 |
-| Those steps carry 3× the loss | the long rows are the hard ones (dense docs, infographics); at HEAD they are also **truncated** to `max_seq_len` (head kept), so the answer region can be cut → unlearnable | M13, `core.py:308,314` |
-| 830 GB corpus, 3 GiB row groups, 29% of wall on I/O | the same rows are 3–40× bigger than they need to be | M7, M9 |
-| no grok collapse | the projector (a *per-token* MLP) now has to align over a 1000× token-count range, and 1.7% of rows are truncated | M14, M18 |
+| 45% of GPU time in 3.2% of steps | doc rows are 3–40× the reference token count → batch cost = longest row (padded L) | M12, M28 |
+| Those steps carry ~3× the loss | at HEAD the collate **starves the answer** for `n_vis ≥ 4,090` (≤2 tokens) and **crops the image** when the text is long | M25, M26, M13 |
+| 883.8 GiB corpus, 3 GiB row groups, 29% of wall on I/O | the same rows are 3–40× bigger than they need to be | M7, M9, M23 |
+| no grok collapse | **not** the projector's token-count range (it is per-token; M27 shows the loss is flat across sizes) — the candidates are the **unserved 39% of questions** (M15/M24), the **collate budget bugs** (M25/M26), and the **recipe** (D4: batch 16 vs 64, 2B vs 304B backbone) | M14, M27 |
 
 **Corollary: fix the payload and the transport problem largely disappears.**
 At the reference budget the corpus is ~182 GiB (served, dedup'd) or ~394 GiB
@@ -350,9 +351,21 @@ slice (which already sits at ≤380). For the **doc** slice it is a policy choic
 with real downside: a 3.9 Mpx docvqa page downscaled to 300k px is a 0.28×
 linear reduction — 12-px glyphs become 3-px smears, one patch per ~5 characters.
 So the budget should be **per slice** (UI 383, OCR/chart 1,024–2,048) — and
-*which* value is an empirical question, to be settled by the P1 probe re-runs
+*which* value is an empirical question, to be settled by the P0 probe re-runs
 (M27 shows the loss is currently flat across sizes, so the size axis is
 untested, not dismissed).
+
+**Measured cost of the cap (M28)**: on a 12.8 Mpx image, preprocess 592 → 82 ms
+(7.2×) and the ViT 2,402 → 22 ms (**110×**) — the ViT cost grows steeply with
+the token count, so the cap is worth far more on the *monster* rows than the
+corpus average (corpus-wide the ViT time goes 1.01 h → 0.54 h).
+
+**Measured subtlety (M23)**: byte size does **not** imply resolution. The
+cauldron images are PNG at ~4 B/px, so `websight` at 1.1 MB/image can still be
+274k px (already capped), while the *same subset* elsewhere (the audit's shard
+13) is 74.9% > 300k px. **Resolution must be measured in pixels per image** —
+which the precompute knows for free (it is the ViT's own input geometry), so a
+per-subset budget can be enforced without a separate pass.
 
 ---
 
@@ -395,7 +408,7 @@ Cost units: **S** ≤ half a day · **M** 1–3 days · **L** > 3 days (or GPU-h
 | W7b | **Write the corpus as blob+index in shard order** (one `.bin` + one `.idx` per shard, atomic rename), so W8 disappears and the output is directly consumable by both row-sources | D2 | M | none |
 | W7c | **Resumability at shard granularity** (a finished shard's blob+index is renamed into place and recorded; a killed run restarts at the next shard) — the current resume is per-image via 137k `.pt` files | 6 h run on a killable box | S | none |
 | W7d | **Drop the full-corpus size-scan** (`pack_batches` opens every image to read its dimensions — a whole pass over 138k files) by taking the patch count from the images repo's own metadata or caching it | measurable I/O in the 6 h | S | none |
-| W7e | Benchmark the new precompute end-to-end on the target GPU box and **record the number**. Harness: `scripts/bench_precompute.py` (per-stage timing: read / decode / preprocess / h2d / vit / write_pt / write_blob; `--synthetic-old` for the paired old-vs-cap measurement). Target: **≤ 30 min for the full 138,987-image corpus** at the 383 cap | the 6 h run was Colab + Google-Drive + 137k per-image `.pt` writes, not compute: `process_image` alone was 461 ms/img at the old geometry vs 11 ms at the cap (M21), and the CPU side is 3.6–48× the GPU side (M22) | S | none |
+| W7e | Benchmark the new precompute end-to-end on the target GPU box and **record the number**. Harness: `scripts/bench_precompute.py` (per-stage timing; `--shards 0,13,16 --spread` for a representative sample; `--synthetic-old` for the paired geometry measurement). **Already measured (M28): the full corpus is ~1.16 h serial, ~0.64 h overlapped, on a 95 GiB card** — the old 6 h was Colab + Google Drive + 137k per-image `.pt` writes, not compute. Target: ≤ 45 min overlapped. The *upload* of ~394 GiB may then dominate and is unmeasured | M28 | S | none |
 | W7f | **Stream shards to HF as they are produced** (one shard blob + index at a time, uploaded immediately): the container's ephemeral disk holds one shard (~2–3 GiB), never the whole corpus. Required because there is **no volume** — the 310 GiB corpus is never materialised on any host | D3 (no Modal volume) | S | none |
 | W8 | ~~Re-pack~~ — **merged into W7b**: the precompute emits the final corpus format. Remaining: the global `key_map` (key → shard,row) and the key-index **v4** shape | M7, M15, M16; v4 needed because row→RG is no longer valid | S | **yes** (new plan version) |
 | W9 | Publish the new corpus to a **new repo** `keypa/vision-adapter-embeddings-v2` (decided) — a different file format (`.bin`+`.idx`, not parquet) and an unambiguous legacy boundary. Keep the old repo published, tagged **`deprecated`** in its card, so old checkpoints stay resumable | D5, §7 | S | keeps old resumable |
