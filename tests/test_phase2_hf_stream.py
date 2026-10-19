@@ -76,8 +76,6 @@ def test_lru_finds_shards_under_the_data_subdir(tmp_path):
     """hf_hub_download(local_dir=...) keeps the repo-relative path, so a shard
     lands at <cache>/data/emb_XXXX.parquet. The old glob (<cache>/emb_*.parquet)
     matched nothing -> the whole-shard cache was never evicted."""
-    import os
-
     from vision_adapter.data.stream import _cached_shard_files
 
     d = tmp_path / "data"
@@ -90,7 +88,6 @@ def test_lru_finds_shards_under_the_data_subdir(tmp_path):
 
 
 def test_lru_evicts_the_oldest_shard(tmp_path):
-    import os
     import time
 
     from vision_adapter.data.stream import _enforce_lru_cache
