@@ -55,6 +55,9 @@ DEFAULT_BATCH_PATCHES = 240_000   # precompute_colab.py BATCH_PATCHES (tuned for
 # batch on an unseen GPU; the bench reports the observed patches/GB so the
 # constant can be recalibrated from a real run.
 PATCHES_PER_GB = 24_000
+MAX_AUTO_PATCHES = 1_000_000   # sanity cap: a batch much bigger than this does not
+                               # saturate a GPU any better, and the varlen
+                               # attention kernel dislikes very long packed sequences
 CPU_STAGES = ("read", "decode", "preprocess", "write_pt", "write_blob")
 BATCH_STAGES = ("cat", "h2d", "vit")
 
@@ -69,6 +72,10 @@ def auto_batch_patches(device, headroom_gb: float) -> tuple[int, str]:
         return DEFAULT_BATCH_PATCHES, f"mem_get_info failed ({e}); default budget"
     usable_gb = max(0.5, (free / 2**30) - headroom_gb)
     n = int(usable_gb * PATCHES_PER_GB)
+    if n > MAX_AUTO_PATCHES:
+        return MAX_AUTO_PATCHES, (f"{free/2**30:.1f} GiB free of {total/2**30:.1f} GiB, "
+                                  f"{usable_gb:.1f} GiB usable x {PATCHES_PER_GB:,} patches/GB "
+                                  f"= {n:,}, capped at {MAX_AUTO_PATCHES:,}")
     return n, (f"{free/2**30:.1f} GiB free of {total/2**30:.1f} GiB, "
                f"{usable_gb:.1f} GiB usable x {PATCHES_PER_GB:,} patches/GB")
 
@@ -190,8 +197,9 @@ class _Batch:
         self.items: list[dict] = []
         self.patches = 0
 
-    def add(self, pixel_values, grid, dims):
-        self.items.append({"pv": pixel_values, "grid": grid, "dims": dims})
+    def add(self, pixel_values, grid, dims, idx, cpu_ms):
+        self.items.append({"pv": pixel_values, "grid": grid, "dims": dims, "i": idx,
+                           "cpu": cpu_ms})
         self.patches += int(pixel_values.shape[0])
 
     def full(self):
@@ -249,13 +257,19 @@ def measure(args, vit, device, process_image, budget, preprocess_mod):
         for it, emb in zip(batch.items, outs):
             flat = emb.reshape(emb.shape[0], -1).to(torch.bfloat16).cpu()
             t6 = time.perf_counter()
-            path = os.path.join(tmpdir, f"e{seen}.pt")
+            path = os.path.join(tmpdir, f"e{it['i']}.pt")
             torch.save(flat, path)                      # current write path (real fs)
             os.remove(path)
             t7 = time.perf_counter()
             with open(blob_path, "ab") as bf:            # proposed: append to the shard blob
                 bf.write(flat.reshape(-1).view(torch.uint8).numpy().tobytes())
             t8 = time.perf_counter()
+            if it["i"] < args.warmup:                    # warmup images are timed but not recorded
+                seen += 1
+                continue
+            T["read"].append(it["cpu"][0])
+            T["decode"].append(it["cpu"][1])
+            T["preprocess"].append(it["cpu"][2])
             T["write_pt"].append((t7 - t6) * 1e3)
             T["write_blob"].append((t8 - t7) * 1e3)
             for k, v in bt.items():
@@ -270,7 +284,7 @@ def measure(args, vit, device, process_image, budget, preprocess_mod):
         batch.patches = 0
 
     with torch.no_grad():
-        for _name, raw in sample_source(args):
+        for i, (_name, raw) in enumerate(sample_source(args)):
             t0 = time.perf_counter()
             data = raw
             t1 = time.perf_counter()
@@ -278,20 +292,12 @@ def measure(args, vit, device, process_image, budget, preprocess_mod):
             t2 = time.perf_counter()
             out = process_image(im)
             t3 = time.perf_counter()
-            if seen < args.warmup:
-                # warmup images still go through the ViT, but are not recorded
-                batch.add(out["pixel_values"], out["grid_thws"], im.size)
-                if batch.full():
-                    flush()
-                continue
-            T["read"].append((t1 - t0) * 1e3)
-            T["decode"].append((t2 - t1) * 1e3)
-            T["preprocess"].append((t3 - t2) * 1e3)
-            batch.add(out["pixel_values"], out["grid_thws"], im.size)
+            batch.add(out["pixel_values"], out["grid_thws"], im.size, i,
+                      ((t1 - t0) * 1e3, (t2 - t1) * 1e3, (t3 - t2) * 1e3))
             if batch.full():
                 flush()
-            if seen % 25 == 0:
-                print(f"[bench] {seen}/{args.n + args.warmup}", flush=True)
+            if i % 25 == 0:
+                print(f"[bench] {i}/{args.n + args.warmup}", flush=True)
         flush()
     _pp.MAX_PATCHES = old_max
     return T, n_vis, n_patches, dims_all, vram_stats
@@ -412,7 +418,10 @@ def main():
 
     T, n_vis, n_patches, dims, vram_stats = measure(args, vit, device, process_image, budget, preprocess_mod)
     if not T["read"]:
-        raise SystemExit("no samples")
+        raise SystemExit(
+            f"no samples recorded: the sample ({args.n}+{args.warmup} images) never produced a "
+            f"recorded batch. Check --n vs --warmup ({args.warmup}) and --batch-patches "
+            f"({budget:,}).")
     res = report(T, n_vis, n_patches, dims, vram_stats, note)
     res["batch_patches"] = budget
     res["batch_patches_note"] = note
