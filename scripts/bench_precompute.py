@@ -54,7 +54,7 @@ DEFAULT_BATCH_PATCHES = 240_000   # precompute_colab.py BATCH_PATCHES (tuned for
 # weights -> ~24k patches per GB of usable VRAM. Used only to auto-size the
 # batch on an unseen GPU; the bench reports the observed patches/GB so the
 # constant can be recalibrated from a real run.
-PATCHES_PER_GB = 24_000
+PATCHES_PER_GB = 20_000   # recalibrated 2026-10-19 from a measured run (20,262 patches/GiB)
 MAX_AUTO_PATCHES = 1_000_000   # sanity cap: a batch much bigger than this does not
                                # saturate a GPU any better, and the varlen
                                # attention kernel dislikes very long packed sequences
@@ -91,30 +91,46 @@ def iter_local_images(root: Path, n: int):
         yield p.name, p.read_bytes()
 
 
-def iter_repo_images(repo: str, shard: int, n: int, cache_dir: Path):
-    """Yield (filename, bytes) from one parquet shard of the images repo."""
+def iter_repo_images(repo: str, shard: int, n: int, cache_dir: Path, shards=None, spread=False):
+    """Yield (filename, bytes) from the images repo.
+
+    shards: comma-separated shard indices (default: just `shard`).
+    spread: take every k-th row of each shard instead of the first n rows, so a
+            small sample is not biased towards one corner of one shard.
+    """
     import pyarrow.parquet as pq
     from huggingface_hub import hf_hub_download
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    fname = f"data/train-{shard:05d}-of-00017.parquet"
-    path = hf_hub_download(repo, fname, repo_type="dataset", local_dir=str(cache_dir))
-    pf = pq.ParquetFile(path)
-    taken = 0
-    for batch in pf.iter_batches(batch_size=64, columns=["filename", "image"]):
-        for nm, blob in zip(batch.column("filename").to_pylist(),
-                            batch.column("image").to_pylist()):
-            yield nm, blob
-            taken += 1
-            if taken >= n:
-                return
+    idxs = [int(s) for s in shards.split(",")] if shards else [shard]
+    per = max(1, n // len(idxs))
+    for si, sh in enumerate(idxs):
+        fname = f"data/train-{sh:05d}-of-00017.parquet"
+        path = hf_hub_download(repo, fname, repo_type="dataset", local_dir=str(cache_dir))
+        pf = pq.ParquetFile(path)
+        taken = 0
+        for batch in pf.iter_batches(batch_size=256, columns=["filename", "image"]):
+            names = batch.column("filename").to_pylist()
+            blobs = batch.column("image").to_pylist()
+            for i, (nm, blob) in enumerate(zip(names, blobs)):
+                if spread:
+                    # deterministic spread across the shard
+                    if i % max(1, (pf.metadata.num_rows // max(per, 1))) != 0:
+                        continue
+                yield nm, blob
+                taken += 1
+                if taken >= per:
+                    break
+            if taken >= per:
+                break
 
 
 def sample_source(args):
     if args.images_root:
         return iter_local_images(args.images_root, args.n + args.warmup)
     return iter_repo_images(args.images_repo, args.shard, args.n + args.warmup,
-                            Path("/tmp/bench_precompute"))
+                            Path("/tmp/bench_precompute"),
+                            shards=args.shards, spread=args.spread)
 
 
 # ------------------------------------------------------------- geometry ----
@@ -388,6 +404,11 @@ def main():
     src.add_argument("--images-root", type=Path)
     src.add_argument("--images-repo", default="keypa/vision-adapter-images")
     ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--shards", default=None,
+                    help="comma-separated shard indices to sample across (e.g. 0,13,16)")
+    ap.add_argument("--spread", action="store_true",
+                    help="sample every k-th row of each shard instead of the first rows "
+                         "(the first rows of one shard are not a representative sample)")
     ap.add_argument("--n", type=int, default=200)
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--warmup", type=int, default=10)
