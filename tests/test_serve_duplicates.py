@@ -19,6 +19,7 @@ from vision_adapter.core import COLLATE_VERSION
 from vision_adapter.data.stream import (
     STREAM_VERSION,
     group_rows_by_span,
+    interleaved_positions,
     rows_in_span,
     span_is_skippable,
 )
@@ -113,3 +114,84 @@ def test_span_is_skippable_only_when_every_row_is_before_the_offset():
     assert span_is_skippable(emitted=7, n_rows=4, start_pos=10) is False
     # no resume -> nothing is skippable
     assert span_is_skippable(emitted=0, n_rows=5, start_pos=0) is False
+
+
+def test_questions_of_one_image_are_interleaved():
+    """Serving them consecutively would put 54 questions about ONE image in a
+    batch, and the batch loss is a token-mean."""
+    want = group_rows_by_span(
+        [_row(0, assistant="q1"), _row(0, assistant="q2"), _row(1, assistant="r1")],
+        g0=64)
+    order = interleaved_positions(want[0])
+    assert order == [(0, 0), (1, 0), (0, 1)], order
+    served = [want[0][p][qi]["assistant"] for p, qi in order]
+    assert served == ["q1", "r1", "q2"], served
+
+
+# ------------------------------------------------------------- the loader ---
+# Nothing drove EmbStreamDataset.__iter__ before: the emitted counter, the
+# resume skip, the duplicates and the interleaving were all untested.
+
+
+def _write_shard(path, n_rows=128, n_vis=4):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from vision_adapter.data.pack import SCHEMA
+
+    rows = [{"key": f"embeddings/k{i:04d}.pt", "n_vis": n_vis,
+             "vis_bytes": b"\x00" * (n_vis * 4096 * 2)} for i in range(n_rows)]
+    w = pq.ParquetWriter(path, SCHEMA, compression=None)
+    for i in range(0, n_rows, 64):
+        w.write_table(pa.Table.from_pylist(rows[i:i + 64], schema=SCHEMA))
+    w.close()
+    return path
+
+
+def _plan_rows(n_positions=8, questions=2):
+    out = []
+    for p in range(n_positions):
+        for qi in range(questions):
+            out.append({"_row": p, "emb": f"embeddings/k{p:04d}.pt",
+                        "user": f"u{p}q{qi}", "assistant": f"a{p}q{qi}", "g": "t"})
+    return out
+
+
+def test_loader_serves_every_plan_row_including_duplicates(tmp_path):
+    from vision_adapter.data.stream import EmbStreamDataset
+
+    shard = _write_shard(tmp_path / "emb_0000.parquet")
+    plan_rows = _plan_rows(n_positions=8, questions=3)
+    ds = EmbStreamDataset(
+        plan={"data/emb_0000.parquet": plan_rows},
+        stream_order=["data/emb_0000.parquet"],
+        local_shards={"data/emb_0000.parquet": str(shard)},
+    )
+    got = list(ds)
+    assert len(got) == len(plan_rows) == 24, len(got)
+    texts = sorted(r["assistant"] for r in got)
+    assert texts == sorted(r["assistant"] for r in plan_rows)
+    # the questions of one image are spread, not consecutive
+    served = [r["assistant"] for r in got]
+    assert served[:3] == ["a0q0", "a1q0", "a2q0"], served[:3]
+
+
+def test_loader_resume_skips_the_first_rows(tmp_path):
+    from vision_adapter.data.stream import EmbStreamDataset, group_rows_by_span
+
+    shard = _write_shard(tmp_path / "emb_0000.parquet")
+    plan_rows = _plan_rows(n_positions=8, questions=2)
+    ds = EmbStreamDataset(
+        plan={"data/emb_0000.parquet": plan_rows},
+        stream_order=["data/emb_0000.parquet"],
+        start_pos=5,
+        local_shards={"data/emb_0000.parquet": str(shard)},
+    )
+    got = list(ds)
+    assert len(got) == len(plan_rows) - 5, len(got)
+    # the expected served order: positions ascending, the questions of a
+    # position spread round-robin
+    want = group_rows_by_span(plan_rows, g0=64)
+    expected = [want[0][p][qi]["assistant"]
+                for p, qi in interleaved_positions(want[0])][5:]
+    assert [r["assistant"] for r in got] == expected
