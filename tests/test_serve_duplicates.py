@@ -16,7 +16,12 @@ Hermetic: no HF, no GPU. Run:
 """
 
 from vision_adapter.core import COLLATE_VERSION
-from vision_adapter.data.stream import STREAM_VERSION, group_rows_by_span
+from vision_adapter.data.stream import (
+    STREAM_VERSION,
+    group_rows_by_span,
+    rows_in_span,
+    span_is_skippable,
+)
 from vision_adapter.train import _recipe_mismatch
 
 
@@ -80,3 +85,21 @@ def test_resume_accepts_a_legacy_checkpoint_without_versions():
     """Old checkpoints have no version keys: they are resumable (the loader
     change is the only difference and it is the caller's choice to resume)."""
     assert _recipe_mismatch({"manifest_sha256": "abc", "seed": 0}) is None
+
+
+def test_rows_in_span_counts_every_question():
+    rows = [_row(0), _row(0), _row(0), _row(5)]
+    want = group_rows_by_span(rows, g0=64)
+    assert rows_in_span(want[0]) == 4, "duplicates count as separate rows"
+
+
+def test_span_is_skippable_only_when_every_row_is_before_the_offset():
+    # 10 rows in the group, resume at row 10 -> the whole group is before it
+    assert span_is_skippable(emitted=0, n_rows=10, start_pos=10) is True
+    # the group straddles the offset -> must be fetched
+    assert span_is_skippable(emitted=0, n_rows=11, start_pos=10) is False
+    assert span_is_skippable(emitted=5, n_rows=5, start_pos=10) is True
+    # a group that straddles the offset must be fetched
+    assert span_is_skippable(emitted=7, n_rows=4, start_pos=10) is False
+    # no resume -> nothing is skippable
+    assert span_is_skippable(emitted=0, n_rows=5, start_pos=0) is False

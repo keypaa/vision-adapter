@@ -70,3 +70,53 @@ def test_hf_transfer_chunked_fallback():
         assert True
     except ImportError:
         assert True
+
+
+def test_lru_finds_shards_under_the_data_subdir(tmp_path):
+    """hf_hub_download(local_dir=...) keeps the repo-relative path, so a shard
+    lands at <cache>/data/emb_XXXX.parquet. The old glob (<cache>/emb_*.parquet)
+    matched nothing -> the whole-shard cache was never evicted."""
+    import os
+
+    from vision_adapter.data.stream import _cached_shard_files
+
+    d = tmp_path / "data"
+    d.mkdir()
+    (d / "emb_0094.parquet").write_bytes(b"x" * 10)
+    (tmp_path / "emb_0001.parquet").write_bytes(b"x" * 10)
+    found = _cached_shard_files(str(tmp_path))
+    names = sorted(os.path.basename(p) for p in found)
+    assert names == ["emb_0001.parquet", "emb_0094.parquet"], found
+
+
+def test_lru_evicts_the_oldest_shard(tmp_path):
+    import os
+    import time
+
+    from vision_adapter.data.stream import _enforce_lru_cache
+
+    d = tmp_path / "data"
+    d.mkdir()
+    paths = []
+    for i in range(4):
+        p = d / f"emb_{i:04d}.parquet"
+        p.write_bytes(b"x" * 10)
+        os.utime(p, (time.time() - (10 - i) * 60, time.time() - (10 - i) * 60))
+        paths.append(p)
+    _enforce_lru_cache(str(tmp_path), max_shards=2)
+    left = sorted(p.name for p in d.glob("emb_*.parquet"))
+    assert left == ["emb_0002.parquet", "emb_0003.parquet"], left
+
+
+def test_rg_cache_budget_has_a_floor_and_a_ceiling(tmp_path, monkeypatch):
+    """The row-group cache is a cache: it scales with the disk but stays bounded."""
+    import shutil
+
+    from vision_adapter.data import stream
+
+    monkeypatch.setattr(shutil, "disk_usage",
+                        lambda p: shutil._ntuple_diskusage(10**12, 10**12, 10**12))
+    assert stream._rg_cache_budget(str(tmp_path)) == stream.RG_CACHE_MAX_BYTES
+    monkeypatch.setattr(shutil, "disk_usage",
+                        lambda p: shutil._ntuple_diskusage(1, 1, 10**9))
+    assert stream._rg_cache_budget(str(tmp_path)) == stream.RG_CACHE_MIN_BYTES

@@ -381,22 +381,44 @@ def drain_row_group_prefetch(fut):
         return None
 
 
-def _enforce_lru_cache(cache_dir: str | None, max_shards: int = 4) -> None:
+def _cached_shard_files(cache_dir: str) -> list[str]:
+    """Whole-shard files in the cache, wherever they actually live.
+
+    `hf_hub_download(local_dir=...)` keeps the repo-relative path, so a shard
+    downloaded as `data/emb_0094.parquet` lands at
+    `<cache_dir>/data/emb_0094.parquet`, NOT `<cache_dir>/emb_0094.parquet`.
+    The old glob (`<cache_dir>/emb_*.parquet`) therefore matched nothing and
+    the whole-shard cache was never evicted: it grew without bound on a big
+    box and filled the disk on a small one.
+    """
+    import glob
+
+    pats = [
+        os.path.join(cache_dir, "**", "emb_*.parquet"),
+        os.path.join(cache_dir, "emb_*.parquet"),
+    ]
+    out: list[str] = []
+    for pat in pats:
+        for p in glob.glob(pat, recursive=True):
+            if os.path.isfile(p) and p not in out:
+                out.append(p)
+    return out
+
+
+def _enforce_lru_cache(cache_dir: str | None, max_shards: int | None = None) -> None:
     """LRU eviction for the whole-shard cache, sized by free disk not by host.
 
-    Holds at most ``max_shards`` shards. Now that the whole-shard path runs
-    off-Modal too, a fixed shard count would be wrong on either extreme: 4
-    shards is 12-256 GB depending on which ones landed, and 4×64GB overflows
-    a 100 GB disk. Size it from `shutil.disk_usage` instead, and keep a
+    Holds at most ``max_shards`` shards (or as many as fit in the disk
+    budget). A fixed shard count is wrong on either extreme: 4 shards is
+    12-256 GB depending on which ones landed, and 4x64GB overflows a 100 GB
+    disk. Size it from `shutil.disk_usage` instead, and keep a
     caller-supplied ``max_shards`` as the ceiling when given.
     """
     if not cache_dir or not os.path.isdir(cache_dir):
         return
     limit = _shard_lru_limit(cache_dir, max_shards)
     try:
-        import glob
-
-        shards = glob.glob(os.path.join(cache_dir, "emb_*.parquet"))
+        shards = _cached_shard_files(cache_dir)
         if len(shards) <= limit:
             return
         shards.sort(key=lambda p: os.path.getmtime(p))
@@ -416,7 +438,7 @@ def _shard_lru_limit(cache_dir: str, max_shards: int | None = None) -> int:
 
     80% of free space, so the download that triggers the eviction still lands.
     Falls back to 4 when the disk cannot be measured — the previous
-    behaviour, which is the safe side for a 12 GB Colab disk.
+    behaviour, which is the safe side for a small disk.
     """
     if max_shards is not None:
         try:
@@ -438,9 +460,7 @@ def _shard_lru_limit(cache_dir: str, max_shards: int | None = None) -> int:
 def _biggest_cached_shard(cache_dir: str) -> int:
     """Largest cached shard in bytes, or 0 — the unit the disk budget divides by."""
     try:
-        import glob
-
-        sizes = [os.path.getsize(p) for p in glob.glob(os.path.join(cache_dir, "emb_*.parquet"))]
+        sizes = [os.path.getsize(p) for p in _cached_shard_files(cache_dir)]
         return max(sizes) if sizes else 0
     except Exception:
         return 0
@@ -477,12 +497,40 @@ def _coalesce_ranges(ranges: list[tuple[int, int]], gap: int = 2 * 2**20) -> lis
     return out
 
 
-def _enforce_rg_cache_limit(cache_dir: str | None, max_bytes: int = 12 * 2**30) -> None:
-    """Keep rg_*.bin disk cache under 12GiB for Colab (Phase 3).
+RG_CACHE_MIN_BYTES = 12 * 2**30      # floor: the old Colab-sized budget
+RG_CACHE_MAX_BYTES = 64 * 2**30      # ceiling: beyond this it is not a cache
+RG_CACHE_FREE_FRACTION = 0.10         # ... and it never exceeds this of the disk
 
-    Modal uses whole-shard LRU instead; this is for Range fallback path."""
+
+def _rg_cache_budget(cache_dir: str) -> int:
+    """How many bytes the row-group disk cache may use on this host.
+
+    The old budget was a hardcoded 12 GiB, chosen for a 15 GB Colab disk. It
+    is a *cache*, not a store: on a 500 GB box a 12 GiB cap holds four of the
+    3 GiB row groups, so the cache thrashed (the measured eviction storm
+    during the 4,000-step probe) and the loader re-fetched what it had just
+    thrown away. Scale it with the disk instead, within bounds.
+    """
+    try:
+        import shutil
+
+        free = shutil.disk_usage(cache_dir).free
+        by_disk = int(free * RG_CACHE_FREE_FRACTION)
+        return max(RG_CACHE_MIN_BYTES, min(RG_CACHE_MAX_BYTES, by_disk))
+    except Exception:
+        return RG_CACHE_MIN_BYTES
+
+
+def _enforce_rg_cache_limit(cache_dir: str | None, max_bytes: int | None = None) -> None:
+    """Keep the rg_*.bin disk cache inside its budget (disk-derived by default).
+
+    This is a CACHE: it may be dropped at any time, and nothing may depend on
+    it surviving. The old fixed 12 GiB cap was sized for a Colab disk; on a
+    big box it thrashed, on a small one it was the right size.
+    """
     if not cache_dir or not os.path.isdir(cache_dir) or _in_modal():
         return
+    budget = max_bytes if max_bytes is not None else _rg_cache_budget(cache_dir)
     try:
         import glob
 
@@ -491,13 +539,14 @@ def _enforce_rg_cache_limit(cache_dir: str | None, max_bytes: int = 12 * 2**30) 
             return
         files.sort(key=lambda p: os.path.getmtime(p))
         total = sum(os.path.getsize(p) for p in files)
-        while total > max_bytes and files:
+        while total > budget and files:
             old = files.pop(0)
             try:
                 sz = os.path.getsize(old)
                 os.remove(old)
                 total -= sz
-                print(f"[stream] RG cache evicted {os.path.basename(old)} ({sz/2**20:.0f}MiB, cap 12GiB)", flush=True)
+                print(f"[stream] RG cache evicted {os.path.basename(old)} "
+                      f"({sz/2**20:.0f}MiB, budget {budget/2**30:.0f}GiB)", flush=True)
             except Exception:
                 pass
     except Exception:
@@ -688,6 +737,20 @@ def group_rows_by_span(rows_here, g0: int) -> dict[int, dict[int, list[dict]]]:
     return want
 
 
+def rows_in_span(want_rg: dict[int, list[dict]]) -> int:
+    """How many plan rows a row group contributes to the stream."""
+    return sum(len(v) for v in want_rg.values())
+
+
+def span_is_skippable(emitted: int, n_rows: int, start_pos: int) -> bool:
+    """True when EVERY row of this group is before the resume offset.
+
+    Such a group must not be fetched: the 4,000-step probe spent 22.7 minutes
+    fetching groups whose rows it then threw away.
+    """
+    return emitted + n_rows <= start_pos
+
+
 class EmbStreamDataset(torch.utils.data.IterableDataset):
     """Shard-by-shard streaming with next-RG prefetch.
 
@@ -766,6 +829,11 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                 g0 = md.row_group(0).num_rows or 64
                 want = group_rows_by_span(rows_here, g0)
                 for rgi in sorted(want):
+                    # Resume skip (see the Range path): do not fetch groups
+                    # whose rows are all before start_pos.
+                    if span_is_skippable(emitted, rows_in_span(want[rgi]), self.start_pos):
+                        emitted += rows_in_span(want[rgi])
+                        continue
                     tbl = pq.ParquetFile(local_path).read_row_group(rgi, columns=["key", "n_vis", "vis_bytes"])
                     for j in sorted(want[rgi]):
                         for row in want[rgi][j]:
@@ -790,7 +858,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                                 "grid_thw": row.get("grid_thw"),
                             }
                             emitted += 1
-                _enforce_lru_cache(self.rg_cache_dir, max_shards=4)
+                _enforce_lru_cache(self.rg_cache_dir)
                 if next_shard_fut is not None and next_shard_fut.done():
                     try:
                         next_shard_fut.result()
@@ -813,57 +881,84 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
             want = group_rows_by_span(rows_here, g0)
             rgis = sorted(want)
 
-            # Prefetch next RG on a side thread; current RG loads on main thread.
-            # The side thread just warms disk_cache (RemoteShard.load_span writes
-            # rg_*.bin), so the next rs.load_span hits the file and dt ~0.
+            # Prefetch the NEXT row group while the CURRENT one is being trained.
+            #
+            # The previous version submitted the fetch for rgis[idx+1] and then
+            # immediately drained it *before* reading rgis[idx], so every
+            # download sat between two training steps: the network was 100%
+            # exposed (measured: the 4,000-step probe's 7,166 s gap was the
+            # whole transfer time, and 46% of the GPU time went to the slow
+            # groups). It also compared the next group's byte length against
+            # the current group's size, so the "adopt" path never fired.
+            #
+            # Now: the fetch for rgis[idx+1] is submitted at the top of
+            # iteration idx (so it overlaps the training of rgis[idx]), and
+            # rgis[idx] is adopted by IDENTITY (lo, hi) at the top of
+            # iteration idx+1. Same rows, same order, same bytes -- only WHEN
+            # the transfer happens changes.
             prefetch: ThreadPoolExecutor | None = None
-            next_fut = None
+            pending: tuple[int, int, object] | None = None   # (lo, hi, future)
             if self.rg_cache_dir and len(rgis) > 1:
                 prefetch = ThreadPoolExecutor(max_workers=1)
 
+            def _start_prefetch(n_rgi: int):
+                """Submit the fetch for n_rgi; returns (lo, hi, future) or None."""
+                n_lo, n_hi = rg_span(md, n_rgi)
+                probe = RemoteShard.__new__(RemoteShard)
+                probe.url = url  # type: ignore[attr-defined]
+                probe.disk_cache = self.rg_cache_dir  # type: ignore[attr-defined]
+                n_cf = probe._cache_file(n_lo, n_hi)
+                if os.path.exists(n_cf) and os.path.getsize(n_cf) == n_hi - n_lo:
+                    return None            # already on disk -> the main thread reads it
+
+                def _bg(n_lo=n_lo, n_hi=n_hi, n_rgi=n_rgi, sf=sf, size=rs.size):
+                    rs2 = RemoteShard(url, size, disk_cache=self.rg_cache_dir)
+                    t0 = time.time()
+                    rs2.load_span(n_lo, n_hi)
+                    dt = time.time() - t0
+                    if dt > 2:
+                        print(f"[stream] prefetched {Path(sf).name} rg{n_rgi} "
+                              f"({(n_hi-n_lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
+                    return rs2._span[1] if rs2._span else None
+
+                return (n_lo, n_hi, prefetch.submit(_bg))
+
             try:
                 for idx, rgi in enumerate(rgis):
-                    # Kick off prefetch for rg[idx+1] if not already cached
-                    if prefetch is not None and idx + 1 < len(rgis) and next_fut is None:
-                        n_rgi = rgis[idx + 1]
-                        n_lo, n_hi = rg_span(md, n_rgi)
-                        # Use real shard size for cache key (not 0 — keys on [url,lo,hi])
-                        probe = RemoteShard.__new__(RemoteShard)
-                        probe.url = url  # type: ignore[attr-defined]
-                        probe.disk_cache = self.rg_cache_dir  # type: ignore[attr-defined]
-                        n_cf = probe._cache_file(n_lo, n_hi)
-                        if not (os.path.exists(n_cf) and os.path.getsize(n_cf) == n_hi - n_lo):
-                            def _bg(url=url, n_lo=n_lo, n_hi=n_hi, cache=self.rg_cache_dir, n_rgi=n_rgi, sf=sf, size=rs.size):
-                                rs2 = RemoteShard(url, size, disk_cache=cache)
-                                t0 = time.time()
-                                rs2.load_span(n_lo, n_hi)
-                                dt = time.time() - t0
-                                if dt > 2:
-                                    print(f"[stream] prefetched {Path(sf).name} rg{n_rgi} ({(n_hi-n_lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
-                                # hand the bytes back so the main thread can
-                                # adopt them instead of fetching the same span
-                                return rs2._span[1] if rs2._span else None
-
-                            next_fut = prefetch.submit(_bg)
-
+                    # Resume skip: a row group whose rows are ALL before
+                    # start_pos is never fetched. The old code fetched every
+                    # group and then threw the rows away, which cost the
+                    # 4,000-step probe 22.7 minutes before its first step.
+                    if span_is_skippable(emitted, rows_in_span(want[rgi]), self.start_pos):
+                        emitted += rows_in_span(want[rgi])
+                        continue
                     lo, hi = rg_span(md, rgi)
-                    # If a prefetch for THIS row group is still in flight, wait
-                    # for it and adopt its bytes. Racing it would re-download
-                    # the identical span on the main thread, which is how the
-                    # slowest groups were being fetched twice.
                     t0 = time.time()
-                    _adopted = drain_row_group_prefetch(next_fut)
-                    if _adopted is not None and isinstance(_adopted, bytes) and len(_adopted) == hi - lo:
-                        rs._span = (lo, _adopted)
-                        dt = time.time() - t0
-                        print(f"[stream] adopted prefetched {Path(sf).name} rg{rgi} "
-                              f"({(hi-lo)/2**20:.0f}MiB, waited {dt:.0f}s)", flush=True)
+                    # 1) adopt the bytes prefetched for THIS group (identity, not length)
+                    _adopted = None
+                    if pending is not None and pending[0] == lo and pending[1] == hi:
+                        _adopted = drain_row_group_prefetch(pending[2])
+                        if _adopted is not None and isinstance(_adopted, bytes) \
+                                and len(_adopted) == hi - lo:
+                            rs._span = (lo, _adopted)
+                            dt = time.time() - t0
+                            print(f"[stream] adopted prefetched {Path(sf).name} rg{rgi} "
+                                  f"({(hi-lo)/2**20:.0f}MiB, waited {dt:.0f}s)", flush=True)
+                        else:
+                            rs.load_span(lo, hi)
+                            dt = time.time() - t0
+                            if dt > 2:
+                                print(f"[stream] streamed {Path(sf).name} rg{rgi} "
+                                      f"({(hi-lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
                     else:
                         rs.load_span(lo, hi)
                         dt = time.time() - t0
                         if dt > 2:
-                            print(f"[stream] streamed {Path(sf).name} rg{rgi} ({(hi-lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
-                    next_fut = None
+                            print(f"[stream] streamed {Path(sf).name} rg{rgi} "
+                                  f"({(hi-lo)/2**20:.0f}MiB in {dt:.0f}s)", flush=True)
+                    # 2) start the NEXT group's fetch now, so it overlaps this group's training
+                    pending = (_start_prefetch(rgis[idx + 1]) if (prefetch is not None
+                              and idx + 1 < len(rgis)) else None)
 
                     tbl = pf.read_row_group(rgi, columns=["key", "n_vis", "vis_bytes"])
                     try:
@@ -893,19 +988,17 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                     finally:
                         del tbl
                         rs._span = None
-
-                    # Drain prefetch before next iteration so errors surface
-                    if next_fut is not None and next_fut.done():
-                        next_fut.result()
-                        next_fut = None
             finally:
                 if prefetch is not None:
-                    # Cancel outstanding prefetch (best-effort)
-                    if next_fut is not None:
-                        next_fut.cancel()
+                    # Cancel the outstanding prefetch (best-effort)
+                    if pending is not None:
+                        try:
+                            pending[2].cancel()  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
                     prefetch.shutdown(wait=False, cancel_futures=True)
                 rs._span = None  # type: ignore[assignment]
-            _enforce_lru_cache(self.rg_cache_dir, max_shards=4)
+            _enforce_lru_cache(self.rg_cache_dir)
             if next_shard_fut is not None and next_shard_fut.done():
                 try:
                     next_shard_fut.result()
