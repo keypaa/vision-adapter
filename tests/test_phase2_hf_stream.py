@@ -117,3 +117,30 @@ def test_rg_cache_budget_has_a_floor_and_a_ceiling(tmp_path, monkeypatch):
     monkeypatch.setattr(shutil, "disk_usage",
                         lambda p: shutil._ntuple_diskusage(1, 1, 10**9))
     assert stream._rg_cache_budget(str(tmp_path)) == stream.RG_CACHE_MIN_BYTES
+
+
+def test_shard_cache_budget_is_a_byte_budget(tmp_path, monkeypatch):
+    """The whole-shard cache is 0.4-60 GB per file: the budget must be bytes."""
+    import shutil
+
+    from vision_adapter.data import stream
+
+    monkeypatch.setattr(shutil, "disk_usage",
+                        lambda p: shutil._ntuple_diskusage(100, 100, 100 * 2**30))
+    b = stream._shard_cache_budget_bytes(str(tmp_path))
+    assert b == int(50 * 2**30), b
+
+
+def test_lru_evicts_by_bytes_not_by_count(tmp_path, monkeypatch):
+    """Four shards must not survive a byte budget that cannot hold them."""
+    from vision_adapter.data import stream
+
+    d = tmp_path / "data"
+    d.mkdir()
+    for i in range(4):
+        (d / f"emb_{i:04d}.parquet").write_bytes(b"x" * 1024)
+    # a 2 KiB budget -> only the newest shard survives
+    monkeypatch.setattr(stream, "_shard_cache_budget_bytes", lambda p: 1024)
+    stream._enforce_lru_cache(str(tmp_path))
+    left = sorted(p.name for p in d.glob("emb_*.parquet"))
+    assert left == ["emb_0003.parquet"], left

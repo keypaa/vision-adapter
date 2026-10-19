@@ -345,6 +345,20 @@ def _download_shard_hf_transfer(shard: str, cache_dir: str | None = None, token:
         cached = _shard_cache_path(cache_dir, shard)
         if cached:
             return cached
+        # Refuse a download that cannot fit: the shards are 0.4-60 GB and the
+        # disk budget is half the free space. A shard that does not fit is
+        # served by the Range path instead of filling the disk.
+        try:
+            size = _remote_size(f"https://huggingface.co/datasets/{EMB_REPO}/resolve/main/{shard}")
+            budget = _shard_cache_budget_bytes(cache_dir)
+            cached_bytes = sum(os.path.getsize(p) for p in _cached_shard_files(cache_dir))
+            if size > budget - cached_bytes:
+                print(f"[stream] shard {shard} is {size/2**30:.1f}GiB and the cache budget "
+                      f"is {budget/2**30:.1f}GiB (free {cached_bytes/2**30:.1f}GiB used) — "
+                      f"skipping the whole-shard download, using Range", flush=True)
+                return None
+        except Exception:
+            pass
     try:
         from huggingface_hub import hf_hub_download  # type: ignore[import]
 
@@ -405,28 +419,55 @@ def _cached_shard_files(cache_dir: str) -> list[str]:
     return out
 
 
-def _enforce_lru_cache(cache_dir: str | None, max_shards: int | None = None) -> None:
-    """LRU eviction for the whole-shard cache, sized by free disk not by host.
+SHARD_CACHE_FREE_FRACTION = 0.5   # the whole-shard cache may use half the disk
 
-    Holds at most ``max_shards`` shards (or as many as fit in the disk
-    budget). A fixed shard count is wrong on either extreme: 4 shards is
-    12-256 GB depending on which ones landed, and 4x64GB overflows a 100 GB
-    disk. Size it from `shutil.disk_usage` instead, and keep a
-    caller-supplied ``max_shards`` as the ceiling when given.
+
+def _shard_cache_budget_bytes(cache_dir: str) -> int:
+    """How many bytes the whole-shard cache may hold on this host.
+
+    A byte budget, not a shard count: the shards are 0.4-60 GB, so any fixed
+    count is either a disk-fill hazard or a thrash. Half the free disk, so
+    there is room for the row-group cache and the run's own output.
+    """
+    try:
+        import shutil
+
+        free = shutil.disk_usage(cache_dir).free
+        return max(1 * 2**30, int(free * SHARD_CACHE_FREE_FRACTION))
+    except Exception:
+        return 1 * 2**30
+
+
+def _enforce_lru_cache(cache_dir: str | None, max_shards: int | None = None) -> None:
+    """Evict whole-shard cache files (oldest first) until the byte budget holds.
+
+    The whole-shard path is open on every host now, so the cache is a real
+    disk consumer: 0.4-60 GB per shard. The budget is derived from the free
+    disk; ``max_shards`` (when given) is an additional ceiling.
     """
     if not cache_dir or not os.path.isdir(cache_dir):
         return
-    limit = _shard_lru_limit(cache_dir, max_shards)
     try:
         shards = _cached_shard_files(cache_dir)
-        if len(shards) <= limit:
+        if not shards:
             return
-        shards.sort(key=lambda p: os.path.getmtime(p))
-        for old in shards[: len(shards) - limit]:
+        budget = _shard_cache_budget_bytes(cache_dir)
+        if max_shards is not None:
             try:
+                biggest = max((os.path.getsize(p) for p in shards), default=0)
+                budget = min(budget, int(max_shards) * biggest)
+            except (TypeError, ValueError):
+                pass
+        shards.sort(key=lambda p: os.path.getmtime(p))
+        total = sum(os.path.getsize(p) for p in shards)
+        while total > budget and len(shards) > 1:
+            old = shards.pop(0)
+            try:
+                sz = os.path.getsize(old)
                 os.remove(old)
+                total -= sz
                 print(f"[stream] LRU evicted {os.path.basename(old)} "
-                      f"(cache >{limit} shards)", flush=True)
+                      f"({sz/2**20:.0f}MiB, cache budget {budget/2**30:.0f}GiB)", flush=True)
             except Exception:
                 pass
     except Exception:
