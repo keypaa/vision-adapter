@@ -4,6 +4,10 @@ Single source of truth for what remains after the Qwen3.5-2B probe.
 Includes the surviving recommendations of both fresh-eyes reviews
 (adaptive-ckpt reviewer = R1, FlexAttention researcher = R2).
 
+**Data path / corpus work is planned in `docs/DATA_PATH_REBUILD.md`** (measured
+evidence, the visual-token-budget root cause, and the prioritized W1–W23 list).
+Read it before scheduling anything that touches the corpus or the loader.
+
 ## 0. Where we stand (done)
 
 - [x] Bucketed HF streaming, volume deleted, repack 103/103 verified
