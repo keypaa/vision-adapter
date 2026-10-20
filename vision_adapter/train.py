@@ -185,6 +185,22 @@ def _resolve_resume(ckpt_plan: dict, cli_max_steps: int | None, cli_seed: int = 
 PLAN_META_KEYS = ("manifest_sha256", "seed", "sample_size", "stream_order_hash",
                    "max_steps", "groups", "lr_schedule")
 
+
+def filter_by_groups(rows, groups) -> list[dict]:
+    """Keep only the manifest rows whose group is in the requested slice.
+
+    One rule for the training rows AND the held-out rows: a val probe that
+    measures rows the run never trains on (the val split is 85% agentic but
+    also carries doc/conv rows) dilutes the very number it is supposed to
+    read -- a slice that grokked can be masked by a slice that never will.
+    """
+    want = [g.strip() for g in (groups or "").split(",") if g.strip()] if isinstance(groups, str) \
+        else [g.strip() for g in (groups or []) if g.strip()]
+    if not want:
+        return list(rows)
+    return [r for r in rows if r.get("g") in want]
+
+
 def _recipe_mismatch(ckpt_plan: dict) -> str | None:
     """Why this checkpoint cannot be resumed under the current recipe.
 
@@ -1181,7 +1197,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     _groups = [g.strip() for g in (getattr(cfg, "groups", "") or "").split(",") if g.strip()]
     if _groups:
         _before = len(rows)
-        rows = [r for r in rows if r.get("g") in _groups]
+        rows = filter_by_groups(rows, _groups)
         _gset = sorted({r.get("g") for r in rows})
         print(f"[train] slice filter: groups={_groups} -> {len(rows)}/{_before} rows "
               f"(groups present: {_gset})", flush=True)
@@ -1318,6 +1334,11 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         except Exception as e:  # noqa: BLE001
             print(f"[train][WARN] val manifest unavailable ({e}) — val probe OFF", flush=True)
         if _val_rows:
+            if _groups:
+                _before_val = len(_val_rows)
+                _val_rows = filter_by_groups(_val_rows, _groups)
+                print(f"[train] val slice filter: groups={_groups} -> "
+                      f"{len(_val_rows)}/{_before_val} rows", flush=True)
             val_order, val_plan, _n_val, _val_local = build_val_plan(
                 val_rows=_val_rows,
                 index=index,
