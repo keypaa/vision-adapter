@@ -182,7 +182,8 @@ def _resolve_resume(ckpt_plan: dict, cli_max_steps: int | None, cli_seed: int = 
             "start_pos_rows": int(ckpt_plan.get("step", 0)) * int(ckpt_plan.get("batch_size", 16))}
 
 
-PLAN_META_KEYS = ("manifest_sha256", "seed", "sample_size", "stream_order_hash", "max_steps")
+PLAN_META_KEYS = ("manifest_sha256", "seed", "sample_size", "stream_order_hash",
+                   "max_steps", "groups", "lr_schedule")
 
 def _recipe_mismatch(ckpt_plan: dict) -> str | None:
     """Why this checkpoint cannot be resumed under the current recipe.
@@ -1170,6 +1171,23 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             _persist_fetched_manifest(data_dir, rows)
         except Exception as e:  # noqa: BLE001 — persistence is best-effort, training must not die here
             print(f"[train] manifest persist failed ({e}) — continuing with in-memory rows", flush=True)
+    # Optional slice filter: keep only the requested manifest groups.
+    #
+    # The reference recipe's regime is the agentic slice (every row <= 380
+    # visual tokens, i.e. the reference's 300k-pixel budget), and the doc slice
+    # is 79.7% over it (median 925, max 16,598) -- so a probe on "everything"
+    # is not a probe on the recipe (docs/REFERENCE_RECIPE.md, D6). The slice is
+    # recorded in the plan metadata, so a resume cannot silently change it.
+    _groups = [g.strip() for g in (getattr(cfg, "groups", "") or "").split(",") if g.strip()]
+    if _groups:
+        _before = len(rows)
+        rows = [r for r in rows if r.get("g") in _groups]
+        _gset = sorted({r.get("g") for r in rows})
+        print(f"[train] slice filter: groups={_groups} -> {len(rows)}/{_before} rows "
+              f"(groups present: {_gset})", flush=True)
+        if not rows:
+            print(f"[train][FATAL] no rows left after the group filter {_groups}", flush=True)
+            return 1
     # Device / dtype (mirror grok logic: bf16 Ampere+, else fp32/fp16 via autocast; --dtype overrides)
     dev = device if device in ("cuda","cpu") and (device!="cuda" or _torch.cuda.is_available()) else "cpu"
     if dev == "cuda":
@@ -1446,6 +1464,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 "max_steps": steps,
                 "stream_version": _STREAM_VERSION,
                 "collate_version": _COLLATE_VERSION,
+                "groups": getattr(cfg, "groups", "") or "",
+                "lr_schedule": getattr(cfg, "lr_schedule", "cosine"),
             }
             _diffs = _diff_plan_meta(_cur_meta, _ckpt_plan)
             if _diffs:
@@ -1582,6 +1602,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                         "manifest_sha256": _mhash(local_manifest),
                         "seed": 0,
                         "sample_size": sample_size,
+                        "groups": getattr(cfg, "groups", "") or "",
+                        "lr_schedule": getattr(cfg, "lr_schedule", "cosine"),
                         "batch_size": cfg.batch_size,
                         "stream_order_hash": _order_hash,
                         "max_steps": steps,

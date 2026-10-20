@@ -137,6 +137,8 @@ class TrainConfig:
     max_seq_len: int = 4096
     epochs: int = 2
     batch_size: int = 8
+    groups: str = ""               # comma-separated manifest groups to train on
+                                   # (e.g. "agentic"); empty = all
 
     # --- telemetry / grok window (Baseten 900*64 = 57.6k) ---
     samples_per_baseten_grok: int = 900 * 64

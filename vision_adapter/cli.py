@@ -122,6 +122,9 @@ def _apply_cfg_overrides(cfg, args: argparse.Namespace):
     if getattr(args, "warmup_steps", None) is not None:
         cfg = cfg.replace(warmup_steps=args.warmup_steps)
         print(f"[train] override warmup_steps={cfg.warmup_steps}", flush=True)
+    if getattr(args, "groups", None) is not None:
+        cfg = cfg.replace(groups=args.groups)
+        print(f"[train] override groups={cfg.groups!r}", flush=True)
     return cfg
 
 
@@ -310,6 +313,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lr", type=float, default=None, help="override the learning rate")
     p.add_argument("--warmup-steps", type=int, default=None,
                    help="override the warmup steps (0 = the reference's no-warmup)")
+    p.add_argument("--groups", default=None,
+                   help="comma-separated manifest groups to train on, e.g. 'agentic'. "
+                        "Empty (default) = all groups. The agentic slice is the "
+                        "reference's regime (every row <= 380 visual tokens); the doc "
+                        "slice is 79.7%% of rows over it")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32 with true AMP; T4: use bf16 or fp32")
     p.add_argument("--push-to-hf", dest="push_to_hf", action="store_true", help="push ckpts + log to HF model repo on save (needs --hf-ckpt-repo + write token)")
