@@ -130,6 +130,7 @@ class TrainConfig:
     # --- optimisation ---
     lr: float = 5e-4
     warmup_steps: int = 100
+    lr_schedule: str = "cosine"        # "cosine" | "constant" (the reference recipe)
     grad_clip: float = 1.0
 
     # --- data / sequence ---
@@ -161,6 +162,9 @@ class TrainConfig:
             raise ValueError(f"lr must be in (0,1], got {self.lr}")
         if self.warmup_steps < 0:
             raise ValueError(f"warmup_steps must be >=0, got {self.warmup_steps}")
+        if self.lr_schedule not in ("cosine", "constant"):
+            raise ValueError(
+                f"lr_schedule must be 'cosine' or 'constant', got {self.lr_schedule!r}")
         if self.grad_clip <= 0:
             raise ValueError(f"grad_clip must be >0, got {self.grad_clip}")
         if self.max_seq_len <= 0:

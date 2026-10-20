@@ -113,6 +113,15 @@ def _apply_cfg_overrides(cfg, args: argparse.Namespace):
     if getattr(args, "save_every", None) is not None:
         cfg = cfg.replace(save_every=args.save_every)
         print(f"[train] override save_every={cfg.save_every} steps", flush=True)
+    if getattr(args, "lr_schedule", None) is not None:
+        cfg = cfg.replace(lr_schedule=args.lr_schedule)
+        print(f"[train] override lr_schedule={cfg.lr_schedule}", flush=True)
+    if getattr(args, "lr", None) is not None:
+        cfg = cfg.replace(lr=args.lr)
+        print(f"[train] override lr={cfg.lr}", flush=True)
+    if getattr(args, "warmup_steps", None) is not None:
+        cfg = cfg.replace(warmup_steps=args.warmup_steps)
+        print(f"[train] override warmup_steps={cfg.warmup_steps}", flush=True)
     return cfg
 
 
@@ -293,6 +302,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="train on the synthetic geometry stand-in (inverts orientation "
                         "on ~18%% of rows) as a deliberate A/B baseline")
     p.add_argument("--batch-size", type=int, default=None, help="override batch size (e.g. 48 for PRO 6000 ckpt OFF)")
+    p.add_argument("--lr-schedule", choices=("cosine", "constant"), default=None,
+                   help="'constant' holds the peak LR for the whole run -- the "
+                        "reference recipe (Harry Partridge / 0xSero) used a "
+                        "constant 5e-4, and our cosine decay had fallen to 0.11x "
+                        "peak by the sample count where the reference grokked")
+    p.add_argument("--lr", type=float, default=None, help="override the learning rate")
+    p.add_argument("--warmup-steps", type=int, default=None,
+                   help="override the warmup steps (0 = the reference's no-warmup)")
     p.add_argument("--hf-token", default=None, help="HF token (or HF_TOKEN env) — higher rate limits for streaming")
     p.add_argument("--dtype", choices=("auto","bf16","fp16","fp32"), default="auto", help="'auto' = bf16 Ampere+ else fp16/fp32 with true AMP; T4: use bf16 or fp32")
     p.add_argument("--push-to-hf", dest="push_to_hf", action="store_true", help="push ckpts + log to HF model repo on save (needs --hf-ckpt-repo + write token)")

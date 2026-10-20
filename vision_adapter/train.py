@@ -1470,7 +1470,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         _step_iter = range(start_step, steps + 1) if steps is not None else itertools.count(start_step)
         for step in _step_iter:
             for g in opt.param_groups:
-                g["lr"] = lr_at(step, lr_horizon, cfg.lr, cfg.warmup_steps)
+                g["lr"] = lr_at(step, lr_horizon, cfg.lr, cfg.warmup_steps,
+                                getattr(cfg, "lr_schedule", "cosine"))
             _wt = time.time()
             batch = next(it)
             wait_ms = (time.time() - _wt) * 1000.0

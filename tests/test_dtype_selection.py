@@ -56,3 +56,33 @@ def test_both_training_paths_share_the_one_selection():
     ).read_text()
     # exactly one dtype_map literal should remain, in the shared helper
     assert src.count('"fp16": _torch.float16') + src.count('"fp16": torch.float16') == 1
+
+
+def test_constant_schedule_holds_the_peak():
+    """The reference recipe: a constant 5e-4 (no scheduler, no warmup)."""
+    from vision_adapter.core import lr_at
+
+    assert lr_at(1, 4000, 5e-4, 0, schedule="constant") == 5e-4
+    assert lr_at(900, 4000, 5e-4, 0, schedule="constant") == 5e-4
+    assert lr_at(4000, 4000, 5e-4, 0, schedule="constant") == 5e-4
+    # with a warmup it still ramps first
+    assert lr_at(1, 4000, 5e-4, 25, schedule="constant") < 5e-4
+    assert lr_at(26, 4000, 5e-4, 25, schedule="constant") == 5e-4
+
+
+def test_cosine_schedule_still_decays():
+    from vision_adapter.core import lr_at
+
+    assert lr_at(1, 4000, 5e-4, 100) < 5e-4          # warmup
+    assert lr_at(100, 4000, 5e-4, 100) == 5e-4       # peak
+    assert lr_at(3600, 4000, 5e-4, 100) < 0.2 * 5e-4  # decayed to ~10%
+
+
+def test_the_config_validates_the_schedule():
+    import pytest
+
+    from vision_adapter.config import TrainConfig
+
+    assert TrainConfig(lr_schedule="constant").lr_schedule == "constant"
+    with pytest.raises(ValueError):
+        TrainConfig(lr_schedule="linear")

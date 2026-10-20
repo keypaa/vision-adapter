@@ -572,10 +572,23 @@ class visual_inject:
 # lr_at — linear warmup then cosine decay to 10%
 # ---------------------------------------------------------------------------
 
-def lr_at(step: int, max_steps: int, base_lr: float = 5e-4, warmup: int = 100) -> float:
-    """Linear warmup then cosine decay to 10% of peak."""
+def lr_at(step: int, max_steps: int, base_lr: float = 5e-4, warmup: int = 100,
+          schedule: str = "cosine") -> float:
+    """The LR schedule.
+
+    "cosine" (default): linear warmup then cosine decay to 10% of peak.
+    "constant": warmup, then hold at the peak for the whole run.
+
+    The reference recipe (Harry Partridge's "GLM 5.2 With Vision"; 0xSero's
+    reproduction) used a CONSTANT 5e-4: `AdamW(lr=5e-4)` with no scheduler
+    and no warmup, for 2 epochs. Our 4,000-step probe decayed to 0.11x peak by
+    the sample count where the reference grokked, so a decaying LR is a
+    candidate cause of the missing collapse.
+    """
     if step <= warmup:
-        return base_lr * max(1, step) / warmup
+        return base_lr * max(1, step) / max(1, warmup)
+    if schedule == "constant":
+        return base_lr
     t = min(1.0, (step - warmup) / max(1, max_steps - warmup))
     return base_lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * t)))
 
