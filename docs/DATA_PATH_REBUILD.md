@@ -454,10 +454,65 @@ Cost units: **S** ≤ half a day · **M** 1–3 days · **L** > 3 days (or GPU-h
 
 ---
 
+## 4b. The corpus rebuild pipeline — BUILT (2026-10-20)
+
+Two new pieces, ready to run on the GPU box. The point of the blob format is
+that a **row** is the unit of transfer (2.9 MiB at the 383-token cap) and its
+offset is a prefix sum, so the index is `n_vis` per row (2.7 KB per 1,360-row
+shard) and **"1% of the corpus" costs 1% of the bytes and 1% of the time** —
+which the parquet row-group path could not do (3.19× overfetch, M7).
+
+### `scripts/rebuild_corpus.py` — the writer
+
+```bash
+# 1. see what the cap does (no GPU, no writes):
+python scripts/rebuild_corpus.py --dry-run --shards 13 --limit 40
+# 2. build and publish (GPU box):
+python scripts/rebuild_corpus.py --out-repo keypa/vision-adapter-embeddings-v2 \
+    --out-dir ./corpus_out --device cuda
+# 3. a denser budget for the doc/OCR slice (D6):
+python scripts/rebuild_corpus.py --max-pixels 800000 --out-repo .../embeddings-v2-doc
+```
+
+- **The cap is the reference's rule**, applied in `cap_image()`: scale to
+  `--max-pixels` (default 300,000) and **floor the dimensions to a multiple of
+  28**. Our own `navit_resize` pads *up* instead, which measured 411–425 merged
+  tokens where the reference's rule gives ≤382 — the dry run caught that.
+  Measured on the real images repo (shard 13, the cauldron rows):
+  **300k px → n_vis median 364, max 378** (the reference's regime);
+  **800k px → median 936, max 1,056** (the dense doc budget).
+- The decode/resize (CPU) overlaps the ViT forward (GPU) through a bounded
+  queue; shards are written atomically and **uploaded as they are produced**,
+  so the disk holds one shard and **no volume is needed**.
+- It also emits the **new geometry**: `rows.parquet` carries
+  `key → (shard, row, n_vis, grid_thw)`, replacing both the key index and the
+  grid sidecar (the old sidecar describes the old, uncapped images).
+
+### `vision_adapter/data/blob_corpus.py` — the reader
+
+- `BlobCorpus.open(root)`: a local dir **or** an HF repo; identical bytes.
+- `read_range(shard, offset, length)`: one Range request (or a seek+read) —
+  the loader asks for the bytes of the rows it is about to serve, not the shard.
+- `build_row_plan(corpus, keys, sample_size, seed)`: a **row-granular** plan
+  (the parquet plan is shard-granular, so a small run still paid for whole
+  shards) — this is W11b.
+- `BlobStreamDataset`: serves the plan with one coalesced range per group.
+
+**Still to do (the last mile):** the trainer is not wired to the blob corpus
+yet — it still builds its plan from the parquet key index and reads parquet
+shards. That switch is one flag (`--corpus keypa/vision-adapter-embeddings-v2`)
+plus the plan source, and it must bump `STREAM_VERSION` again (the served row
+stream changes shape). It is deliberately *not* done before the probe decides
+whether the rebuild is needed at all.
+
+---
+
 ## 5. Explicitly not doing
 
 - **Not** the corpus rebuild *yet*: it is conditional on W17a's outcome (§2.3).
   The cap is a hypothesis; the collate bug and the unserved 39% are facts.
+  (The *pipeline* is built — §4b — so the decision only costs GPU-hours, not
+  engineering time.)
 - **Not** a corpus-wide byte-capped-parquet rewrite (the earlier idea): it needs
   key-index v4, breaks the `row → row_group` invariant, and does *not* reduce
   relative overfetch (density is row-group-size independent). The payload fix
