@@ -208,3 +208,17 @@ def test_daemon_task_satisfies_the_drain_contract():
     boom = _DaemonTask(lambda: 1 / 0)
     assert drain_row_group_prefetch(boom) is None      # errors are swallowed
     assert boom.done()
+
+
+def test_the_current_recipe_versions_are_v3():
+    """Both versions moved (the interleaving, the answer cap and the
+    row-aligned crop), so the guard refuses every earlier recipe."""
+    from vision_adapter.data.stream import STREAM_VERSION
+    from vision_adapter.train import _recipe_mismatch
+
+    assert STREAM_VERSION == 3
+    assert COLLATE_VERSION == 3
+    assert _recipe_mismatch({"stream_version": 2, "collate_version": 3}) is not None
+    assert _recipe_mismatch({"stream_version": 3, "collate_version": 2}) is not None
+    assert _recipe_mismatch({"stream_version": STREAM_VERSION,
+                             "collate_version": COLLATE_VERSION}) is None

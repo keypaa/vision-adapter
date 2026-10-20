@@ -35,10 +35,15 @@ MANIFEST_REPO = "keypa/vision-adapter-manifests"
 MANIFEST_FILE = "train_manifest_grids.jsonl"
 # Shape of the row stream the loader serves, recorded in every checkpoint.
 #   v1 = one row per image position (the manifest's extra questions were dropped)
-#   v2 = every plan row is served (the questions of an image are interleaved)
+#   v2 = every plan row is served, but the questions of one image were
+#        CONSECUTIVE (up to 54 in one batch, and the batch loss is a
+#        token-mean, so one image could dominate the gradient)
+#   v3 = every plan row is served and the questions of one image are
+#        INTERLEAVED across the row group -- the row at a given offset
+#        changed, so a v2 checkpoint must not resume under v3
 # A resume across versions is refused: the row at a given offset is a different
 # row, so the "data continues where it left off" contract would be broken.
-STREAM_VERSION = 2
+STREAM_VERSION = 3
 KEY_INDEX_CACHE = "key_index_cache.json"
 
 # Vision dim is fixed by MoonViT 2x2 merge flatten — matches config TrainConfig.vision_dim
