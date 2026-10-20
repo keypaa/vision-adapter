@@ -507,6 +507,84 @@ whether the rebuild is needed at all.
 
 ---
 
+## 4c. THE PROBE RUNBOOK (probe #1: "does the recipe grok?")
+
+**What it tests:** the reference recipe, on the slice that is already in the
+reference's geometry regime, with the defects fixed. Not the corpus size.
+
+| | reference | this run |
+|---|---|---|
+| slice | art + UI (66k images) | **agentic only** (51,834 rows, every row ≤ 380 tokens = the reference's 300k-px budget) |
+| batch | 64 | 16 (4× smaller; the sample count is what matters) |
+| LR | **5e-4 constant** | 5e-4 constant (`--lr-schedule constant`), 25-step warmup |
+| answers | short | filtered: the 645 long/HTML answers are dropped |
+| geometry | — | **measured** (`grid_thw` from the grids manifest) — the old probe used the synthetic grid (37% distorted, 17% transposed) |
+| questions | 1 per image | **all of them** (the old loader served 61%) |
+
+**Expected event:** the reference collapsed at 57,600 samples (87% of its epoch).
+Our agentic epoch is 51,834 samples → epoch-relative ≈ step 2,818;
+sample-relative ≈ step 3,600. A 4,000-step run (64,000 samples = 1.23 epochs)
+covers both.
+
+```bash
+cd /marimo/vision-adapter && git pull
+
+# 1. the filtered manifest (drops the 645 long/HTML answers; keeps grid_thw)
+python scripts/filter_manifest.py --manifest data/train_manifest_grids.jsonl \
+    --out data/train_manifest_filtered.jsonl --max-answer-words 20 --fetch
+
+# 2. the probe
+export HF_TOKEN=... VISION_ADAPTER_PUSH_HF=1
+export VISION_ADAPTER_HF_CKPT_REPO=keypa/vision-adapter-probe-checkpoints
+export VISION_ADAPTER_CKPT_TAG=p05          # keep the old artifacts intact
+python -m vision_adapter train --data-dir ./data --config probe \
+    --max-steps 4000 --groups agentic --lr-schedule constant --lr 5e-4 \
+    --warmup-steps 25 --dtype auto \
+    --push-to-hf --hf-ckpt-repo keypa/vision-adapter-probe-checkpoints
+```
+
+### Host: Molab (interactive) vs Modal
+
+| | Molab | Modal |
+|---|---|---|
+| the rules | "notebooks for **non-interactive jobs**" may be terminated; no SSH | batch platform, designed for this |
+| how to run it | **a foreground cell you watch** (not `nohup ... &`) | a normal background job |
+| data to pull | 133 GiB of agentic rows (246 GiB of shards) | same |
+| disk | interactive sessions have room for a cache | the container disk decides the path |
+
+**The disk decides the transport, automatically:** the whole-shard path stores
+shards on disk (246 GiB) and is **refused** when they do not fit the byte
+budget (the loader then falls back to Range); the Range path keeps only the
+fetched row groups in `rg_cache` (bounded, 12–64 GiB, evicted) → it needs far
+less disk. So a small-disk host transparently gets the slower-but-tiny Range
+path, and a big-disk host gets the fast whole-shard path.
+
+**Disk arithmetic to check before launching:** the Range path needs
+`rg_cache` ≤ 64 GiB; the whole-shard path needs 246 GiB of shard cache. On
+Modal, if the container disk is smaller than a shard, the loader will say
+"shard X is N GiB and the cache budget is M GiB — skipping the whole-shard
+download, using Range" and carry on.
+
+### After the run
+
+```bash
+python scripts/analyze_probe.py --log data/probe_log.jsonl --out probe_p05.md
+```
+
+The three numbers that decide the next step:
+1. **the grok test** — the sustained EMA criterion (a drop in the *level*, not a
+   single-window move: the reference's own 0.5-nat threshold fires 271× on our
+   per-step log, so it measures noise here);
+2. **`g_mix` per step** — which slice learns (the old log had no mix);
+3. **`Σ wait_ms / Σ step_ms`** — the data path's share (the old run: 29%).
+
+If a collapse appears → the recipe is confirmed and the doc slice becomes a
+per-slice-budget + tiling question. If the loss only memorises (train loss → 0)
+without generalising → too little data diversity (51,834 images vs the
+reference's 66,240) → bring in the doc slice after the per-slice re-embed.
+
+---
+
 ## 5. Explicitly not doing
 
 - **Not** the corpus rebuild *yet*: it is conditional on W17a's outcome (§2.3).
