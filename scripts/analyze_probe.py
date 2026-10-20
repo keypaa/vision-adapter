@@ -156,6 +156,50 @@ def slice_section(tr, p) -> None:
     p("  (a negative trend = the slice is learning)")
 
 
+def grok_section(tr, p) -> None:
+    """Is there a GROK COLLAPSE?
+
+    The reference (Harry Partridge, "GLM 5.2 With Vision"; 0xSero's
+    reproduction) describes a long plateau and then a sharp, SUSTAINED drop at
+    ~step 900 (batch 64, 57,600 samples). 0xSero's detector is a >0.5-nat
+    drop between consecutive log intervals, but that is calibrated on a
+    10-step-averaged, homogeneous-batch log: on a per-step log of a
+    heterogeneous batch it fires on noise. So we report BOTH:
+      * the reference's naive threshold (for comparison -- it over-fires), and
+      * the sustained criterion (does the EMA level actually break its plateau).
+    """
+    p("\n## grok test")
+    if len(tr) < 50:
+        p("  too few steps")
+        return
+    by_step = {r["step"]: r["loss"] for r in tr}
+    steps = sorted(by_step)
+    drops = [(s + 10, by_step[s] - by_step[s + 10]) for s in steps if s + 10 in by_step]
+    if drops:
+        w = max(drops, key=lambda d: d[1])
+        fires = sum(1 for _, d in drops if d > 0.5)
+        p(f"  reference's naive threshold (>0.5 nats per 10-step window): max {w[1]:+.3f} "
+          f"at step {w[0]}  ->  {'fires' if w[1] > 0.5 else 'no'}"
+          f"  ({fires}/{len(drops)} windows above 0.5 -- it over-fires on a per-step log)")
+    ema = [(r["step"], r.get("ema_loss")) for r in tr if r.get("ema_loss") is not None]
+    if len(ema) < 20:
+        p("  (no ema_loss in this log)")
+        return
+    half = len(ema) // 2
+    first = [v for _, v in ema[:half]]
+    second = [v for _, v in ema[half:]]
+    lo1, hi1 = min(first), max(first)
+    lo2, hi2 = min(second), max(second)
+    p(f"  EMA over the first half : {lo1:.3f}..{hi1:.3f}  (mean {sum(first)/len(first):.3f})")
+    p(f"  EMA over the second half: {lo2:.3f}..{hi2:.3f}  (mean {sum(second)/len(second):.3f})")
+    collapsed = hi2 < lo1 - 0.3
+    p(f"  sustained criterion (the second half sits BELOW the first half's floor): "
+      f"{'COLLAPSE' if collapsed else 'no collapse -- the plateau holds'}")
+    per_step = max(1, int(tr[0].get("samples_seen", 16)) or 16)
+    p(f"    (the reference grokked at 57,600 samples = step {57600 // per_step} at this "
+      f"batch size; this run reached {tr[-1].get('samples_seen', 0):,} samples)")
+
+
 def size_section(tr, p) -> None:
     p("\n## cost by sequence length (L is the padded batch length)")
     gpu = sum(r.get("step_ms", 0.0) for r in tr) / 1000.0
@@ -197,6 +241,7 @@ def main() -> int:
     loss_section(tr, args.window, p)
     slice_section(tr, p)
     size_section(tr, p)
+    grok_section(tr, p)
     _max_len = int((hdr or {}).get("config", {}).get("max_seq_len") or 4096)
     wasted_section(tr, _max_len, p)
     if args.out:
