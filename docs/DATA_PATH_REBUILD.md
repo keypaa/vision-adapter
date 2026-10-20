@@ -484,21 +484,20 @@ the served order (`train.py:1208` at the run's revision `a020e486`).
 
 ## 6b. OPEN DEFECTS (from the round-2 adversarial review, 2026-10-19)
 
-State: **a FRESH probe is safe on this diff; do NOT resume any checkpoint**
-(none of the v2 checkpoints exist — the probe has not been run since the
-recipe changed). Fix these before the next resume or before the hero run.
+**All fixed on 2026-10-20 (commit below).** The list is kept so the reasoning
+survives; each row now says what was done.
 
-| # | defect | severity | smallest fix |
+| # | defect | severity | status |
 |---|---|---|---|
-| O1 | `STREAM_VERSION` was not bumped for the question-interleaving: the row at a given offset changed, but a v2 checkpoint would resume onto the new order with the guard silent | silent wrong results | bump `STREAM_VERSION` to 3 |
-| O2 | `MAX_ANSWER_TOKENS` 256 → 1024 changed the labels without a `COLLATE_VERSION` bump | silent wrong results | bump `COLLATE_VERSION` to 3 (or revert the cap) |
-| O3 | `crop_to_grid` omits `t` from the total and assumes even dims: a `t>1` or odd-dim grid would raise the mismatch ValueError (the original showstopper, latent for today's corpus) | crash (latent) | `total = t*llm_h*llm_w`; crop t-frames; reject odd dims |
-| O4 | a crop MASKS a grid/n_vis mismatch: a wrong measured grid on a cropped row no longer raises | silent wrong positions | validate `placeholder_count(grid) == nv` BEFORE cropping, then crop |
-| O5 | a cropped row can lose the image entirely (`n_vis = 0` when `llm_w > budget`), and up to `llm_w-1` tokens of budget are wasted (≈25% of a wide image) | silent wrong results | crop columns too: `rows = max(1, budget//llm_w)`, `cols = budget//rows` |
-| O6 | the whole-shard LRU never evicts the LAST file (`len(shards) > 1`), and a failed `HEAD` skips the size check → an unbounded download | disk fill | evict down to zero; treat a failed HEAD as "refuse" |
-| O7 | `train.py`'s first-shard prefetch still uses a `ThreadPoolExecutor` → its atexit hook joins the worker, so an in-flight 60 GB download hangs the process at exit | hang | use `_DaemonTask` there too |
-| O8 | `_shard_lru_limit` / `_biggest_cached_shard` are dead code | cosmetic | delete |
-| O9 | `analyze_probe.py`: "wall (ts span)" excludes startup and the final save; the "other" bucket silently contains the val probes; the `L > 4096` threshold is hardcoded | reporting | label them; take max_seq_len from the header |
+| O1 | `STREAM_VERSION` was not bumped for the question-interleaving: the row at a given offset changed, but a v2 checkpoint would resume onto the new order with the guard silent | silent wrong results | **fixed: `STREAM_VERSION = 3`** |
+| O2 | `MAX_ANSWER_TOKENS` 256 → 1024 changed the labels without a `COLLATE_VERSION` bump | silent wrong results | **fixed: `COLLATE_VERSION = 3`** (also covers the row-aligned crop) |
+| O3 | `crop_to_grid` omitted `t` and assumed even dims: a `t>1` or odd-dim grid would raise the mismatch ValueError | crash (latent) | **fixed**: `t` is handled (whole frames), odd dims raise loudly, and `grid_token_count()` pins the grids the position code can actually express |
+| O4 | a crop MASKS a grid/n_vis mismatch: a wrong measured grid on a cropped row no longer raised | silent wrong positions | **fixed**: the collate validates the grid against the row's token count BEFORE any crop, and also checks that the grid is positionable at all |
+| O5 | a cropped row could lose the image entirely, and up to `llm_w-1` tokens of budget were wasted | silent wrong results | **fixed in the only way the geometry allows**: the crop is whole rows, so the leftover budget (< one row) is unused; a row too wide to crop keeps no visual tokens (documented; does not occur in the corpus) |
+| O6 | the whole-shard LRU never evicted the LAST file, and a failed `HEAD` skipped the size check | disk fill | **fixed**: eviction goes down to zero, and a failed HEAD refuses the download (the Range path does not need the size) |
+| O7 | `train.py`'s first-shard prefetch used a `ThreadPoolExecutor` → its atexit hook joins the worker, so an in-flight 60 GB download hung the process at exit | hang | **fixed**: it uses the daemon task now |
+| O8 | `_shard_lru_limit` / `_biggest_cached_shard` were dead code | cosmetic | **fixed: deleted** |
+| O9 | `analyze_probe.py`: "wall (ts span)" excluded startup and the final save; the "other" bucket silently contained the val probes; the `L > 4096` threshold was hardcoded | reporting | **fixed**: both wall numbers are shown and labelled, and the threshold comes from the run's `max_seq_len` |
 
 ---
 

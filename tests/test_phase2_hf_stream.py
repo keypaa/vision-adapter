@@ -154,3 +154,39 @@ def test_lru_evicts_by_bytes_not_by_count(tmp_path, monkeypatch):
     stream._enforce_lru_cache(str(tmp_path))
     left = sorted(p.name for p in d.glob("emb_*.parquet"))
     assert left == ["emb_0003.parquet"], left
+
+
+def test_lru_evicts_even_the_last_shard(tmp_path, monkeypatch):
+    """One shard over budget must go too: the shards are 0.4-60 GB, so "one
+    more" is not "one more small thing"."""
+    from vision_adapter.data import stream
+
+    d = tmp_path / "data"
+    d.mkdir()
+    p = d / "emb_0000.parquet"
+    p.write_bytes(b"x" * 4096)
+    monkeypatch.setattr(stream, "_shard_cache_budget_bytes", lambda c: 1024)
+    stream._enforce_lru_cache(str(tmp_path))
+    assert not p.exists(), "a shard over budget must be evicted"
+
+
+def test_a_failed_size_check_refuses_the_whole_shard_download(tmp_path, monkeypatch):
+    """If the size is unknown we cannot check the budget, so the download is
+    refused (the Range path does not need the size)."""
+    import vision_adapter.data.stream as stream
+
+    def _boom(url):
+        raise RuntimeError("no HEAD for you")
+
+    called = []
+
+    def _fake_download(*a, **k):
+        called.append(a)
+        raise AssertionError("must not download when the size is unknown")
+
+    monkeypatch.setattr(stream, "_remote_size", _boom)
+    monkeypatch.setattr(stream, "hf_hub_download", _fake_download, raising=False)
+    out = stream._download_shard_hf_transfer("data/emb_0000.parquet",
+                                             cache_dir=str(tmp_path))
+    assert out is None
+    assert not called

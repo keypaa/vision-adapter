@@ -156,10 +156,10 @@ def test_measured_grid_stays_consistent_with_a_cropped_span():
     from vision_adapter.core import placeholder_count, train_position_ids
 
     tok = StubTok()
-    # grid 1x8x2030 patches -> 4x1015 = 4060 merged tokens, over a 64-token budget
-    grid = [1, 8, 2030]
-    n_vis = 4060
-    batch = make_collate(tok, tok.pad_token_id, max_len=64, vision_dim=8)(
+    # grid 1x8x2100 patches -> 4x1050 = 4200 merged tokens, cropped to fit 4096
+    grid = [1, 8, 2100]
+    n_vis = 4200
+    batch = make_collate(tok, tok.pad_token_id, max_len=4096, vision_dim=8)(
         [_grid_item(n_vis, grid)]
     )
     kept = int(batch["n_vis"][0])
@@ -191,5 +191,94 @@ def test_no_measured_grid_is_fine():
         [_item(n_vis=50, user="q", assistant="ans")]
     )
     assert batch["grid_thw"][0] is None
+    pos = train_position_ids(batch, merge_size=2)
+    assert pos.shape[-1] == batch["input_ids"].shape[-1]
+
+
+# ------------------------------------------------------------ O3/O4/O5 ----
+# The grid the position code can actually express, and the crops it can
+# represent without lying about the geometry.
+
+
+def test_grid_token_count_matches_the_placeholder_count():
+    from vision_adapter.core import grid_token_count, placeholder_count
+
+    for grid in ([1, 8, 2030], [1, 28, 28], [1, 4, 8]):
+        assert grid_token_count(grid) == placeholder_count(torch.tensor(grid))
+
+
+def test_multi_frame_grid_crops_in_whole_frames():
+    """t>1: the temporal axis is NOT merged, so the enumeration and the
+    placeholder count agree and a head crop is expressible in whole frames."""
+    from vision_adapter.core import crop_to_grid, grid_token_count, placeholder_count
+
+    grid = [2, 8, 8]                     # 2 frames x 4 x 4 merged cells = 32 tokens
+    assert grid_token_count(grid) == placeholder_count(torch.tensor(grid)) == 32
+    kept, cropped = crop_to_grid(grid, 16)
+    assert kept == 16, (kept, cropped)
+    assert placeholder_count(torch.tensor(cropped)) == kept
+    assert grid_token_count(cropped) == kept
+    assert cropped[0] == 1, cropped
+
+
+def test_odd_dims_are_rejected():
+    import pytest
+
+    from vision_adapter.core import crop_to_grid
+
+    with pytest.raises(ValueError, match="divisible"):
+        crop_to_grid([1, 5, 5], 4)
+
+
+def test_crop_keeps_the_geometry_exact():
+    """The kept tokens must be the FIRST cells of the cropped grid, and the
+    cropped grid's count must equal the kept tokens."""
+    from vision_adapter.core import (crop_to_grid, grid_token_count, placeholder_count,
+                                     vision_position_ids)
+
+    grid = [1, 8, 2100]                     # 4 x 1050 merged cells = 4200 tokens
+    kept, cropped = crop_to_grid(grid, 4052)
+    assert placeholder_count(torch.tensor(cropped)) == kept
+    assert grid_token_count(cropped) == kept
+    # the positions of the cropped grid are the first `kept` of the original
+    full = vision_position_ids(1, torch.tensor(grid), 2)
+    part = vision_position_ids(1, torch.tensor(cropped), 2)
+    assert torch.equal(part, full[:, :kept])
+    # the crop is whole rows: the leftover budget (< one row) is unused
+    assert kept % 1050 == 0
+    assert kept <= 4052
+
+
+def test_a_cropped_row_still_passes_the_position_code():
+    from vision_adapter.core import train_position_ids
+
+    tok = StubTok()
+    grid = [1, 8, 2100]
+    n_vis = 4200
+    batch = make_collate(tok, tok.pad_token_id, max_len=4096, vision_dim=8)(
+        [_grid_item(n_vis, grid)]
+    )
+    kept = int(batch["n_vis"][0])
+    assert 0 < kept < n_vis
+    pos = train_position_ids(batch, merge_size=2)
+    assert pos.shape[-1] == batch["input_ids"].shape[-1]
+
+
+def test_an_image_too_wide_to_crop_keeps_no_visual_tokens():
+    """A row whose image cannot be cropped to even ONE merged row (it is wider
+    than the whole budget) cannot be represented as a rectangle: the row keeps
+    no visual tokens and its text still trains. Needs an image wider than
+    ~4,000 merged columns; it does not occur in the corpus, and it must not
+    crash the run."""
+    from vision_adapter.core import train_position_ids
+
+    tok = StubTok()
+    grid = [1, 8, 4060]            # llm_w = 2030 merged cells
+    n_vis = 4 * 2030
+    batch = make_collate(tok, tok.pad_token_id, max_len=64, vision_dim=8)(
+        [_grid_item(n_vis, grid)]
+    )
+    assert int(batch["n_vis"][0]) == 0
+    assert batch["grid_thw"][0] == [1, 0, 4060]
     pos = train_position_ids(batch, merge_size=2)
     assert pos.shape[-1] == batch["input_ids"].shape[-1]

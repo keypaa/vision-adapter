@@ -353,9 +353,16 @@ def _download_shard_hf_transfer(shard: str, cache_dir: str | None = None, token:
             return cached
         # Refuse a download that cannot fit: the shards are 0.4-60 GB and the
         # disk budget is half the free space. A shard that does not fit is
-        # served by the Range path instead of filling the disk.
+        # served by the Range path instead of filling the disk. A failed HEAD
+        # means the size is unknown, so the download is refused too (the Range
+        # path does not need the size).
         try:
             size = _remote_size(f"https://huggingface.co/datasets/{EMB_REPO}/resolve/main/{shard}")
+        except Exception as e:
+            print(f"[stream] shard {shard}: size unknown ({type(e).__name__}) — skipping the "
+                  f"whole-shard download, using Range", flush=True)
+            return None
+        try:
             budget = _shard_cache_budget_bytes(cache_dir)
             cached_bytes = sum(os.path.getsize(p) for p in _cached_shard_files(cache_dir))
             if size > budget - cached_bytes:
@@ -509,7 +516,10 @@ def _enforce_lru_cache(cache_dir: str | None, max_shards: int | None = None) -> 
                 pass
         shards.sort(key=lambda p: os.path.getmtime(p))
         total = sum(os.path.getsize(p) for p in shards)
-        while total > budget and len(shards) > 1:
+        # Evict down to ZERO: a single shard over budget must go too, or the
+        # disk stays over its budget (the shards are 0.4-60 GB, so "one more"
+        # is not "one more small thing"). The shard in use is re-downloadable.
+        while total > budget and shards:
             old = shards.pop(0)
             try:
                 sz = os.path.getsize(old)
@@ -521,39 +531,6 @@ def _enforce_lru_cache(cache_dir: str | None, max_shards: int | None = None) -> 
                 pass
     except Exception:
         pass
-
-
-def _shard_lru_limit(cache_dir: str, max_shards: int | None = None) -> int:
-    """How many whole shards fit in the disk budget for ``cache_dir``.
-
-    80% of free space, so the download that triggers the eviction still lands.
-    Falls back to 4 when the disk cannot be measured — the previous
-    behaviour, which is the safe side for a small disk.
-    """
-    if max_shards is not None:
-        try:
-            return max(1, int(max_shards))
-        except (TypeError, ValueError):
-            pass
-    try:
-        import shutil
-
-        free = shutil.disk_usage(cache_dir).free
-        biggest = _biggest_cached_shard(cache_dir)
-        if biggest <= 0:
-            return 4
-        return max(1, int((free * 0.8) // biggest))
-    except Exception:
-        return 4
-
-
-def _biggest_cached_shard(cache_dir: str) -> int:
-    """Largest cached shard in bytes, or 0 — the unit the disk budget divides by."""
-    try:
-        sizes = [os.path.getsize(p) for p in _cached_shard_files(cache_dir)]
-        return max(sizes) if sizes else 0
-    except Exception:
-        return 0
 
 
 def _shard_cache_path(cache_dir: str | None, shard: str) -> str | None:

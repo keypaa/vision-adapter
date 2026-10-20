@@ -1352,17 +1352,22 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     _prefetch_exec = None
     _first_shard_fut = None
     try:
-        from concurrent.futures import ThreadPoolExecutor as _TPE
-
-        from vision_adapter.data.stream import _download_shard_hf_transfer as _dl_shard, _get_hf_shard_path as _get_path, _in_modal as _is_modal
+        from vision_adapter.data.stream import (
+            _DaemonTask,
+            _download_shard_hf_transfer as _dl_shard,
+            _get_hf_shard_path as _get_path,
+            _in_modal as _is_modal,
+        )
 
         if _is_modal():
             # Warm first shard in background (if not already cached)
             first_sf = next((s for s in stream_order if s in plan), None)
             _rg_dir = str(_cache_root / "rg_cache")
             if first_sf and _get_path(first_sf, cache_dir=_rg_dir) is None:
-                _prefetch_exec = _TPE(max_workers=1)
-                _first_shard_fut = _prefetch_exec.submit(_dl_shard, first_sf, _rg_dir)
+                # A daemon thread, not a ThreadPoolExecutor: the executor's
+                # atexit hook JOINS its workers, so an in-flight 60 GB download
+                # would hang the process at exit.
+                _first_shard_fut = _DaemonTask(_dl_shard, first_sf, _rg_dir)
                 print(f"[train] daemon prefetching first shard {first_sf} ...", flush=True)
     except Exception:
         _prefetch_exec = None
@@ -1655,12 +1660,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             pass
     except Exception:
         pass
-    # Cleanup daemon
-    if _prefetch_exec is not None:
-        try:
-            _prefetch_exec.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+    # Cleanup daemon (the prefetch runs on a daemon thread: an in-flight
+    # download must not block the process at exit)
     return 0
 
 def _run_resume_local(dd: Path, cfg: TrainConfig, max_steps: int | None, device: str | None, dtype: str, resume_step: int | None, allow_synthetic: bool = False, lr_horizon: int | None = None) -> int:

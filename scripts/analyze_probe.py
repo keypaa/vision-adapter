@@ -33,24 +33,34 @@ def load_log(path: Path):
     return hdr, tr, end
 
 
-def wall_clock_section(tr, end, p) -> None:
+def wall_clock_section(tr, end, hdr, p) -> None:
     p("\n## wall clock")
     gpu = sum(r.get("step_ms", 0.0) for r in tr) / 1000.0
     wait = sum(r.get("wait_ms", 0.0) for r in tr) / 1000.0
     ts = [r.get("ts") for r in tr if r.get("ts")]
-    wall = (max(ts) - min(ts)) if len(ts) > 1 else None
-    if wall:
-        p(f"  wall (ts span)      {wall:,.0f} s")
-        p(f"  GPU (sum step_ms)   {gpu:,.0f} s   ({100*gpu/wall:.1f}%)")
-        p(f"  data wait (wait_ms) {wait:,.0f} s   ({100*wait/wall:.1f}%)")
-        p(f"  other (log/ckpt)   {wall-gpu-wait:,.0f} s   ({100*(wall-gpu-wait)/wall:.1f}%)")
+    span = (max(ts) - min(ts)) if len(ts) > 1 else None
+    # the run's own wall (from run_end) is the authoritative total; the ts span
+    # covers the first..last TRAIN record only, so it excludes startup (index
+    # build, plan) and the final save.
+    run_wall = (end.get("wall_min") * 60.0) if end and end.get("wall_min") else None
+    if span:
+        p(f"  run wall (run_end)     {run_wall:,.0f} s" if run_wall
+          else "  run wall (run_end)     n/a")
+        p(f"  ts span (train records) {span:,.0f} s   (excludes startup + final save)")
+        p(f"  GPU (sum step_ms)      {gpu:,.0f} s   ({100*gpu/span:.1f}% of the ts span)")
+        if wait:
+            p(f"  data wait (wait_ms)    {wait:,.0f} s   ({100*wait/span:.1f}%)")
+        p(f"  other (log/ckpt/val)   {span-gpu-wait:,.0f} s   ({100*(span-gpu-wait)/span:.1f}%)"
+          "   <- includes the val probes")
     else:
-        p(f"  GPU (sum step_ms)   {gpu:,.0f} s   (no ts in this log)")
+        p(f"  GPU (sum step_ms)      {gpu:,.0f} s   (no ts in this log)")
     if end:
-        p(f"  run_end wall_min    {end.get('wall_min')} min   final_loss={end.get('final_loss')}")
+        p(f"  run_end wall_min       {end.get('wall_min')} min   final_loss={end.get('final_loss')}")
     if wait == 0.0 and tr:
         p("  (this log predates wait_ms: the gap is wall - step_ms, which mixes "
           "network and local time)")
+    if hdr and hdr.get("config", {}).get("max_seq_len"):
+        p(f"  (max_seq_len in the run header: {hdr['config']['max_seq_len']})")
 
 
 def loss_section(tr, window: int, p) -> list[tuple[int, float, float]]:
@@ -96,7 +106,7 @@ def loss_section(tr, window: int, p) -> list[tuple[int, float, float]]:
     return curve
 
 
-def wasted_section(tr, p) -> None:
+def wasted_section(tr, max_len, p) -> None:
     """Steps whose sequence is over the context budget: expensive AND unlearnable.
 
     At the pre-W0 collate, a row with n_vis >= 4090 had its answer crushed to
@@ -104,8 +114,8 @@ def wasted_section(tr, p) -> None:
     high loss with no learnable signal, at the most expensive sequence length
     in the run.
     """
-    p("\n## steps over the context budget (L > 4096: answers/questions crushed)")
-    over = [r for r in tr if (r.get("L") or 0) > 4096]
+    p(f"\n## steps over the context budget (L > {max_len}: answers/questions crushed)")
+    over = [r for r in tr if (r.get("L") or 0) > max_len]
     if not over:
         p("  none")
         return
@@ -114,8 +124,8 @@ def wasted_section(tr, p) -> None:
     p(f"  {len(over)} of {len(tr)} steps ({100*len(over)/len(tr):.1f}%)")
     p(f"  GPU time {t:,.0f} s of {gpu:,.0f} s = {100*t/max(gpu,1e-9):.1f}% of the GPU budget")
     p(f"  mean loss {st.mean(r['loss'] for r in over):.3f} vs "
-      f"{st.mean(r['loss'] for r in tr if (r.get('L') or 0) <= 4096):.3f} for the rest")
-    rest = [r for r in tr if (r.get("L") or 0) <= 4096]
+      f"{st.mean(r['loss'] for r in tr if (r.get('L') or 0) <= max_len):.3f} for the rest")
+    rest = [r for r in tr if (r.get("L") or 0) <= max_len]
     p(f"  mean {1000*t/len(over):,.0f} ms/step vs "
       f"{sum(r.get('step_ms', 0.0) for r in rest)/max(1, len(rest)):,.0f} ms/step")
     p("  (after the collate fix the answers survive; the rows become learnable "
@@ -183,11 +193,12 @@ def main() -> int:
           f"manifest_rows={hdr.get('manifest_rows')}  "
           f"batch={hdr.get('config', {}).get('batch_size')}")
     p(f"steps {tr[0]['step']}..{tr[-1]['step']}  ({len(tr)} records)")
-    wall_clock_section(tr, end, p)
+    wall_clock_section(tr, end, hdr, p)
     loss_section(tr, args.window, p)
     slice_section(tr, p)
     size_section(tr, p)
-    wasted_section(tr, p)
+    _max_len = int((hdr or {}).get("config", {}).get("max_seq_len") or 4096)
+    wasted_section(tr, _max_len, p)
     if args.out:
         args.out.write_text("\n".join(out) + "\n")
         print(f"\n[analyze] wrote {args.out}")

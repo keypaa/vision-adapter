@@ -101,7 +101,9 @@ def test_collate_preserves_grid_thw_per_row():
     tok = StubTok()
     items = [
         {
-            "vis": torch.randn(4, 8),
+            # the grid must agree with the row's visual token count:
+            # [1,4,8] -> 4*8/4 = 8 placeholders
+            "vis": torch.randn(8, 8),
             "user": "u",
             "assistant": "a",
             "g": "t",
@@ -114,6 +116,30 @@ def test_collate_preserves_grid_thw_per_row():
     # row 0 measured, row 1 left empty for the synthetic fallback
     assert batch["grid_thw"][0] == [1, 4, 8]
     assert not batch["grid_thw"][1]
+
+
+def test_collate_rejects_a_grid_that_disagrees_with_the_row():
+    """A measured grid that does not match the row's tokens is a data bug, and
+    it must be loud (the old fixture in this file was itself inconsistent:
+    n_vis=4 with grid [1,4,8] -> 8 placeholders)."""
+    import pytest
+
+    from vision_adapter.core import make_collate
+
+    class StubTok:
+        pad_token_id = 0
+        bos_token_id = 1
+        eos_token_id = 2
+
+        def __call__(self, text, add_special_tokens=False):
+            return {"input_ids": [(ord(c) % 900) + 10 for c in text] or [10]}
+
+    tok = StubTok()
+    with pytest.raises(ValueError, match="mismatch"):
+        make_collate(tok, tok.pad_token_id, max_len=64, vision_dim=8)(
+            [{"vis": torch.randn(4, 8), "user": "u", "assistant": "a",
+              "g": "t", "grid_thw": [1, 4, 8]}]
+        )
 
 
 def test_mixed_batch_measures_only_rows_with_a_grid():

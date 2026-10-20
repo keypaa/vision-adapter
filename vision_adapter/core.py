@@ -284,25 +284,41 @@ MAX_ANSWER_TOKENS = 1024   # guard for an unfiltered manifest (the manifest
 # Shape of the supervision the collate produces, recorded in every checkpoint.
 #   v1 = image-first budget (the answer was crushed to <=2 tokens for n_vis>=4090)
 #   v2 = answer > question > image
-# A resume across versions is refused: the labels of the affected rows changed.
-COLLATE_VERSION = 2
+#   v3 = the answer cap raised to 1024 tokens, and the visual span is cropped
+#        ROW-ALIGNED with the grid cropped to match (the position ids of a
+#        cropped row changed)
+# A resume across versions is refused: the labels/positions of the affected
+# rows changed.
+COLLATE_VERSION = 3
 SPATIAL_MERGE_SIZE = 2      # the 2x2 patch merge (see ARCHITECTURE.md)
 
 
+def grid_token_count(grid) -> int:
+    """How many visual tokens the position code enumerates for a grid.
+
+    `vision_position_ids` walks (t, h//merge, w//merge) — the TEMPORAL axis is
+    not merged — while the placeholder count is (t*h*w)//merge**2. The two
+    agree only when h and w are even, which is what the corpus produces (the
+    grid comes from `grid_from_dims`, which pads to 28-pixel multiples). A grid
+    they disagree on cannot be positioned at all, so it is rejected rather than
+    silently mis-placed.
+    """
+    t, h, w = (int(x) for x in grid)
+    return t * (h // SPATIAL_MERGE_SIZE) * (w // SPATIAL_MERGE_SIZE)
+
+
 def crop_to_grid(grid, kept: int, merge_size: int = SPATIAL_MERGE_SIZE):
-    """Round a head crop down to whole grid rows and crop the grid with it.
+    """Crop a head span to a grid rectangle the position code can use.
 
     The visual tokens of a row are the merged patches of its grid in
     row-major order, so the first `kept` of them are the TOP of the image.
-    A crop that is not row-aligned would leave a partial row, which no grid
-    can express -- and the position code needs a grid whose placeholder
-    count equals the number of visual tokens (core.row_grids_for_batch
-    raises otherwise, and the native path scatters one slot per token).
+    A rectangle can only express a head crop that is whole in the LAST
+    enumerated axis, i.e. whole merged ROWS: kept = k * llm_w and the grid
+    becomes [1, k*merge, w]. A partial row is not expressible, so the crop
+    is rounded DOWN and the leftover budget goes unused.
 
-    Returns (kept, grid): `kept` tokens and the matching rectangle, or the
-    input grid unchanged when nothing was cropped. `grid=None` means "no
-    measured grid" -> the position code falls back to the synthetic grid
-    derived from the kept token count.
+    Returns ``(kept, grid)``. ``grid=None`` means "no measured grid" -> the
+    position code falls back to the synthetic grid for the kept count.
     """
     if grid is None:
         return kept, None
@@ -313,16 +329,37 @@ def crop_to_grid(grid, kept: int, merge_size: int = SPATIAL_MERGE_SIZE):
     if len(g) != 3:
         return kept, None
     t, h, w = g
+    if h % merge_size or w % merge_size:
+        # The position code enumerates h//merge x w//merge cells while the
+        # placeholder count is (t*h*w)//merge**2: for odd dims the two
+        # disagree, so the grid cannot describe the tokens. That is a data
+        # bug and it must stay loud (the synthetic stand-in is worse: it
+        # inverts orientation).
+        raise ValueError(
+            f"grid_thw {g} has dims not divisible by the merge size "
+            f"({merge_size}); the geometry of this row cannot be expressed"
+        )
     llm_h, llm_w = h // merge_size, w // merge_size
     if llm_h <= 0 or llm_w <= 0:
         return kept, g
-    total = llm_h * llm_w
+    total = t * llm_h * llm_w
     if kept >= total:
         return kept, g
+    if t > 1:
+        # The enumeration is frame-major (t is NOT merged), so a head crop of
+        # a multi-frame grid is only expressible in whole frames.
+        frames_kept = max(0, kept // (llm_h * llm_w))
+        if frames_kept == 0:
+            return 0, [0, h, w]
+        return frames_kept * llm_h * llm_w, [frames_kept, h, w]
     rows_kept = max(0, kept // llm_w)
     if rows_kept == 0:
-        return 0, [t, 0, w]
-    return rows_kept * llm_w, [t, rows_kept * merge_size, w]
+        # One merged row does not fit in the budget: the image cannot be
+        # cropped to a rectangle, so the row keeps no visual tokens (its
+        # text still trains). This needs an image wider than the budget
+        # (~8,000 merged columns) and does not occur in the corpus.
+        return 0, [1, 0, w]
+    return rows_kept * llm_w, [1, rows_kept * merge_size, w]
 
 
 def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
@@ -345,9 +382,10 @@ def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
     kept) only as the last resort. L never exceeds max_len.
 
     A cropped image keeps its geometry: the crop is rounded DOWN to a whole
-    number of grid rows and the grid is cropped with it (crop_to_grid), so
-    the position code still sees a grid whose placeholder count equals the
-    number of visual tokens.
+    number of grid rows (or frames, for t>1) and the grid is cropped with it
+    (crop_to_grid), so the position code still sees a grid whose placeholder
+    count equals the number of visual tokens. A grid that disagrees with the
+    row's token count is a data bug and raises BEFORE any crop can mask it.
 
     Layout contract (unchanged):
     - labels -100 everywhere except answer+EOS; BOS/img/user/pad never contribute
@@ -378,6 +416,23 @@ def make_collate(tok, pad_id: int, max_len: int = 4096, vision_dim: int = 4096):
         for u, a, nv, grid in zip(u_ids, a_ids, n_vis, grids):
             a = a[: min(len(a), MAX_ANSWER_TOKENS, text_budget)]
             u = u[: max(0, text_budget - len(a))]
+            # A measured grid that disagrees with the row's token count is a
+            # DATA bug. It must raise here, before a crop can hide it (a
+            # cropped grid always matches the cropped token count).
+            if grid is not None:
+                _g = torch.as_tensor([int(x) for x in grid], dtype=torch.long)
+                _count = placeholder_count(_g, SPATIAL_MERGE_SIZE)
+                if _count != nv:
+                    raise ValueError(
+                        f"grid_thw {grid} mismatch: gives {_count} placeholders but the "
+                        f"row has {nv} visual tokens"
+                    )
+                _enum = grid_token_count([int(x) for x in grid])
+                if _enum != nv:
+                    raise ValueError(
+                        f"grid_thw {grid} cannot be positioned: the position code "
+                        f"enumerates {_enum} cells but the row has {nv} visual tokens"
+                    )
             # The image takes the rest (head kept). It is the elastic resource.
             budget = max_len - len(u) - len(a) - 2
             if nv > budget:
