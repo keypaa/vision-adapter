@@ -48,6 +48,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+# The images repo is xet-backed, and the big shards (6.9 GB) fail to
+# reconstruct with "Internal Writer Error: Background writer channel closed".
+# The classic (non-xet) download path does not hit it.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+
 import numpy as np
 import torch
 
@@ -57,15 +62,90 @@ IMAGES_REPO = "keypa/vision-adapter-images"
 N_SHARDS = 17
 MOONVIT_REPO = "keypa/MoonViT-V2-Standalone"
 
+# Per-slice pixel budgets (docs/REFERENCE_RECIPE.md §3, D6).
+#
+# The reference's rule (300,000 px) was set for ART images: WikiArt at 256 px
+# and fashion products at 384x512 are ~100-200k px, so the cap was a mild
+# downscale of photographs. Our doc slices are not photographs: they are
+# rendered documents whose ANSWER lives in small text. Measured on the real
+# corpus (served positions, n_vis from the key index):
+#
+#   slice                rows   n_vis med      max    KiB/img   budget
+#   agentic/*           51,834        364      380     7-196    300k px (unchanged: already there)
+#   vqav2/okvqa/aokvqa  4,157        368      529    339-469   300k px (at/under budget already)
+#   ocrvqa/scienceqa     2,298        216      324    61-246    300k px
+#   visual7w/ai2d/chartqa 3,708   252-580    2,916   38-340    300k px
+#   plotqa               5,366        960    1,250     29      300k px (synthetic charts: cheap, legible)
+#   textvqa/infographic_vqa  1,359  1,036-1,250 4,760  870-942   800k px (text must stay readable)
+#   docvqa/screen2words/websight 2,395 2,691-4,941 16,598  488-1,038  800k px (or drop: 4k+ tokens
+#                                                                        does not fit the 4,096 context)
+#
+# The 800k px tier is 1,020 merged tokens: 3x the reference's budget, still
+# inside the 4,096-token context with room for the text. Below ~600k px a
+# scanned page's 12-px glyphs fall under one 14-px patch, so the answer is
+# unreadable -- that is the legibility floor, and it is a judgement call, not
+# a measured one.
+BUDGETS: dict[str, int] = {
+    "default": 300_000,
+    "cauldron/textvqa": 800_000,
+    "cauldron/infographic_vqa": 800_000,
+    "cauldron/docvqa": 800_000,
+    "cauldron/screen2words": 800_000,
+    "cauldron/websight": 800_000,
+}
+
+
+def subset_of(filename: str) -> str:
+    """'cauldron/chartqa-0000001-0.png' -> 'cauldron/chartqa'"""
+    import re
+
+    parts = filename.split("/")
+    stem = parts[-1].rsplit(".", 1)[0]
+    stem = re.sub(r"[-_]\d+$", "", stem)
+    stem = re.sub(r"-\d+$", "", stem)
+    return "/".join(parts[:-1] + [stem])
+
+
+def budget_for(filename: str, default: int) -> int:
+    return BUDGETS.get(subset_of(filename), default)
+
 
 # ------------------------------------------------------------------ input --
-def images_shard(repo: str, shard: int, cache: Path) -> Path:
-    """Download one images-repo parquet shard (a few hundred MB) and return it."""
+def images_shard(repo: str, shard: int, cache: Path, attempts: int = 3) -> Path:
+    """Download one images-repo parquet shard (0.3-6.9 GB) and return it.
+
+    The big shards can fail mid-reconstruction ("File reconstruction error:
+    Internal Writer Error") — that is transient, so retry.
+    """
+    import time
+
     from huggingface_hub import hf_hub_download
 
     cache.mkdir(parents=True, exist_ok=True)
-    return Path(hf_hub_download(repo, f"data/train-{shard:05d}-of-{N_SHARDS:05d}.parquet",
-                                repo_type="dataset", local_dir=str(cache)))
+    name = f"data/train-{shard:05d}-of-{N_SHARDS:05d}.parquet"
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            path = Path(hf_hub_download(repo, name, repo_type="dataset",
+                                        local_dir=str(cache)))
+            return path
+        except Exception as e:  # noqa: BLE001 - retried
+            last = e
+            if "quota" in str(e).lower() or "space" in str(e).lower():
+                # the images shards are 0.3-6.9 GB; the download needs room for
+                # the file AND the transfer's temporary copy
+                import shutil
+
+                free = shutil.disk_usage(cache).free
+                raise RuntimeError(
+                    f"not enough disk to fetch {name}: {free/2**30:.1f} GiB free in "
+                    f"{cache}. Point --cache-dir at a bigger disk (the images shards "
+                    f"are up to 6.9 GB)."
+                ) from e
+            print(f"[rebuild] shard {shard}: download attempt {attempt} failed "
+                  f"({type(e).__name__}: {e})", flush=True)
+            time.sleep(5 * attempt)
+    raise RuntimeError(f"could not download {name} after {attempts} attempts: {last}")
 
 
 def cap_image(im, max_pixels: int, round_to: int = 28):
@@ -97,14 +177,19 @@ def cap_image(im, max_pixels: int, round_to: int = 28):
     return im.resize((nw, nh), Image.LANCZOS)
 
 
-def prepare(blob: bytes, max_pixels: int, preprocess_mod=None):
-    """decode -> cap -> patchify. Returns (pixel_values, grid_thw, n_patches)."""
+def prepare(blob: bytes, max_pixels: int, preprocess_mod=None, filename: str = ""):
+    """decode -> cap -> patchify. Returns (pixel_values, grid_thw, n_patches).
+
+    The budget is PER SLICE: `budget_for(filename)` maps the image's subset to
+    its pixel budget (BUDGETS), so the doc slices that must stay readable get
+    a bigger budget than the reference's 300k px.
+    """
     from PIL import Image
 
     from vision_adapter.models.preprocess import process_image
 
     im = Image.open(io.BytesIO(blob)).convert("RGB")
-    im = cap_image(im, max_pixels)
+    im = cap_image(im, budget_for(filename, max_pixels) if filename else max_pixels)
     out = process_image(im)
     return out["pixel_values"], out["grid_thws"], int(out["pixel_values"].shape[0])
 
@@ -137,7 +222,8 @@ def build_shard(shard: int, args, vit, device, preprocess_mod) -> ShardInfo:
                     if args.limit and n >= args.limit:
                         return
                     n += 1
-                    q.put((nm, ex.submit(prepare, blob, args.max_pixels, preprocess_mod)))
+                    q.put((nm, ex.submit(prepare, blob, args.max_pixels,
+                                          preprocess_mod, str(nm))))
         finally:
             q.put(None)
 
