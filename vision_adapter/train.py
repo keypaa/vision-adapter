@@ -342,6 +342,21 @@ def _final_ckpt_filename(steps: int) -> str:
     return f"projector_{tag}_final_{int(steps)}.pt" if tag else f"projector_final_{int(steps)}.pt"
 
 
+def _log_filename(base: str) -> str:
+    """Tag-scoped log/curve names.
+
+    The log is pushed to the same HF repo as the checkpoints and is uploaded
+    under its plain name, so an untagged run OVERWRITES the previous run's
+    log (the raw evidence of that run) in the shared repo. Scoping the name
+    with the run tag keeps both.
+    """
+    tag = _ckpt_tag()
+    if not tag:
+        return base
+    stem, _, ext = base.rpartition(".")
+    return f"{stem}_{tag}.{ext}" if ext else f"{base}_{tag}"
+
+
 def _ckpt_step_number(name: str) -> int:
     """Parse step from legacy and tagged step filenames; -1 otherwise.
 
@@ -1355,8 +1370,8 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         else:
             print("[train][WARN] no val rows — val probe OFF for this run", flush=True)
     # Logging
-    log_path = data_dir / "probe_log.jsonl"
-    curves_path = data_dir / "probe_curves.png"
+    log_path = data_dir / _log_filename("probe_log.jsonl")
+    curves_path = data_dir / _log_filename("probe_curves.png")
     if _resume_info is not None:
         run_id = resume_ckpt.get("run_id") if isinstance(resume_ckpt, dict) else None
         if not run_id:

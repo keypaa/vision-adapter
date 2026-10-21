@@ -533,7 +533,10 @@ cd /marimo/vision-adapter && git pull
 python scripts/filter_manifest.py --manifest data/train_manifest_grids.jsonl \
     --out data/train_manifest_filtered.jsonl --max-answer-words 20 --fetch
 
-# 2. the probe
+# 2. pack the held-out set (else 16 val probes stream 28 shards each = ~6 h)
+python scripts/pack_val.py --n 1000 --out-dir ./data
+
+# 3. the probe
 export HF_TOKEN=... VISION_ADAPTER_PUSH_HF=1
 export VISION_ADAPTER_HF_CKPT_REPO=keypa/vision-adapter-probe-checkpoints
 export VISION_ADAPTER_CKPT_TAG=p05          # keep the old artifacts intact
@@ -542,6 +545,11 @@ python -m vision_adapter train --data-dir ./data --config probe \
     --warmup-steps 25 --dtype auto \
     --push-to-hf --hf-ckpt-repo keypa/vision-adapter-probe-checkpoints
 ```
+
+With the tag set, this run's artifacts are **scoped**: `projector_p05_step*.pt`,
+`probe_log_p05.jsonl`, `probe_curves_p05.png` → the previous run's files in the
+HF repo are not overwritten, and the analysis reads the last run in an
+appended log.
 
 ### Step 0 (do this BEFORE the run): pack the held-out set
 
@@ -585,7 +593,7 @@ download, using Range" and carry on.
 ### After the run
 
 ```bash
-python scripts/analyze_probe.py --log data/probe_log.jsonl --out probe_p05.md
+python scripts/analyze_probe.py --log data/probe_log_p05.jsonl --out probe_p05.md
 ```
 
 The three numbers that decide the next step:

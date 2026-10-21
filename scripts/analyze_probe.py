@@ -27,6 +27,12 @@ from pathlib import Path
 
 def load_log(path: Path):
     recs = [json.loads(line) for line in open(path) if line.strip()]
+    # A log can hold SEVERAL runs: the trainer appends on resume, and a box
+    # reused for a new run keeps the previous file. The run that matters is
+    # the LAST one -- its header, its train records, its end record.
+    starts = [i for i, r in enumerate(recs) if r.get("type") == "config_header"]
+    if starts:
+        recs = recs[starts[-1]:]
     hdr = next((r for r in recs if r.get("type") == "config_header"), None)
     tr = [r for r in recs if r.get("type") == "train"]
     end = next((r for r in recs if r.get("type") == "run_end"), None)
