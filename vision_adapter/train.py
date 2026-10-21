@@ -100,6 +100,15 @@ def _download_ckpt(repo_id: str, step: int | None, dest_dir: Path) -> Path:
     from huggingface_hub import hf_hub_download
 
     names = [f for f in _list_hf_ckpt_files(repo_id) if _ckpt_step_number(f) >= 0]
+    # The repo holds the PREVIOUS run's untagged checkpoints too (step 4000
+    # from the old probe). With a tag set, "the latest checkpoint" must mean
+    # the latest of THIS run -- otherwise a resume silently picks up the old
+    # run's final checkpoint (and the recipe guard then refuses it).
+    tag = _ckpt_tag()
+    if tag:
+        tagged = [f for f in names if f.startswith(f"projector_{tag}_step")]
+        if tagged:
+            names = tagged
     if not names:
         raise FileNotFoundError(f"no step ckpts in hf:{repo_id}")
     if step is None:
@@ -396,6 +405,22 @@ def _find_local_ckpt(data_dir: Path | str, step: int | None = None) -> Path:
             if n > best_n:
                 best_n = n
                 best = p
+    # Same rule as the HF resume: with a tag set, "the latest" is the latest
+    # of THIS run -- the directory can still hold the previous run's files.
+    tag = _ckpt_tag()
+    if tag:
+        tagged = [p for p in (best, ) if p is not None and p.name.startswith(f"projector_{tag}_step")]
+        if tagged:
+            best = tagged[0]
+        else:
+            for d in search_dirs:
+                if not d.is_dir():
+                    continue
+                cands = [p for p in d.glob(f"projector_{tag}_step*.pt")
+                         if _ckpt_step_number(p.name) >= 0]
+                if cands:
+                    best = max(cands, key=lambda p: _ckpt_step_number(p.name))
+                    break
     if best is None:
         raise FileNotFoundError(f"no projector_step*.pt in {[str(d) for d in search_dirs]}")
     return best
