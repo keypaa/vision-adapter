@@ -51,9 +51,9 @@ def bucket_name(n_vis: int) -> str:
 
 
 def key_index(args) -> dict:
-    from vision_adapter.data.stream import load_key_index
+    from vision_adapter.data.stream import build_key_index, list_shards, load_key_index
 
-    for cand in (args.key_index, "emb_cache/cache", "."):
+    for cand in (args.key_index, args.cache_dir, "emb_cache/cache", "."):
         if not cand:
             continue
         p = Path(cand)
@@ -67,8 +67,17 @@ def key_index(args) -> dict:
         elif p.is_file():
             idx, ok = load_key_index(str(p))
             if ok:
+                print(f"[pack-val] key index: {p} ({len(idx)} entries)")
                 return idx
-    raise SystemExit("[pack-val] no key index found — pass --key-index")
+    # Not on the box yet: build it. It is the trainer's own index (footer +
+    # key chunks only, ~70 s for the whole corpus) and the trainer builds one
+    # at startup anyway — but the pack step needs it FIRST, to locate the val
+    # rows, so it cannot wait for the trainer to make one.
+    print(f"[pack-val] no key index found — building it into {args.cache_dir} "
+          f"(the trainer builds the same thing at startup; ~70 s)", flush=True)
+    idx = build_key_index(list_shards(), cache_dir=str(args.cache_dir))
+    print(f"[pack-val] key index built: {len(idx)} entries", flush=True)
+    return idx
 
 
 def quotas_from_corpus(train_rows, index, n_total: int) -> tuple[dict, dict]:
@@ -278,6 +287,8 @@ def main() -> int:
                     help="total rows, split across groups by corpus proportion")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--key-index", default=None)
+    ap.add_argument("--cache-dir", default="data/cache",
+                    help="where the key index is found (or built)")
     ap.add_argument("--manifest", default=None, help="val manifest; HF when absent")
     ap.add_argument("--train-manifest", default=None)
     ap.add_argument("--dry-run", action="store_true",
