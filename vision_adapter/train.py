@@ -450,7 +450,7 @@ VAL_PACK_GLOB = "val_pack_*.parquet"
 
 
 def build_val_plan(val_rows, index, stream_order, train_shards, data_dir,
-                   excluded, seed, build_plan):
+                   excluded, seed, build_plan, groups=""):
     """Choose how the val probe gets its embeddings.
 
     Packed parquets — one per group — are local reads. Without them the
@@ -462,6 +462,12 @@ def build_val_plan(val_rows, index, stream_order, train_shards, data_dir,
     (scripts/pack_val.py asserts no key is in the train manifest), so they need
     no shard exclusion. We re-check anyway: a pack rebuilt by hand after the
     train plan changed must not be able to leak.
+
+    ``groups`` narrows the probe to the slice the run trains on. It is applied
+    AFTER the pack's coverage and leak checks: the checks are about the pack
+    against the val manifest, and narrowing the manifest first would make the
+    other groups' packs look broken (and send the run back to the slow
+    multi-shard fallback).
     """
     packs = sorted(data_dir.glob(VAL_PACK_GLOB))
     if packs:
@@ -504,10 +510,14 @@ def build_val_plan(val_rows, index, stream_order, train_shards, data_dir,
                     raise ValueError(
                         f"{pack.name}: {len(leak)} rows resolve to a train shard")
 
+                # Narrow to the trained slice AFTER the checks above.
+                keep = filter_by_groups(plan_rows, groups)
+                if groups and not keep:
+                    continue  # this pack holds no rows of the trained slice
                 order.append(pack.name)
-                plan[pack.name] = plan_rows
+                plan[pack.name] = keep
                 local[pack.name] = str(pack)
-                n_total += len(plan_rows)
+                n_total += len(keep)
 
             per_g = {}
             for rows in plan.values():
@@ -521,6 +531,7 @@ def build_val_plan(val_rows, index, stream_order, train_shards, data_dir,
                   f"the multi-shard plan", flush=True)
 
     val_order = [s for s in stream_order if s not in excluded]
+    val_rows = filter_by_groups(val_rows, groups)
     plan = build_plan(
         val_rows, index, sample_size=len(val_rows), seed=seed,
         excluded_shards=train_shards,
@@ -1374,11 +1385,6 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
         except Exception as e:  # noqa: BLE001
             print(f"[train][WARN] val manifest unavailable ({e}) — val probe OFF", flush=True)
         if _val_rows:
-            if _groups:
-                _before_val = len(_val_rows)
-                _val_rows = filter_by_groups(_val_rows, _groups)
-                print(f"[train] val slice filter: groups={_groups} -> "
-                      f"{len(_val_rows)}/{_before_val} rows", flush=True)
             val_order, val_plan, _n_val, _val_local = build_val_plan(
                 val_rows=_val_rows,
                 index=index,
@@ -1388,6 +1394,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 excluded=EXCLUDED,
                 seed=_plan_seed,
                 build_plan=_build_plan,
+                groups=",".join(_groups),
             )
             _n_val_planned = _n_val
             print(f"[train] val plan: {_n_val}/{len(_val_rows)} rows "
