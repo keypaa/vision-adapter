@@ -28,7 +28,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import tempfile
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -208,7 +207,7 @@ def pack(args) -> int:
         print("[pack-val] dry run — nothing written")
         return 0
 
-    cache_dir = tempfile.mkdtemp(prefix="valpack_")
+    cache_dir = str(args.cache_dir)
     for g, rows in sorted(packs.items()):
         if not rows:
             continue
@@ -263,6 +262,19 @@ def _write_pack(args, group, chosen, index, cache_dir):
                 n_done += 1
             del tbl, vbs
         print(f"[pack-val]   {sf}: {n_done}/{len(wanted)} rows", flush=True)
+        # The parquet API needs a LOCAL file, so a whole shard (0.4-60 GB) is
+        # downloaded for it. With ~50 shards that is ~175 GB sitting in the
+        # cache — and it is the SAME data the trainer is about to download
+        # again. So the cache is the trainer's (data/cache), and the LRU
+        # keeps it inside the disk budget after every shard: the peak stays
+        # bounded, and the shards that survive are the ones the trainer
+        # reuses instead of re-fetching.
+        try:
+            from vision_adapter.data.stream import _enforce_lru_cache
+
+            _enforce_lru_cache(cache_dir)
+        except Exception as e:  # noqa: BLE001 — the budget is best-effort here
+            print(f"[pack-val] cache trim failed ({e}) — continuing", flush=True)
 
     out = Path(args.out_dir) / f"val_pack_{group}.parquet"
     out.parent.mkdir(parents=True, exist_ok=True)
