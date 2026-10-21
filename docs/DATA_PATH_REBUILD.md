@@ -637,6 +637,11 @@ reference's 66,240) → bring in the doc slice after the per-slice re-embed.
 | `scripts/eval_heldout.py` | two projectors compared on rows from `emb_0000/0001` | those shards are the **smallest images** (their neighbours `emb_0002..0007` hold n_vis 16–100, median 35) → a small-image regime, *not* the agentic regime (median 364) |
 | `Σ wait_ms / Σ step_ms` | the data path's share of the wall time | whether the *transfer* was efficient (the old run overfetched 3.19×) |
 
+**Numbering note:** these are SIGNATURES of a probe outcome, S1-S8. The
+O1-O9 in section 6b are the open CODE DEFECTS -- a different numbering, all
+fixed. (Renamed from O1-O8 on 2026-10-21: two numbering schemes for O was
+one too many.)
+
 **The grok criterion (fixed now):** a *sustained* drop in the EMA **level** of
 ≥0.3 nats, holding for ≥3 consecutive logged windows, at or after step ≈2,800.
 The reference's own ">0.5 nats below the running mean" threshold fires 271
@@ -644,20 +649,20 @@ times on our per-step log — it measures noise here, so it is not used.
 
 | # | signature in the log | what it means | next action | cost | hero-run consequence |
 |---|---|---|---|---|---|
-| **O1** | EMA level breaks: a sustained ≥0.3-nat drop after ≈step 2,800 (epoch-relative ≈2,818, sample-relative ≈3,600) | **the recipe works on our data** — the five defects (decaying LR, synthetic geometry, crushed answers, unserved questions, wrong pixel regime) were the blockers | hero run with the same recipe; the corpus rebuild becomes a *quality/perf* project, not a gate | done | **unblocked** |
-| **O2** | the loss falls steadily (e.g. 1.1 → 0.6) with no cliff, still falling at step 4,000 | the fixes helped; the snap did not happen. Candidates: 1.23 epochs is short (the reference ran 2); the 2B backbone does not grok this way (the reference used a 504B MoE); click-coordinate grounding is harder than naming an object; 51,834 images is too few | in order, cheapest first: (1) extend to 8,000 steps (2 epochs); (2) batch 64 via grad-accum 4 (the reference's effective batch); (3) the "recipe arm": the doc slice re-embedded at its own budget; (4) treat the probe as a weak proxy | +1–2 h per arm | **the branch where the probe's verdict may not transfer.** A negative on a 2B backbone with a hard task may indict the *proxy*, not the recipe → decide the hero run on cost, not on this verdict |
-| **O3** | train loss → 0 while the held-out loss stays flat | memorisation, not grokking | more data diversity: the doc slice (after the per-slice re-embed) and the **art** slice — the reference's actual task type (a WikiArt-style curriculum), which our mix has none of | a rebuild + a re-embed | the mix must grow **before** a multi-GPU spend |
-| **O4** | the loss is pinned (≈1.1, gnorm ≈0.17 as in the old run) | a bug, not a science problem: the projector is not moving | the **16-row overfit test**: can the projector drive the loss to ~0 on 16 fixed rows? If not, the plumbing is broken (collate / position ids / LR / projector scale) | minutes | **do not launch the hero** — a broken projector on 300B+ GPUs is a waste |
-| **O5** | the wall time ≫ the old run's 24,366 s for the same 4,000 steps; `wait_ms ≫ step_ms` | the data path is still the bottleneck (e.g. the whole-shard path was refused for lack of disk → the Range path, 3.19× overfetch) | the corpus rebuild becomes the **precondition** for the science, not the optional extra | a rebuild | the hero run *must* have the rebuilt corpus first — a Range-path hero wastes the GPU |
-| **O6** | the run exits early (geometry guard / collate validation / recipe refusal) | a config or manifest mismatch | `scripts/preflight_manifest.py` (PASS on 27,705 live rows) + the error text; usually a 10-minute fix | minutes | nothing was spent |
-| **O7** | a collapse appears, but the val loss does not follow | memorisation wearing a grok's clothes | treat as **O3** | — | — |
-| **O8** | the collapse lands at step ≈3,900, at the very end | the run was too short | re-run to 8,000 steps and read the criterion again | +2 h | — |
+| **S1** | EMA level breaks: a sustained ≥0.3-nat drop after ≈step 2,800 (epoch-relative ≈2,818, sample-relative ≈3,600) | **the recipe works on our data** — the five defects (decaying LR, synthetic geometry, crushed answers, unserved questions, wrong pixel regime) were the blockers | hero run with the same recipe; the corpus rebuild becomes a *quality/perf* project, not a gate | done | **unblocked** |
+| **S2** | the loss falls steadily (e.g. 1.1 → 0.6) with no cliff, still falling at step 4,000 | the fixes helped; the snap did not happen. Candidates: 1.23 epochs is short (the reference ran 2); the 2B backbone does not grok this way (the reference used a 504B MoE); click-coordinate grounding is harder than naming an object; 51,834 images is too few | in order, cheapest first: (1) extend to 8,000 steps (2 epochs); (2) batch 64 via grad-accum 4 (the reference's effective batch); (3) the "recipe arm": the doc slice re-embedded at its own budget; (4) treat the probe as a weak proxy | +1–2 h per arm | **the branch where the probe's verdict may not transfer.** A negative on a 2B backbone with a hard task may indict the *proxy*, not the recipe → decide the hero run on cost, not on this verdict |
+| **S3** | train loss → 0 while the held-out loss stays flat | memorisation, not grokking | more data diversity: the doc slice (after the per-slice re-embed) and the **art** slice — the reference's actual task type (a WikiArt-style curriculum), which our mix has none of | a rebuild + a re-embed | the mix must grow **before** a multi-GPU spend |
+| **S4** | the loss is pinned (≈1.1, gnorm ≈0.17 as in the old run) | a bug, not a science problem: the projector is not moving | the **16-row overfit test**: can the projector drive the loss to ~0 on 16 fixed rows? If not, the plumbing is broken (collate / position ids / LR / projector scale) | minutes | **do not launch the hero** — a broken projector on 300B+ GPUs is a waste |
+| **S5** | the wall time ≫ the old run's 24,366 s for the same 4,000 steps; `wait_ms ≫ step_ms` | the data path is still the bottleneck (e.g. the whole-shard path was refused for lack of disk → the Range path, 3.19× overfetch) | the corpus rebuild becomes the **precondition** for the science, not the optional extra | a rebuild | the hero run *must* have the rebuilt corpus first — a Range-path hero wastes the GPU |
+| **S6** | the run exits early (geometry guard / collate validation / recipe refusal) | a config or manifest mismatch | `scripts/preflight_manifest.py` (PASS on 27,705 live rows) + the error text; usually a 10-minute fix | minutes | nothing was spent |
+| **S7** | a collapse appears, but the val loss does not follow | memorisation wearing a grok's clothes | treat as **S3** | — | — |
+| **S8** | the collapse lands at step ≈3,900, at the very end | the run was too short | re-run to 8,000 steps and read the criterion again | +2 h | — |
 
 **The honest prior:** O2 is the most likely branch — grokking is
 backbone- and data-sensitive, the reference's backbone was a 504B MoE, and our
 task (predict a click coordinate) has far higher answer entropy than "a red
-bus". O1 is the branch that pays off; O4 is the branch that must be caught
-cheaply; O5 is the branch that costs the most wall time.
+bus". S1 is the branch that pays off; S4 is the branch that must be caught
+cheaply; S5 is the branch that costs the most wall time.
 
 ---
 
