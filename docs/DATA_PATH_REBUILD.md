@@ -560,13 +560,32 @@ plan does **not** use — 28 of 103 shards ≈ 260 GiB per probe ≈ 6 h of extr
 I/O for the run. One command fixes it:
 
 ```bash
-python scripts/pack_val.py --n 1000 --out-dir ./data
+python scripts/pack_val.py --n 1000 --out-dir ./data --publish
 # -> data/val_pack_<group>.parquet + data/val_pack_<group>.map.json
 ```
 
-~3 GiB, one download, and every val probe becomes a local read. The packs
-carry the disjointness invariant (an assert: no val key may appear in the
-train manifest) and the trainer re-checks it.
+`--publish` uploads the packs to the manifests repo: **a fresh session has no
+`data/` and no caches**, so without the published copies every session
+rebuilds them — which is ~50 whole shards (~175 GB of transfer, ~15–25 min)
+and exactly where both of the pack's bugs were. With them it is ~3 GB and
+seconds. The packs are derived from public corpus data plus the val
+manifest, and the trainer re-checks the disjointness invariant.
+
+A fresh session also has to fetch the corpus shards for training itself
+(246 GiB for the agentic slice, ~25 min at 166 MiB/s) — that is unavoidable
+without a volume, and it is the real price of a fresh notebook.
+
+### A five-minute gate before the probe
+
+```bash
+python scripts/overfit_test.py --data-dir ./data --rows 16 --steps 40 --lr 5e-4
+```
+
+Can the projector move at all? It uses the same manifest, key index, plan,
+collate, projector init, optimizer and forward step as the probe. **PASS**
+(the best loss < 0.2, or a ≥5× drop) → the plumbing works and the probe's
+question is a science question. **FAIL** (the loss stays ≈1.1) → a bug, not a
+science problem; do not spend 4 GPU-hours proving it.
 
 ### Host: Molab (interactive) vs Modal
 

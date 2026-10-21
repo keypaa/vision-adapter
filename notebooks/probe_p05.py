@@ -159,6 +159,35 @@ def _(mo):
 def _(mo):
     mo.md(
         r"""
+        ## What a fresh session has, and what it does not
+
+        Every session starts empty, so it is worth being explicit about what
+        survives and what has to be re-fetched:
+
+        | | survives a fresh session? | cost to rebuild |
+        |---|---|---|
+        | the repo | **yes** (it is a clone you pull) | seconds |
+        | the run's checkpoints + log | **yes** — on HF, pushed every 100 steps | seconds to download |
+        | the filtered manifest | no | 84 MB (~1 min) — step 2 does it with `--fetch` |
+        | the key index | no | 28 s, automatic |
+        | the held-out packs | no | **published now** → ~3 GB (seconds); a build is ~175 GB (~15–25 min) |
+        | the corpus shards | no | **246 GiB** for the agentic slice — unavoidable, ~25 min at 166 MiB/s |
+        | the shard cache | no | it is the disk's job, not the network's |
+
+        So a fresh session costs roughly **30–45 minutes of downloads** before
+        the first training step, then 3.5–5 hours of run. That is the price
+        of not keeping a volume around — and it is why the *pack* is
+        published: it is the one artefact that is cheap to keep and
+        expensive to rebuild.
+        """
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        r"""
         ## Step 0 — sync the code, and clear the old temp shards
 
         Two things, both seconds:
@@ -288,10 +317,15 @@ def _(mo):
 
         With the pack it is ~3 GiB and every probe is a local read.
 
-        **Two things to know:**
+        **A fresh session has no `data/` and no caches**, so this step either
+        *downloads the published packs* (~3 GB, seconds) or *builds them*
+        (~50 shards, ~175 GB of transfer, ~15-25 min) and publishes them for
+        next time. The cell below tries the published ones first.
+
+        **Two things to know about a build:**
 
         * The shards are downloaded **whole** (pyarrow needs a local parquet
-          file), ~50 of them ≈ 175 GB of transfer. They now land in the
+          file), ~50 of them ≈ 175 GB of transfer. They land in the
           trainer's own cache (`data/cache`) and the LRU trims it, so the disk
           peak stays inside the budget — **not** in `/tmp`, which is small.
         * Expect a few minutes of downloading. Watch for one line per shard.
@@ -307,8 +341,21 @@ def _(mo):
 
 
 @app.cell
-def _(run_streaming):
-    run_streaming("python scripts/pack_val.py --n 1000 --out-dir ./data")
+def _(emit, run_streaming):
+    _have_packs = False
+    try:
+        from huggingface_hub import hf_hub_download
+
+        for _g in ("agentic", "doc", "conv"):
+            for _f in (f"val_pack_{_g}.parquet", f"val_pack_{_g}.map.json"):
+                hf_hub_download("keypa/vision-adapter-manifests", _f,
+                                repo_type="dataset", local_dir="./data")
+        _have_packs = True
+        emit("[notebook] published held-out packs downloaded -> ./data")
+    except Exception as _e:  # noqa: BLE001 — not published yet: build them
+        emit(f"[notebook] no published packs ({type(_e).__name__}) — building them")
+    if not _have_packs:
+        run_streaming("python scripts/pack_val.py --n 1000 --out-dir ./data --publish")
     return
 
 
@@ -441,7 +488,22 @@ def _(mo):
 
 
 @app.cell
-def _(REPO, run_streaming):
+def _(REPO, emit, run_streaming):
+    _log = REPO / "data" / "probe_log_p05.jsonl"
+    if not _log.is_file():
+        # A fresh session has no data/ — the log of a run from an EARLIER
+        # session lives on HF (pushed every save). Fetch it so the reading
+        # can happen in any session.
+        emit("[notebook] no local log — fetching it from HF")
+        try:
+            from huggingface_hub import hf_hub_download
+
+            hf_hub_download("keypa/vision-adapter-probe-checkpoints",
+                            "probe_log_p05.jsonl", repo_type="model",
+                            local_dir=str(REPO / "data"))
+        except Exception as _e:  # noqa: BLE001
+            emit(f"[notebook] no log on HF either ({type(_e).__name__}) — "
+                 "nothing to analyse yet")
     run_streaming(
         "python scripts/analyze_probe.py --log data/probe_log_p05.jsonl "
         "--out probe_p05.md"

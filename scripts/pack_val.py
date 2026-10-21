@@ -303,6 +303,24 @@ def _write_pack(args, group, chosen, index, cache_dir):
     side.write_text(json.dumps(source_to_emb, indent=1, sort_keys=True))
     print(f"[pack-val] {group} source_key -> emb map: {side} "
           f"({len(source_to_emb)} entries)")
+
+    if getattr(args, "publish", False):
+        from vision_adapter.data.stream import MANIFEST_REPO
+
+        # A fresh session has no data/ and no caches: without this, every
+        # session rebuilds the packs (which is where both of today's bugs
+        # were) and re-downloads ~175 GB of shards to do it. The packs are
+        # derived from public corpus data plus a manifest, so publishing them
+        # next to the manifest is safe -- and the next session just downloads
+        # ~3 GB instead.
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        for f in (out, side):
+            api.upload_file(path_or_fileobj=str(f), path_in_repo=f.name,
+                            repo_id=MANIFEST_REPO, repo_type="dataset",
+                            commit_message=f"val pack {f.name}")
+            print(f"[pack-val] published {f.name} -> hf:{MANIFEST_REPO}", flush=True)
     return 0
 
 
@@ -317,6 +335,10 @@ def main() -> int:
     ap.add_argument("--key-index", default=None)
     ap.add_argument("--cache-dir", default="data/cache",
                     help="where the key index is found (or built)")
+    ap.add_argument("--publish", action="store_true",
+                    help="upload the packs to the manifests repo, so the next "
+                         "session can download them instead of rebuilding "
+                         "(a fresh session has no caches and no data/)")
     ap.add_argument("--manifest", default=None, help="val manifest; HF when absent")
     ap.add_argument("--train-manifest", default=None)
     ap.add_argument("--dry-run", action="store_true",
