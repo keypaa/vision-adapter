@@ -240,6 +240,7 @@ def _write_pack(args, group, chosen, index, cache_dir):
         pf = pq.ParquetFile(local)
         wanted = by_shard[sf]
         n_done = 0
+        row_cursor = 0
         for rgi in range(pf.num_row_groups):
             if n_done >= len(wanted):
                 break
@@ -248,7 +249,12 @@ def _write_pack(args, group, chosen, index, cache_dir):
             nvs = tbl.column("n_vis").to_pylist()
             vbs = tbl.column("vis_bytes").to_pylist()
             for j, k in enumerate(keys):
-                r = wanted.get(j)
+                # The key index stores the GLOBAL row in the shard; `j` is the
+                # row WITHIN this row group. Matching on j alone finds only
+                # the rows that happen to sit in the first row group, and
+                # silently packs a biased subset of the val split (measured:
+                # most shards reported 0/N, a few N/N).
+                r = wanted.get(row_cursor + j)
                 if r is None:
                     continue
                 grid = r.get("grid_thw")
@@ -261,7 +267,17 @@ def _write_pack(args, group, chosen, index, cache_dir):
                 source_to_emb[k] = r["emb"]
                 n_done += 1
             del tbl, vbs
-        print(f"[pack-val]   {sf}: {n_done}/{len(wanted)} rows", flush=True)
+            row_cursor += len(keys)
+        if n_done != len(wanted):
+            # Loud, but not fatal: a smaller val set is still a held-out set,
+            # while NO pack sends the trainer back to streaming 28 shards per
+            # probe. The row count is printed at the end so the caller can
+            # judge whether the pack is big enough to read a val loss from.
+            print(f"[pack-val]   {sf}: {n_done}/{len(wanted)} rows "
+                  f"({len(wanted) - n_done} wanted rows NOT in this shard's "
+                  f"row groups)", flush=True)
+        else:
+            print(f"[pack-val]   {sf}: {n_done}/{len(wanted)} rows", flush=True)
         # The parquet API needs a LOCAL file, so a whole shard (0.4-60 GB) is
         # downloaded for it. With ~50 shards that is ~175 GB sitting in the
         # cache — and it is the SAME data the trainer is about to download
