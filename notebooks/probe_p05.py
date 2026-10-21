@@ -27,7 +27,11 @@ def _():
     # --- credentials -------------------------------------------------------
     # Paste your WRITE token here (this cell is never committed), or export
     # HF_TOKEN in the environment before opening the notebook.
-    os.environ.setdefault("HF_TOKEN", "")
+    # os.environ["HF_TOKEN"] = "hf_..."
+    if os.environ.get("HF_TOKEN", "").strip():
+        os.environ["HF_TOKEN"] = os.environ["HF_TOKEN"].strip()
+    else:
+        os.environ.pop("HF_TOKEN", None)  # anonymous reads are fine; pushes are not
     os.environ["VISION_ADAPTER_PUSH_HF"] = "1"
     os.environ["VISION_ADAPTER_HF_CKPT_REPO"] = "keypa/vision-adapter-probe-checkpoints"
     os.environ["VISION_ADAPTER_CKPT_TAG"] = "p05"
@@ -94,7 +98,7 @@ def _():
                            capture_output=True, text=True).stdout.strip()
     emit("git : " + _head + ("" if _head.startswith("393d3b1")
                              else "  <-- NOT 393d3b1: run `git pull` in a terminal first"))
-    return DATA_DIR, REPO, emit, run_streaming
+    return DATA_DIR, REPO, emit, os, run_streaming
 
 
 @app.cell
@@ -128,7 +132,7 @@ def _(run_streaming):
 
 
 @app.cell
-def _(run_streaming):
+def _(os, run_streaming):
     """Cell 4 — THE PROBE (3.5-4.5 h; keep this tab open and watch it).
 
     agentic slice only (51,809 rows, every row <= 380 visual tokens = the
@@ -140,6 +144,11 @@ def _(run_streaming):
       step 500  -> ~25-30 min in (whole-shard path) or ~50 min (Range path)
       end       -> run_end wall_min ~ 200-270
     """
+    if not os.environ.get("HF_TOKEN"):
+        raise RuntimeError(
+            "HF_TOKEN is not set. The probe pushes its checkpoints and its log to "
+            "HF; without a token the run would finish with nothing to show for it. "
+            "Set the token in cell 1 and re-run this cell.")
     run_streaming(
         "python -m vision_adapter train --data-dir ./data --config probe "
         "--max-steps 4000 --groups agentic --lr-schedule constant --lr 5e-4 "
