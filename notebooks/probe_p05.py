@@ -89,16 +89,48 @@ def _():
     emit("HF_TOKEN: " + ("present" if os.environ.get("HF_TOKEN")
                          else "MISSING — the run cannot push checkpoints"))
     emit("run tag: " + os.environ["VISION_ADAPTER_CKPT_TAG"])
-    emit("disk: " + subprocess.run("df -h . | tail -1", shell=True,
-                                   capture_output=True, text=True).stdout.strip())
-    emit("gpu : " + (subprocess.run(
-        "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader",
-        shell=True, capture_output=True, text=True).stdout.strip() or "no nvidia-smi"))
-    _head = subprocess.run("git log --oneline -1", shell=True,
+
+    def disk_facts(paths=(".", "/tmp", "/dev/shm")):
+        """The REAL free space, and the write speed of the mount the cache lives on.
+
+        `df` misreports some mounts (a FUSE/overlay mount can report a size of
+        8.0E), and the whole-shard cache budget is derived from the free space
+        (half of it). So the number that decides the transport is statvfs's,
+        not df's — and if the mount lies about its size, the download can fail
+        with ENOSPC mid-shard (the loader then falls back to Range: correct,
+        but ~1 h slower).
+        """
+        for p in paths:
+            try:
+                st = os.statvfs(p)
+                free = st.f_bavail * st.f_frsize / 2**30
+                total = st.f_blocks * st.f_frsize / 2**30
+                emit(f"disk {p:32s} free {free:9.1f} GiB   total {total:9.1f} GiB")
+            except Exception as e:  # noqa: BLE001
+                emit(f"disk {p:32s} ERR {e}")
+        try:
+            _p = REPO / "data" / ".wtest"
+            _p.parent.mkdir(parents=True, exist_ok=True)
+            _t = time.time()
+            with open(_p, "wb") as f:
+                f.write(os.urandom(256 * 2**20))
+                f.flush()
+                os.fsync(f.fileno())
+            _dt = max(time.time() - _t, 1e-9)
+            _p.unlink(missing_ok=True)
+            emit(f"write 256 MiB to the data dir: {_dt:.1f}s -> {256/_dt:.0f} MiB/s")
+        except Exception as e:  # noqa: BLE001
+            emit(f"write probe failed: {e}")
+
+    disk_facts()
+
+    _head = subprocess.run("git rev-parse --short HEAD", shell=True,
                            capture_output=True, text=True).stdout.strip()
-    emit("git : " + _head + ("" if _head.startswith("393d3b1")
-                             else "  <-- NOT 393d3b1: run `git pull` in a terminal first"))
-    return DATA_DIR, REPO, emit, os, run_streaming
+    _up = subprocess.run("git rev-parse --short origin/master", shell=True,
+                         capture_output=True, text=True).stdout.strip()
+    emit(f"git : HEAD {_head} | origin/master {_up}"
+         + ("" if _head == _up else "   <-- PULL FIRST: git pull"))
+    return DATA_DIR, REPO, disk_facts, emit, os, run_streaming
 
 
 @app.cell
