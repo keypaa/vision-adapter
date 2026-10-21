@@ -570,10 +570,26 @@ train manifest) and the trainer re-checks it.
 
 ### Host: Molab (interactive) vs Modal
 
+**On Molab, run it as a NOTEBOOK, not as a shell job.** Molab's rules
+terminate notebooks used for "non-interactive jobs" and forbid SSH-style
+remote control — a detached `nohup … &` is precisely the shape that got a
+previous session banned. `notebooks/probe_p05.py` is a marimo notebook that
+does the whole thing in five cells (setup → manifest → val packs → the probe
+→ the reading), streams the child's output *into the cell* (a child's stdout
+goes to fd 1 and would bypass marimo's capture, so the cell would look
+frozen for hours), and prints the pre-registered outcome table next to the
+measured numbers in the last cell.
+
+Open it in the Molab notebook, paste the HF token into cell 1, run the cells
+in order, and **keep the tab open and watched**. While it runs, use the
+other cells to look at things (peek at `data/probe_log_p05.jsonl`, watch the
+loss) — that is what makes the session interactive compute rather than a
+batch job.
+
 | | Molab | Modal |
 |---|---|---|
 | the rules | "notebooks for **non-interactive jobs**" may be terminated; no SSH | batch platform, designed for this |
-| how to run it | **a foreground cell you watch** (not `nohup ... &`) | a normal background job |
+| how to run it | the marimo notebook (`notebooks/probe_p05.py`), foreground cells | a normal job; the same commands inside the container |
 | data to pull | 133 GiB of agentic rows (246 GiB of shards) | same |
 | disk | interactive sessions have room for a cache | the container disk decides the path |
 
