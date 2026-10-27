@@ -100,9 +100,9 @@ def main() -> int:
     from vision_adapter.core import (
         build_projector,
         make_collate,
-        resolve_dtype,
         train_step_qwen,
     )
+    from vision_adapter.train import resolve_dtype
     from vision_adapter.data.stream import (
         EmbStreamDataset,
         build_epoch_plan,
