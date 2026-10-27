@@ -24,9 +24,9 @@ def _(mo):
         | questions | 61% served | **100% served** |
         | held-out probe | never ran | every 250 steps (16 points) |
 
-        **The order matters — run the cells top to bottom, and do not skip
-        step 1.** It is a 5-minute gate that catches a broken plumbing
-        before 4 GPU-hours are spent proving it.
+        **The order matters — run the cells top to bottom.** Step 1 prepares
+        the manifest; Step 2 is the 5-minute gate that catches broken plumbing
+        before 4 GPU-hours are spent proving it. Do not skip either step.
 
         ### Molab rules (they got a previous session banned)
 
@@ -168,7 +168,7 @@ def _(mo):
         |---|---|---|
         | the repo | **yes** (it is a clone you pull) | seconds |
         | the run's checkpoints + log | **yes** — on HF, pushed every 100 steps | seconds to download |
-        | the filtered manifest | no | 84 MB (~1 min) — step 2 does it with `--fetch` |
+        | the filtered manifest | no | 84 MB (~1 min) — step 1 does it with `--fetch` |
         | the key index | no | 28 s, automatic |
         | the held-out packs | no | **published now** → ~3 GB (seconds); a build is ~175 GB (~15–25 min) |
         | the corpus shards | no | **246 GiB** for the agentic slice — unavoidable, ~25 min at 166 MiB/s |
@@ -228,50 +228,11 @@ def _(REPO, emit, run_streaming):
 def _(mo):
     mo.md(
         r"""
-        ## Step 1 — the 5-minute gate: can the projector even move?
+        ## Step 1 — the filtered manifest (measured geometry, no long answers)
 
-        This is the cheapest experiment in the project and it decides whether
-        the 4-hour probe is worth running.
-
-        **The question:** train on **16 fixed rows** and see whether the loss
-        falls. Memorising 16 rows is trivial for a projector. If the loss
-        will not move, then the collate, the position ids, the LR or the
-        projector scale are broken — and a 4,000-step probe would spend four
-        hours proving exactly that.
-
-        It uses the **same** manifest, key index, plan, dataset, collate,
-        projector init, optimizer and forward step as the probe, so this is
-        evidence about the probe, not about a toy.
-
-        **How to read it:**
-
-        | output | meaning | what to do |
-        |---|---|---|
-        | `-> PASS`, loss 1.1 → <0.2 | the plumbing works | **continue to step 2** |
-        | `-> FAIL`, loss stays ≈1.1 | a bug, not a science problem | **stop** — paste the output here, do not run the probe |
-        | non-finite loss | the LR/scale is off | stop, same as FAIL |
-
-        Cost: ~1 min model load + 40 steps × ~2 s ≈ **3–5 minutes**, and it
-        downloads only 16 rows' embeddings (~50 MB).
-        """
-    )
-    return
-
-
-@app.cell
-def _(run_streaming):
-    run_streaming(
-        "python scripts/overfit_test.py --data-dir ./data --rows 16 --steps 40 "
-        "--lr 5e-4 --groups agentic"
-    )
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md(
-        r"""
-        ## Step 2 — the filtered manifest (measured geometry, no long answers)
+        Run this before the 5-minute gate: the gate needs a local train
+        manifest, and `--fetch` downloads the measured source manifest when
+        this is a fresh session.
 
         Drops the **645** rows the source recipe says prevent the grokking
         event (445 HTML-generation targets + 200 rationale-style answers) and
@@ -300,6 +261,49 @@ def _(run_streaming):
         "--manifest data/train_manifest_grids.jsonl "
         "--out data/train_manifest_filtered.jsonl "
         "--max-answer-words 20 --fetch"
+    )
+    return
+
+
+@app.cell
+def _(mo):
+    mo.md(
+        r"""
+        ## Step 2 — the 5-minute gate: can the projector even move?
+
+        This is the cheapest experiment in the project and it decides whether
+        the 4-hour probe is worth running.
+
+        **The question:** train on **16 fixed rows** and see whether the loss
+        falls. Memorising 16 rows is trivial for a projector. If the loss
+        will not move, then the collate, the position ids, the LR or the
+        projector scale are broken — and a 4,000-step probe would spend four
+        hours proving exactly that.
+
+        It uses the **same** manifest, key index, plan, dataset, collate,
+        projector init, optimizer and forward step as the probe, so this is
+        evidence about the probe, not about a toy.
+
+        **How to read it:**
+
+        | output | meaning | what to do |
+        |---|---|---|
+        | `-> PASS`, loss 1.1 → <0.2 | the plumbing works | **continue to step 3** |
+        | `-> FAIL`, loss stays ≈1.1 | a bug, not a science problem | **stop** — paste the output here, do not run the probe |
+        | non-finite loss | the LR/scale is off | stop, same as FAIL |
+
+        Cost: ~1 min model load + 40 steps × ~2 s ≈ **3–5 minutes**, and it
+        downloads only 16 rows' embeddings (~50 MB).
+        """
+    )
+    return
+
+
+@app.cell
+def _(run_streaming):
+    run_streaming(
+        "python scripts/overfit_test.py --data-dir ./data --rows 16 --steps 40 "
+        "--lr 5e-4 --groups agentic"
     )
     return
 
