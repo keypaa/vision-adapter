@@ -100,12 +100,19 @@ def _load_backbone(device, dtype_arg="auto"):
     return tok, model, dtype
 
 
-def score_text_nll(model, proj, vis, user, assistant, tok, device, max_len=4096):
-    """Teacher-forced NLL of one (image, user, assistant) triple. No sampling."""
+def score_text_nll(model, proj, vis, user, assistant, tok, device, max_len=4096,
+                   grid_thw=None):
+    """Teacher-forced NLL of one (image, user, assistant) triple. No sampling.
+
+    Pass the image's measured grid when available so its visual tokens receive
+    the same positional geometry used during training.
+    """
     from vision_adapter.core import make_collate
 
     coll = make_collate(tok, tok.pad_token_id, max_len=max_len, vision_dim=4096)
-    batch = coll([{"vis": vis, "user": user, "assistant": assistant, "g": "eval"}])
+    item = {"vis": vis, "user": user, "assistant": assistant, "g": "eval",
+            "grid_thw": grid_thw}
+    batch = coll([item])
     loss, _ = forward_loss(model, proj, batch, device)
     return loss
 
@@ -143,10 +150,22 @@ def _run_discrimination(model, tok, ds, args, llm_dim, dtype, device, data_dir, 
     img_wins = img_trials = txt_wins = txt_trials = 0
     m_img = m_txt = 0.0
     for a, b in pairs:
-        s_aa = score_text_nll(model, proj, a["vis"], a["user"], a["assistant"], tok, device)
-        s_ab = score_text_nll(model, proj, b["vis"], a["user"], a["assistant"], tok, device)
-        s_bb = score_text_nll(model, proj, b["vis"], b["user"], b["assistant"], tok, device)
-        s_ba = score_text_nll(model, proj, a["vis"], b["user"], b["assistant"], tok, device)
+        s_aa = score_text_nll(
+            model, proj, a["vis"], a["user"], a["assistant"], tok, device,
+            grid_thw=a.get("grid_thw"),
+        )
+        s_ab = score_text_nll(
+            model, proj, b["vis"], a["user"], a["assistant"], tok, device,
+            grid_thw=b.get("grid_thw"),
+        )
+        s_bb = score_text_nll(
+            model, proj, b["vis"], b["user"], b["assistant"], tok, device,
+            grid_thw=b.get("grid_thw"),
+        )
+        s_ba = score_text_nll(
+            model, proj, a["vis"], b["user"], b["assistant"], tok, device,
+            grid_thw=a.get("grid_thw"),
+        )
         img_wins += (s_aa < s_ab) + (s_bb < s_ba)
         img_trials += 2
         m_img += (s_ab - s_aa) + (s_ba - s_bb)

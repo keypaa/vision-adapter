@@ -26,7 +26,7 @@ from huggingface_hub import hf_hub_download
 from transformers import AutoTokenizer
 from vision_adapter.models.moonvit import load_moonvit_from_safetensors
 from vision_adapter.models.preprocess import collate_images
-from vision_adapter.core import build_projector, make_collate, embeds_for
+from vision_adapter.core import build_projector, embeds_for
 
 def build_legacy_gen_kwargs(batch, device):
     """Generation kwargs for the legacy splice layout, positions included.
@@ -72,7 +72,7 @@ def resolve_qwen_class(native: bool):
 
 
 def manual_generate(model, inputs_embeds, attention_mask, max_new_tokens, mode="card",
-                    eos_id=None, seed=0):
+                    eos_id=None, seed=0, position_ids=None):
     """Hand-rolled autoregressive loop with KV-cache (no transformers generate).
 
     Exists because generate-from-embeds yields 0 tokens on long prefixes
@@ -90,12 +90,14 @@ def manual_generate(model, inputs_embeds, attention_mask, max_new_tokens, mode="
     out = []
     past = None
     cur_embeds, cur_mask = inputs_embeds, attention_mask
+    cur_position_ids = position_ids
     try:
         with torch.no_grad():
             for _ in range(max_new_tokens):
+                kwargs = {"position_ids": cur_position_ids} if cur_position_ids is not None else {}
                 res = model.model(input_ids=None, inputs_embeds=cur_embeds,
                                   attention_mask=cur_mask, past_key_values=past,
-                                  use_cache=True)
+                                  use_cache=True, **kwargs)
                 logits = model.lm_head(res.last_hidden_state[:, -1]).float()
                 if params.get("do_sample"):
                     probs = torch.softmax(
@@ -116,9 +118,30 @@ def manual_generate(model, inputs_embeds, attention_mask, max_new_tokens, mode="
                 cur_embeds = model.get_input_embeddings()(nxt)
                 cur_mask = torch.ones((cur_mask.shape[0], cur_mask.shape[1] + 1),
                                       dtype=cur_mask.dtype, device=cur_mask.device)
+                if cur_position_ids is not None:
+                    next_text_pos = cur_position_ids[0, :, -1:] + 1
+                    cur_position_ids = next_text_pos.unsqueeze(0).expand(
+                        cur_position_ids.shape[0], -1, -1)
     finally:
         model.train(was_training)
     return out
+
+
+def build_generation_batch(tok, pad_id, vis, user, grid_thw, max_seq_len, max_new_tokens):
+    """Build a generation prefix with training geometry and room for decoding."""
+    from vision_adapter.core import make_collate
+
+    prefix_limit = max_seq_len - max_new_tokens
+    if prefix_limit < 3:
+        raise ValueError("max_seq_len must leave room for the prefix and generated tokens")
+    collate = make_collate(tok, pad_id, max_len=prefix_limit, vision_dim=vis.shape[-1])
+    return collate([{
+        "vis": vis,
+        "user": user,
+        "assistant": "",
+        "g": "test",
+        "grid_thw": grid_thw,
+    }])
 
 
 def strip_trailing_eos(batch, eos_id):
@@ -148,6 +171,8 @@ def main():
     ap.add_argument("--url", default="https://unsloth.ai/cgi/image/unsloth_new_wb_logo_vnrA8AASj-jN5wy8UIYE-.png?format=raw", help="image URL (si --image non donné)")
     ap.add_argument("--image", default=None, help="chemin local image uploadée (ex: /content/image.png) — prioritaire sur --url")
     ap.add_argument("--max_new", type=int, default=64)
+    ap.add_argument("--max-seq-len", "--max_seq_len", dest="max_seq_len", type=int, default=4096,
+                    help="total prefix + generation budget (training default: 4096)")
     ap.add_argument("--gen-mode", choices=("greedy", "card"), default="card")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--debug-ids", action="store_true", help="print raw generated ids + text-only control")
@@ -156,16 +181,23 @@ def main():
     ap.add_argument("--decode", choices=("generate", "manual"), default="generate",
                     help="generate: transformers generate(); manual: hand-rolled KV-cache loop")
     args = ap.parse_args()
+    if args.max_new <= 0 or args.max_seq_len <= args.max_new:
+        ap.error("--max-seq-len must be greater than positive --max_new")
+    if args.prefix_mode == "native" and args.decode == "manual":
+        ap.error("--decode manual currently supports --prefix-mode legacy only")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device {device} cuda={torch.cuda.is_available()}")
     if device.type=="cuda":
         print(f"gpu {torch.cuda.get_device_name(0)} vram {torch.cuda.get_device_properties(0).total_memory/2**30:.1f}GiB")
 
-    # 1. image — local upload prioritaire sinon URL
-    if args.image and Path(args.image).is_file():
-        print(f"loading local image {args.image}")
-        img = Image.open(args.image).convert("RGB")
+    # 1. image — an explicitly requested local file must not silently fall back to the demo URL.
+    if args.image:
+        image_path = Path(args.image)
+        if not image_path.is_file():
+            ap.error(f"--image file does not exist: {image_path}")
+        print(f"loading local image {image_path}")
+        img = Image.open(image_path).convert("RGB")
     else:
         print(f"downloading {args.url}")
         r = requests.get(args.url, timeout=30)
@@ -222,19 +254,23 @@ def main():
     proj.load_state_dict(state)
     print(f"projector {args.ckpt} loaded")
 
-    coll = make_collate(tok, tok.pad_token_id, max_len=512, vision_dim=4096)
-    items = [{"vis": vis, "user": args.prompt, "assistant": "", "g": "test"}]
-    batch = coll(items)
-    print(f"batch input_ids {batch['input_ids'].shape} n_vis {vis.shape[0]}")
+    grid_thw = pack["grid_thws"][0].tolist()
+    batch = build_generation_batch(
+        tok, tok.pad_token_id, vis, args.prompt, grid_thw,
+        max_seq_len=args.max_seq_len, max_new_tokens=args.max_new,
+    )
+    kept_n_vis = int(batch["n_vis"][0])
+    print(f"batch input_ids {batch['input_ids'].shape} n_vis={kept_n_vis}/{vis.shape[0]} "
+          f"grid_thw={batch['grid_thw'][0]}", flush=True)
 
     print(f"\nPrompt: {args.prompt!r}")
     print("Generating (Qwen embeds_for, not DeepSeek hook)...")
     extra_kwargs: dict = {}
     if args.prefix_mode == "native":
-        from scripts.native_prefix import build_native_generate_inputs, grid_for_nvis
+        from scripts.native_prefix import build_native_generate_inputs
 
-        grid = torch.stack([grid_for_nvis(int(n)) for n in batch["n_vis"].tolist()])
-        print(f"native grid (synthetic, N==n_vis): {grid.tolist()}")
+        grid = torch.as_tensor(batch["grid_thw"], dtype=torch.long)
+        print(f"native grid (measured): {grid.tolist()}")
         nin = build_native_generate_inputs(model, proj, batch, tok, grid, str(device))
         inp = {"inputs_embeds": nin["inputs_embeds"], "attention_mask": nin["attention_mask"]}
         extra_kwargs = {"mm_token_type_ids": nin["mm_token_type_ids"],
@@ -252,7 +288,8 @@ def main():
     if args.decode == "manual":
         new_ids = manual_generate(model, inp["inputs_embeds"], inp["attention_mask"],
                                   max_new_tokens=args.max_new, mode=args.gen_mode,
-                                  eos_id=tok.eos_token_id, seed=args.seed)
+                                  eos_id=tok.eos_token_id, seed=args.seed,
+                                  position_ids=extra_kwargs.get("position_ids"))
         gen = tok.decode(new_ids, skip_special_tokens=True)
     else:
         out_ids = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"], max_new_tokens=args.max_new, pad_token_id=tok.pad_token_id, **extra_kwargs, **build_gen_kwargs(args.gen_mode))
@@ -275,7 +312,7 @@ def main():
         torch.manual_seed(args.seed)
         out_nocache = model.generate(inputs_embeds=inp["inputs_embeds"], attention_mask=inp["attention_mask"],
                                      max_new_tokens=args.max_new, pad_token_id=tok.pad_token_id,
-                                     use_cache=False, **build_gen_kwargs(args.gen_mode))
+                                     use_cache=False, **extra_kwargs, **build_gen_kwargs(args.gen_mode))
         nc_new = out_nocache[0][cut:].tolist()
         print(f"DEBUG nocache new_tokens={len(nc_new)} ids={nc_new[:20]}")
         print(f"DEBUG nocache Gen: {tok.decode(nc_new, skip_special_tokens=True)!r}")

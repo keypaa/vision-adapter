@@ -73,6 +73,44 @@ def test_gen_kwargs_card_matches_model_card_vl_recipe():
     assert card == {"do_sample": True, "temperature": 0.7, "top_p": 0.8, "top_k": 20}
 
 
+def test_generation_batch_keeps_measured_grid_and_reserves_context():
+    from scripts.colab_unsloth_test import build_generation_batch
+
+    tok = _stub_tok()
+    vis = torch.zeros(700, 8)
+    grid = [1, 40, 70]
+    batch = build_generation_batch(
+        tok, tok.pad_token_id, vis, "close", grid,
+        max_seq_len=4096, max_new_tokens=64,
+    )
+    assert batch["n_vis"].tolist() == [700]
+    assert batch["grid_thw"] == [grid]
+    assert int(batch["attention_mask"].sum()) + 64 <= 4096
+
+
+def test_manual_generate_passes_and_advances_position_ids(monkeypatch):
+    from scripts.colab_unsloth_test import manual_generate
+
+    model = _tiny_qwen()
+    original_forward = model.model.forward
+    seen = []
+
+    def capture_forward(*args, **kwargs):
+        seen.append(kwargs["position_ids"].detach().clone())
+        return original_forward(*args, **kwargs)
+
+    monkeypatch.setattr(model.model, "forward", capture_forward)
+    length = 6
+    pos = torch.arange(length).view(1, 1, length).expand(4, 1, length).clone()
+    manual_generate(
+        model, torch.randn(1, length, 32), torch.ones(1, length, dtype=torch.long),
+        max_new_tokens=2, mode="greedy", eos_id=-1, position_ids=pos,
+    )
+    assert seen[0].shape == (4, 1, length)
+    assert seen[1].shape == (4, 1, 1)
+    assert torch.all(seen[1] == length)
+
+
 def test_native_mode_resolves_conditional_generation_class():
     import inspect
 
@@ -121,6 +159,27 @@ def test_score_text_nll_structure_and_sensitivity():
     assert nll_same == nll_same2  # deterministic
     assert nll_same > 0 and nll_swap > 0  # finite positive NLLs
     assert nll_same != nll_swap  # vis actually conditions the score
+
+
+def test_score_text_nll_preserves_measured_grid(monkeypatch):
+    from scripts import eval_heldout
+
+    captured = {}
+
+    def capture_batch(model, proj, batch, device):
+        captured["batch"] = batch
+        return 1.0, 1
+
+    monkeypatch.setattr(eval_heldout, "forward_loss", capture_batch)
+    tok = _stub_tok()
+    grid = [1, 4, 4]
+    loss = eval_heldout.score_text_nll(
+        None, None, torch.zeros(4, 4096), "u", "answer", tok, "cpu",
+        grid_thw=grid,
+    )
+    assert loss == 1.0
+    assert captured["batch"]["grid_thw"] == [grid]
+    assert captured["batch"]["n_vis"].tolist() == [4]
 
 
 def test_discrimination_pairs_cover_rows():
