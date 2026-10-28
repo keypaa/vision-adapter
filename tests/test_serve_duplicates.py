@@ -176,6 +176,38 @@ def test_loader_serves_every_plan_row_including_duplicates(tmp_path):
     assert served[:3] == ["a0q0", "a1q0", "a2q0"], served[:3]
 
 
+def test_range_only_loader_avoids_whole_shard_download(tmp_path, monkeypatch):
+    import vision_adapter.data.stream as st
+
+    shard = _write_shard(tmp_path / "emb_0000.parquet", n_rows=128, n_vis=4)
+    data = shard.read_bytes()
+    fetched = []
+
+    def fake_range(_url, start, end, retries=3):
+        fetched.append((start, end))
+        return data[start:end + 1]
+
+    monkeypatch.setattr(st, "_remote_size", lambda _url: len(data))
+    monkeypatch.setattr(st, "_fetch_range", fake_range)
+    monkeypatch.setattr(st, "_get_hf_shard_path", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        st, "_download_shard_hf_transfer",
+        lambda *_a, **_kw: (_ for _ in ()).throw(AssertionError("whole shard download")),
+    )
+    row = {"_row": 3, "emb": "embeddings/k0003.pt", "user": "u",
+           "assistant": "a", "g": "agentic", "grid_thw": [1, 4, 4]}
+    ds = st.EmbStreamDataset(
+        {"data/emb_0000.parquet": [row]}, ["data/emb_0000.parquet"],
+        rg_cache_dir=str(tmp_path / "rg_cache"), range_only=True,
+    )
+
+    got = list(ds)
+    assert len(got) == 1
+    assert got[0]["emb"] == row["emb"]
+    assert got[0]["vis"].shape == (4, 4096)
+    assert fetched  # metadata/footer and the selected row group were read by Range
+
+
 def test_loader_resume_skips_the_first_rows(tmp_path):
     from vision_adapter.data.stream import EmbStreamDataset, group_rows_by_span
 

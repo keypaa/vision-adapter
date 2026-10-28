@@ -867,6 +867,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
         rg_cache_dir: str | None = None,
         vision_dim: int = VISION_DIM,
         local_shards: dict[str, str] | None = None,
+        range_only: bool = False,
     ):
         super().__init__()
         self.plan, self.order = plan, stream_order
@@ -877,6 +878,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
         # this: one file, no fetch, no prefetch daemon. Rows still carry `_row`
         # because the reader indexes row groups by position either way.
         self.local_shards = local_shards or {}
+        self.range_only = bool(range_only)
         if rg_cache_dir:
             os.makedirs(rg_cache_dir, exist_ok=True)
 
@@ -894,7 +896,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
             if not rows_here:
                 continue
             # Schedule next shard download while GPU trains current shard (pipelined 12min cold over 33h)
-            if self.rg_cache_dir and sf in shard_idx:
+            if self.rg_cache_dir and not self.range_only and sf in shard_idx:
                 cur = shard_idx[sf]
                 if cur + 1 < len(shard_list) and (next_shard_fut is None or next_shard_fut.done()):
                     nxt = shard_list[cur + 1]
@@ -910,7 +912,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
             local_path: str | None = self.local_shards.get(sf)
             if local_path is None:
                 local_path = _get_hf_shard_path(sf, cache_dir=self.rg_cache_dir)
-            if local_path is None:
+            if local_path is None and not self.range_only:
                 local_path = _download_shard_hf_transfer(sf, cache_dir=self.rg_cache_dir)
             if local_path and os.path.exists(local_path):
                 pf = pq.ParquetFile(local_path)

@@ -268,7 +268,8 @@ def main() -> int:
 
     plan = plan_for_selected_rows(selected)
     ds = EmbStreamDataset(
-        plan, order, rg_cache_dir=str(cache_dir / "rg_cache"), vision_dim=VISION_DIM,
+        plan, order, rg_cache_dir=str(cache_dir / "rg_cache"),
+        vision_dim=VISION_DIM, range_only=True,
     )
     streamed = validate_streamed_rows(selected, list(ds))
     print(f"[heldout-gen] verified {len(streamed)} exact real embeddings; "
