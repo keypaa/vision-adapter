@@ -1211,12 +1211,11 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
     tok_hf = _ghf()
     if tok_hf:
         os.environ["HF_TOKEN"] = tok_hf
-    # Manifest: prefer the measured-geometry one, else the plain one, else fetch.
-    manifest_name = None
-    for candidate in (MEASURED_MANIFEST_FILE, PLAIN_MANIFEST_FILE):
-        if (data_dir / candidate).is_file():
-            manifest_name = candidate
-            break
+    # Use the same filtered > measured > plain preference as the rest of the trainer.
+    try:
+        manifest_name = resolve_manifest_name(data_dir)
+    except FileNotFoundError:
+        manifest_name = None
     local_manifest = data_dir / manifest_name if manifest_name else None
     if local_manifest is not None:
         rows, header = load_manifest(local_manifest)
@@ -1914,15 +1913,20 @@ def run_train(
             print(str(e), flush=True)
             raise
 
-    manifest_path = dd / "train_manifest.jsonl"
-    if manifest_path.exists():
+    try:
+        manifest_name = resolve_manifest_name(dd)
+        manifest_path = dd / manifest_name
+    except FileNotFoundError:
+        manifest_name = None
+        manifest_path = None
+    if manifest_path is not None:
         rows, header = load_manifest(manifest_path)
         is_fake_fixture = header is not None and any("fake" in r.get("emb", "") for r in rows[:10])
         if is_fake_fixture or len(rows) <= 200:
             print(f"[train] detected {'fake fixture' if is_fake_fixture else 'small manifest'} ({len(rows)} rows) — running tiny smoke (no 2B download)", flush=True)
             return _smoke_train_with_fake_data(dd, cfg, max_steps, dev)
     else:
-        print(f"[train] no local manifest at {manifest_path} — will fetch from HF (keypa/vision-adapter-manifests)", flush=True)
+        print(f"[train] no local train manifest in {dd} — will fetch from HF (keypa/vision-adapter-manifests)", flush=True)
 
     # Real data: native HF streaming (no grok shell-out).
     # Uses vision_adapter/data/stream.py (RemoteShard cluster sampling) so
