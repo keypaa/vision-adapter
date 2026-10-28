@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """Generate answers for measured, genuinely held-out agentic examples.
 
-This deliberately uses only manifest rows mapped to emb_0000/emb_0001, which
-are excluded from training. It streams the exact selected embedding keys and
-requires each row's measured grid; it never substitutes a synthetic/noise image.
+By default, this samples emb_0000/emb_0001, which are excluded from training.
+For a representative evaluation, pass a disjoint validation manifest with
+measured grids and a visual-token range. It streams exact embedding keys and
+never substitutes synthetic geometry or noise images.
 
-Example (Colab T4):
-    VISION_ADAPTER_PROJECTOR=scaled python scripts/generate_heldout.py \
-        --ckpt ./data/checkpoints/projector_p05_step4000.pt --n 3
+Example (Colab T4, after preparing the measured validation manifest):
+    VISION_ADAPTER_PROJECTOR=scaled python scripts/generate_heldout.py \\
+        --manifest data/val_generation_measured.jsonl \\
+        --min-vis-tokens 300 --max-vis-tokens 380 --ckpt \\
+        ./data/checkpoints/projector_p05_step4000.pt --n 30
 """
 from __future__ import annotations
 
@@ -42,7 +45,8 @@ def _grid_n_vis(grid_thw) -> int:
 
 
 def select_agentic_heldout_rows(rows, index, n=3, seed=0,
-                                max_n_vis=AGENTIC_MAX_VIS_TOKENS):
+                                max_n_vis=AGENTIC_MAX_VIS_TOKENS,
+                                min_n_vis=0, allowed_shards=HELDOUT_SHARDS):
     """Choose deterministically among complete, in-regime held-out agentic rows.
 
     The returned rows carry private stream-location fields used to read those
@@ -52,10 +56,10 @@ def select_agentic_heldout_rows(rows, index, n=3, seed=0,
     """
     candidates = []
     counts = {"not_heldout": 0, "not_agentic": 0, "missing_grid": 0,
-              "over_token_cap": 0}
+              "under_token_floor": 0, "over_token_cap": 0}
     for row in rows:
         loc = index.get(row.get("emb"))
-        if loc is None or loc[0] not in HELDOUT_SHARDS:
+        if loc is None or (allowed_shards is not None and loc[0] not in allowed_shards):
             counts["not_heldout"] += 1
             continue
         if row.get("g") != "agentic":
@@ -71,6 +75,9 @@ def select_agentic_heldout_rows(rows, index, n=3, seed=0,
                 f"measured grid/token mismatch for {row.get('emb')}: "
                 f"grid gives {n_vis}, index gives {loc[2]}"
             )
+        if n_vis < min_n_vis:
+            counts["under_token_floor"] += 1
+            continue
         if n_vis > max_n_vis:
             counts["over_token_cap"] += 1
             continue
@@ -177,8 +184,8 @@ def _score_outputs(rows, outputs):
             ))
     print(f"\nformat/action: verb {verb}/{len(outputs)}, syntax {syntax}/{len(outputs)}")
     if distances:
-        print(f"coordinate error: median {statistics.median(distances):.0f}px; "
-              f"within 100px {sum(d < 100 for d in distances)}/{len(outputs)}")
+        print(f"coordinate error: median {statistics.median(distances):.0f} normalized units; "
+              f"within 100 units {sum(d < 100 for d in distances)}/{len(outputs)}")
     else:
         print("coordinate error: not scored (no start_box coordinates in both target and output)")
 
@@ -192,6 +199,12 @@ def main() -> int:
     ap.add_argument("--max-new", type=int, default=64)
     ap.add_argument("--max-seq-len", type=int, default=4096)
     ap.add_argument("--max-vis-tokens", type=int, default=AGENTIC_MAX_VIS_TOKENS)
+    ap.add_argument("--min-vis-tokens", type=int, default=0,
+                    help="exclude smaller images (use 300 for representative agentic validation)")
+    ap.add_argument("--manifest", default=None,
+                    help="local disjoint validation manifest; defaults to measured train manifest + held-out shards")
+    ap.add_argument("--train-manifest", default=None,
+                    help="local train manifest for disjointness verification (HF manifest used if omitted)")
     ap.add_argument("--gen-mode", choices=("greedy", "card"), default="card")
     ap.add_argument("--dtype", choices=("auto", "float16", "bfloat16", "float32"), default="auto")
     args = ap.parse_args()
@@ -200,8 +213,9 @@ def main() -> int:
 
     from vision_adapter.core import build_projector, embeds_for
     from vision_adapter.data.stream import (
-        EmbStreamDataset, build_key_index, fetch_manifest,
+        EmbStreamDataset, build_key_index, fetch_manifest, list_shards,
     )
+    from vision_adapter.manifest import load_manifest
     from scripts.colab_unsloth_test import (
         build_generation_batch, manual_generate, strip_trailing_eos,
     )
@@ -209,19 +223,46 @@ def main() -> int:
 
     data_dir = Path(args.data_dir)
     cache_dir = data_dir / "cache"
-    order = sorted(HELDOUT_SHARDS)
-    print(f"[heldout-gen] measured manifest + index for {order}", flush=True)
-    manifest_rows = fetch_manifest(cache_dir=str(cache_dir))
+    if args.manifest:
+        manifest_path = Path(args.manifest)
+        if not manifest_path.is_file():
+            raise FileNotFoundError(f"validation manifest not found: {manifest_path}")
+        manifest_rows, _ = load_manifest(manifest_path)
+        if args.train_manifest:
+            train_manifest_path = Path(args.train_manifest)
+            if not train_manifest_path.is_file():
+                raise FileNotFoundError(f"train manifest not found: {train_manifest_path}")
+            train_rows, _ = load_manifest(train_manifest_path)
+        else:
+            train_rows = fetch_manifest(cache_dir=str(cache_dir))
+        train_keys = {row.get("emb") for row in train_rows if row.get("emb")}
+        overlap = {row.get("emb") for row in manifest_rows if row.get("emb")} & train_keys
+        if overlap:
+            raise RuntimeError(f"validation manifest overlaps training on {len(overlap)} embedding keys")
+        order = list_shards()
+        allowed_shards = None
+        print(f"[heldout-gen] disjoint manifest={manifest_path} rows={len(manifest_rows)}; "
+              f"key-level overlap=0; indexing {len(order)} shards", flush=True)
+    else:
+        order = sorted(HELDOUT_SHARDS)
+        allowed_shards = HELDOUT_SHARDS
+        print(f"[heldout-gen] measured manifest + index for {order}", flush=True)
+        manifest_rows = fetch_manifest(cache_dir=str(cache_dir))
+
     index = build_key_index(order, cache_dir=str(cache_dir))
     selected, counts = select_agentic_heldout_rows(
         manifest_rows, index, n=args.n, seed=args.seed,
-        max_n_vis=args.max_vis_tokens,
+        max_n_vis=args.max_vis_tokens, min_n_vis=args.min_vis_tokens,
+        allowed_shards=allowed_shards,
     )
     print(f"[heldout-gen] eligible/selected={counts['eligible']}/{counts['selected']} "
           f"excluded={{{', '.join(f'{k}:{v}' for k, v in counts.items() if k not in ('eligible', 'selected'))}}}",
           flush=True)
     if not selected:
-        raise RuntimeError("no measured, held-out agentic rows in the requested visual-token regime")
+        raise RuntimeError(
+            "no measured, held-out agentic rows in the requested visual-token regime; "
+            "prepare a measured disjoint validation manifest with scripts/backfill_val_grids.py"
+        )
     if len(selected) < args.n:
         print(f"[heldout-gen] only {len(selected)} of {args.n} requested rows are available", flush=True)
 

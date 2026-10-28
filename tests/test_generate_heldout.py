@@ -62,6 +62,21 @@ def test_selected_plan_preserves_exact_shard_row_and_measured_grid():
     assert {row["emb"] for row in plan[HELDOUT]} == {"a", "b"}
 
 
+def test_validation_selection_can_use_any_shard_and_token_floor():
+    rows = [_row("small"), _row("typical", grid=(1, 40, 38))]
+    index = {
+        "small": (TRAINED, 1, 1),
+        "typical": ("data/emb_0020.parquet", 2, 380),
+    }
+    selected, counts = select_agentic_heldout_rows(
+        rows, index, n=5, seed=0, min_n_vis=300, max_n_vis=380,
+        allowed_shards=None,
+    )
+    assert [row["emb"] for row in selected] == ["typical"]
+    assert counts["under_token_floor"] == 1
+    assert counts["eligible"] == 1
+
+
 def test_grid_disagreement_with_index_is_fatal():
     with pytest.raises(ValueError, match="grid/token mismatch"):
         select_agentic_heldout_rows(
