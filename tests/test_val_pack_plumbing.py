@@ -37,9 +37,8 @@ def _vals(embs):
              "grid_thw": [1, 27, 27]} for e in embs]
 
 
-def test_pack_is_used_when_present(tmp_path):
-    # the packed rows must live on shards the trainer is NOT streaming, or the
-    # pack is correctly refused (see the leak test below)
+def test_pack_is_used_when_present_even_if_val_shares_a_train_shard(tmp_path):
+    # Sharing a parquet shard is not key leakage; the exact embeddings differ.
     index = {"a.pt": ("data/emb_0002.parquet", 0, 374),
              "b.pt": ("data/emb_0002.parquet", 1, 374)}
     _write_pack(tmp_path, ["src_a", "src_b"], {"src_a": "a.pt", "src_b": "b.pt"}, index)
@@ -47,7 +46,8 @@ def test_pack_is_used_when_present(tmp_path):
     order, plan, n, local = build_val_plan(
         val_rows=_vals(["a.pt", "b.pt"]), index=index,
         stream_order=["data/emb_0050.parquet"],
-        train_shards={"data/emb_0050.parquet"},
+        train_shards={"data/emb_0002.parquet"},
+        train_embs={"train-only.pt"},
         data_dir=tmp_path, excluded=set(), seed=0,
         build_plan=lambda *a, **k: pytest.fail("must not build a multi-shard plan"),
     )
@@ -59,15 +59,16 @@ def test_pack_is_used_when_present(tmp_path):
         "_row must be the position in the pack, since the reader indexes by it"
 
 
-def test_a_leaky_pack_falls_back_and_says_why(tmp_path, capsys):
-    """A packed row that resolves to a train shard must not be served."""
+def test_a_key_overlapping_the_train_manifest_is_rejected(tmp_path, capsys):
+    """Exact embedding-key overlap must still reject a packed row."""
     index = {"a.pt": ("data/emb_0002.parquet", 0, 374)}
     _write_pack(tmp_path, ["src_a"], {"src_a": "a.pt"}, index)
 
     order, plan, n, local = build_val_plan(
         val_rows=_vals(["a.pt"]), index=index,
         stream_order=["data/emb_0002.parquet"],
-        train_shards={"data/emb_0002.parquet"},   # <- the leak
+        train_shards={"data/emb_0002.parquet"},
+        train_embs={"a.pt"},   # exact key overlap
         data_dir=tmp_path, excluded=set(), seed=0,
         build_plan=lambda rows, idx, **k: {"data/emb_0002.parquet": rows[:1]},
     )
@@ -75,7 +76,7 @@ def test_a_leaky_pack_falls_back_and_says_why(tmp_path, capsys):
     assert local == {}, "a rejected pack must not be wired in"
     printed = capsys.readouterr().out
     assert "val packs unusable" in printed
-    assert "resolve to a train shard" in printed
+    assert "embedding keys overlap the training manifest" in printed
 
 
 def test_a_pack_whose_map_does_not_match_its_keys_is_refused(tmp_path):
@@ -87,7 +88,8 @@ def test_a_pack_whose_map_does_not_match_its_keys_is_refused(tmp_path):
     _, _, _, local = build_val_plan(
         val_rows=_vals(["a.pt", "b.pt"]), index=index,
         stream_order=["data/emb_0003.parquet"],
-        train_shards=set(), data_dir=tmp_path, excluded=set(), seed=0,
+        train_shards=set(), train_embs=set(),
+        data_dir=tmp_path, excluded=set(), seed=0,
         build_plan=lambda rows, idx, **k: {},
     )
     assert local == {}, "a mismatched pack must be refused, not half-used"
@@ -105,7 +107,8 @@ def test_a_missing_sidecar_refuses_the_pack(tmp_path):
 
     _, _, _, local = build_val_plan(
         val_rows=_vals(["a.pt"]), index=index, stream_order=[],
-        train_shards=set(), data_dir=tmp_path, excluded=set(), seed=0,
+        train_shards=set(), train_embs=set(),
+        data_dir=tmp_path, excluded=set(), seed=0,
         build_plan=lambda rows, idx, **k: {},
     )
     assert local == {}, "without the map there is no way to join pack to manifest"
@@ -123,7 +126,7 @@ def test_without_a_pack_the_fallback_still_excludes_train_shards(tmp_path):
     order, plan, n, local = build_val_plan(
         val_rows=_vals(["a.pt"]), index=index,
         stream_order=["data/emb_0002.parquet", "data/emb_0003.parquet"],
-        train_shards={"data/emb_0002.parquet"},
+        train_shards={"data/emb_0002.parquet"}, train_embs=set(),
         data_dir=tmp_path, excluded={"data/emb_0000.parquet"}, seed=7,
         build_plan=fake_plan,
     )
@@ -144,7 +147,7 @@ def test_a_pack_missing_from_the_val_manifest_is_refused(tmp_path):
 
     _, _, _, local = build_val_plan(
         val_rows=_vals([f"k{i}.pt" for i in range(3)]),   # only 3 of 10
-        index=index, stream_order=[], train_shards=set(),
+        index=index, stream_order=[], train_shards=set(), train_embs=set(),
         data_dir=tmp_path, excluded=set(), seed=0,
         build_plan=lambda rows, idx, **k: {},
     )

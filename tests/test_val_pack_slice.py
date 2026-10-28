@@ -40,7 +40,8 @@ def test_the_pack_path_survives_the_slice_filter(tmp_path):
 
     order, plan, n_total, local = build_val_plan(
         val_rows=rows, index=index, stream_order=["data/emb_0009.parquet"],
-        train_shards=set(), data_dir=tmp_path, excluded=set(), seed=0,
+        train_shards=set(), train_embs=set(),
+        data_dir=tmp_path, excluded=set(), seed=0,
         build_plan=lambda *a, **k: {}, groups="agentic",
     )
 
@@ -61,7 +62,8 @@ def test_without_a_filter_every_pack_is_used(tmp_path):
 
     _order, plan, n_total, _local = build_val_plan(
         val_rows=rows, index=index, stream_order=["data/emb_0009.parquet"],
-        train_shards=set(), data_dir=tmp_path, excluded=set(), seed=0,
+        train_shards=set(), train_embs=set(),
+        data_dir=tmp_path, excluded=set(), seed=0,
         build_plan=lambda *a, **k: {}, groups="",
     )
     assert n_total == 5

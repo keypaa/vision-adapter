@@ -449,7 +449,7 @@ VAL_MANIFEST_FILE = "train_manifest_val_disjoint.jsonl"
 VAL_PACK_GLOB = "val_pack_*.parquet"
 
 
-def build_val_plan(val_rows, index, stream_order, train_shards, data_dir,
+def build_val_plan(val_rows, index, stream_order, train_shards, train_embs, data_dir,
                    excluded, seed, build_plan, groups=""):
     """Choose how the val probe gets its embeddings.
 
@@ -460,8 +460,8 @@ def build_val_plan(val_rows, index, stream_order, train_shards, data_dir,
 
     The packs' disjointness is guaranteed by how they were built
     (scripts/pack_val.py asserts no key is in the train manifest), so they need
-    no shard exclusion. We re-check anyway: a pack rebuilt by hand after the
-    train plan changed must not be able to leak.
+    no shard exclusion. We re-check exact embedding keys against the full train
+    manifest; sharing a parquet shard is not leakage by itself.
 
     ``groups`` narrows the probe to the slice the run trains on. It is applied
     AFTER the pack's coverage and leak checks: the checks are about the pack
@@ -501,14 +501,12 @@ def build_val_plan(val_rows, index, stream_order, train_shards, data_dir,
                         f"{pack.name}: only {len(plan_rows)}/{len(keys)} keys "
                         f"are in the val manifest")
 
-                # disjoint by key — not by shard. The pack was built that way
-                # and we re-check, because a pack rebuilt by hand after the
-                # train plan changed must not be able to leak.
-                leak = [r["emb"] for r in plan_rows
-                        if index.get(r["emb"], (None,))[0] in train_shards]
+                # A validation embedding may share a physical parquet shard
+                # with training rows; only exact key overlap constitutes leakage.
+                leak = [r["emb"] for r in plan_rows if r["emb"] in train_embs]
                 if leak:
                     raise ValueError(
-                        f"{pack.name}: {len(leak)} rows resolve to a train shard")
+                        f"{pack.name}: {len(leak)} embedding keys overlap the training manifest")
 
                 # Narrow to the trained slice AFTER the checks above.
                 keep = filter_by_groups(plan_rows, groups)
@@ -1237,6 +1235,9 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
             _persist_fetched_manifest(data_dir, rows)
         except Exception as e:  # noqa: BLE001 — persistence is best-effort, training must not die here
             print(f"[train] manifest persist failed ({e}) — continuing with in-memory rows", flush=True)
+    # Preserve the full manifest's keys for exact validation leakage checks;
+    # group filtering below narrows only the rows used for training.
+    train_embs = {r["emb"] for r in rows if r.get("emb")}
     # Optional slice filter: keep only the requested manifest groups.
     #
     # The reference recipe's regime is the agentic slice (every row <= 380
@@ -1389,6 +1390,7 @@ def _streaming_train(data_dir: Path, cfg: TrainConfig, max_steps: int | None, de
                 index=index,
                 stream_order=stream_order,
                 train_shards=set(plan.keys()),
+                train_embs=train_embs,
                 data_dir=data_dir,
                 excluded=EXCLUDED,
                 seed=_plan_seed,
