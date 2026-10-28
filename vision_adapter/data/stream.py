@@ -948,7 +948,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                         yield {
                             "vis": vis, "user": row["user"],
                             "assistant": row["assistant"], "g": row.get("g", "?"),
-                            "grid_thw": row.get("grid_thw"),
+                            "grid_thw": row.get("grid_thw"), "emb": row.get("emb"),
                         }
                         emitted += 1
                 _enforce_lru_cache(self.rg_cache_dir)
@@ -1072,7 +1072,7 @@ class EmbStreamDataset(torch.utils.data.IterableDataset):
                             yield {
                                 "vis": vis, "user": row["user"],
                                 "assistant": row["assistant"], "g": row.get("g", "?"),
-                                "grid_thw": row.get("grid_thw"),
+                                "grid_thw": row.get("grid_thw"), "emb": row.get("emb"),
                             }
                             emitted += 1
                     finally:
